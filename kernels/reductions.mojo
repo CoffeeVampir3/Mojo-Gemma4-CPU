@@ -439,8 +439,11 @@ def broadcast[
     src_rank: Int = 0,
     inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
 ):
-    if src.count <= 0 or tp <= 1:
+    if src.count <= 0:
         return
+
+    if src[0] != dst[0]:
+        memcpy(dest=dst[0].as_any_origin(), src=src[0], count=src.count)
 
     if src.count * E.ELEMENT_BYTES <= inline_max_bytes:
         for r in range(tp):

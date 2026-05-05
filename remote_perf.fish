@@ -65,6 +65,7 @@ rsync -av \
     --exclude='fence_experiment_bin' \
     --exclude='tp_param_bin' \
     --include='checkpoints/SmolLM2/model.safetensors' \
+    --include='checkpoints/gemma-4-26B-A4B/*' \
     --exclude='checkpoints/**/*.safetensors' \
     . \
     $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/

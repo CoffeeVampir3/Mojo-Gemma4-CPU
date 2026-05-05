@@ -8,18 +8,26 @@ from modeling.gemma_4_moe import Gemma4
 
 def main():
     var numa = NumaInfo()
-    var topo = numa.plan_topology(1)
-    print("numa nodes:", numa.num_nodes, "degree=1 rank0 node:", topo[0])
+    var topo = numa.plan_topology(4)
+    print("numa nodes:", numa.num_nodes, "degree=4")
 
-    var pools = HeapMoveArray[BurstPool[]](1)
-    pools.push(BurstPool[].for_topology(numa, topo[0]))
-    print("pool capacity:", pools[0].get_capacity())
+    var pools = HeapMoveArray[BurstPool[]](4)
+    for i in range(4):
+        pools.push(BurstPool[].for_topology(numa, topo[i]))
+        print("  rank", i, "node", topo[i], "workers:", pools[i].get_capacity())
 
     var ckpt = Path("checkpoints/gemma-4-26B-A4B")
-    var loaded = Gemma4[1].load(ckpt, numa, topo, pools^)
+    var loaded = Gemma4[4].load(ckpt, numa, topo, pools^)
     if not loaded:
         print("load failed")
         return
     var model = loaded.take()
+
+    var kv = model.new_kv_cache()
+    var dump = Path("dump/embed_test")
+    var token_id = 2
+    print("forward: token_id=" + String(token_id) + " pos=0 dump=" + String(dump))
+    model.forward(token_id, 0, kv, dump_dir=dump)
+    print("dump written to " + String(dump))
+
     _ = model^
-    print("load ok")

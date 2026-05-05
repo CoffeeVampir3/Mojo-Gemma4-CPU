@@ -13,13 +13,16 @@ trait RangedKernel(BurstKernel):
 
 
 @fieldwise_init
-struct Chain[A: BurstKernel, B: BurstKernel](BurstKernel):
+struct Chain[A: RangedKernel, B: RangedKernel](RangedKernel):
     var a: Self.A
     var b: Self.B
 
     def execute(mut self):
         self.a.execute()
         self.b.execute()
+
+    def over_range(self, start: Int, end: Int) -> Self:
+        return Self(self.a.over_range(start, end), self.b.over_range(start, end))
 
 
 struct RankBuffers[dtype: DType, tp: Int, origin: Origin]:
