@@ -9,11 +9,14 @@ from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.helpers import RankBuffers
-from kernels.reductions import broadcast, allreduce
-from kernels.rmsnorm import rms_norm_row, rms_norm, rms_norm_qkv_heads, fused_residual_norm_row
-from kernels.gemv import gemv_chained_qkv, gemv
+from kernels.reductions import dispatch_broadcast, dispatch_allreduce
+from kernels.rmsnorm import rms_norm_row, fused_residual_norm_row
+from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
+from kernels.gemv import dispatch_gemv_chained_qkv, dispatch_gemv
 from kernels.rope import rope_token, RopeTable
-from kernels.kv_tiled_attention import sliding_attention_single_pass, FLASH_PARTIAL_STRIDE
+from kernels.kv_tiled_attention import dispatch_sliding_attention, FLASH_PARTIAL_STRIDE
+from kernels.full_attention import dispatch_full_attention, PARTIAL_STRIDE
+from kernels.logsum_merge import merge_flash_partials
 from modeling.linear_borrow_pool import ScratchPool
 from modeling.linear_borrow_pool import scratch_block_bytes
 from modeling.kv_cache import Gemma4KV, Gemma4KVSliding, Gemma4KVGlobal
@@ -459,7 +462,7 @@ def build_gemma4_plan[degree: Int]() -> Gemma4LoadPlan[degree]:
     return Gemma4LoadPlan[degree](topo, descs^)
 
 
-def sliding_attention_qkv[
+def dispatch_sliding_attention_qkv[
     P: BurstThreadPool, //, degree: Int,
 ](
     x: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -495,13 +498,13 @@ def sliding_attention_qkv[
     var k_out = k_lease.as_ptr[Scalar[DType.bfloat16]]()
     var v_out = v_lease.as_ptr[Scalar[DType.bfloat16]]()
 
-    gemv_chained_qkv[q_rows=q_rows, kv_rows=kv_rows, cols=C.HIDDEN](
+    dispatch_gemv_chained_qkv[q_rows=q_rows, kv_rows=kv_rows, cols=C.HIDDEN](
         x, q_weight, k_weight, v_weight, q_out, k_out, v_out, pool)
 
     var q_norm_w = attn.q_norm.bound(layer_base).as_ptr()
     var k_norm_w = attn.k_norm.bound(layer_base).as_ptr()
 
-    rms_norm_qkv_heads[
+    dispatch_rms_norm_qkv_heads[
         head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
         num_q=num_q_heads, num_kv=num_kv_heads,
     ](q_out, k_out, v_out, q_norm_w, k_norm_w, pool)
@@ -530,22 +533,25 @@ def sliding_attention_qkv[
         128 * flash_stride]()
     var partials_ptr = partials_lease.as_ptr[Scalar[DType.float32]]()
 
-    sliding_attention_single_pass[
+    var nw = dispatch_sliding_attention[
         head_dim=head_dim, num_q=num_q_heads, num_kv=num_kv_heads,
         gqa_ratio=num_q_heads // num_kv_heads, kv_stride=kv_cols,
         window=C.SLIDING_WINDOW](
-        q_out, k_cache_base, v_cache_base, q_out,
+        q_out, k_cache_base, v_cache_base,
         partials_ptr, pos, valid_len, pool)
+
+    merge_flash_partials[head_dim, num_q_heads](
+        q_out, partials_ptr, flash_stride, nw, pool)
 
     partials_lease^.release()
 
     var o_weight = attn.o_proj.bound(layer_base).as_ptr()
-    gemv[rows=C.HIDDEN, cols=q_rows](q_out, o_weight, x, pool)
+    dispatch_gemv[rows=C.HIDDEN, cols=q_rows](q_out, o_weight, x, pool)
 
     q_lease^.release()
 
 
-def full_attention_qkv[
+def dispatch_full_attention_qkv[
     P: BurstThreadPool, //, degree: Int,
 ](
     x: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -581,17 +587,17 @@ def full_attention_qkv[
     var k_out = k_lease.as_ptr[Scalar[DType.bfloat16]]()
     var v_out = v_lease.as_ptr[Scalar[DType.bfloat16]]()
 
-    gemv[rows=q_rows, cols=C.HIDDEN](x, q_weight, q_out, pool)
-    gemv[rows=k_rows, cols=C.HIDDEN](x, k_weight, k_out, pool)
+    dispatch_gemv[rows=q_rows, cols=C.HIDDEN](x, q_weight, q_out, pool)
+    dispatch_gemv[rows=k_rows, cols=C.HIDDEN](x, k_weight, k_out, pool)
 
     var q_norm_w = attn.q_norm.bound(layer_base).as_ptr()
     var k_norm_w = attn.k_norm.bound(layer_base).as_ptr()
 
-    rms_norm[hidden=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps, scaled=False](
+    dispatch_rms_norm[hidden=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps, scaled=False](
         k_out, v_out, k_norm_w, num_kv_heads, pool)
-    rms_norm[hidden=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps](
+    dispatch_rms_norm[hidden=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps](
         q_out, q_out, q_norm_w, num_q_heads, pool)
-    rms_norm[hidden=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps](
+    dispatch_rms_norm[hidden=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps](
         k_out, k_out, k_norm_w, num_kv_heads, pool)
 
     var cos_row = rope_table.cos_row(pos)
@@ -606,10 +612,32 @@ def full_attention_qkv[
             cache_k_dst[i] = k_out[i]
             cache_v_dst[i] = v_out[i]
 
-    # TODO: full attention + o_proj
-
     v_lease^.release()
     k_lease^.release()
+
+    var valid_len = Gemma4KVGlobal[degree].valid_count(rank, pos)
+    var k_cache_base = kv.full.k(layer_idx, rank)
+    var v_cache_base = kv.full.v(layer_idx, rank)
+    comptime kv_cols = k_rows
+    comptime partial_stride = PARTIAL_STRIDE[num_q_heads, head_dim]
+
+    var partials_lease = scratch.borrow[Scalar[DType.float32],
+        128 * partial_stride]()
+    var partials_ptr = partials_lease.as_ptr[Scalar[DType.float32]]()
+
+    var nw = dispatch_full_attention[
+        head_dim=head_dim, num_q=num_q_heads, num_kv=num_kv_heads,
+        gqa_ratio=num_q_heads // num_kv_heads, kv_stride=kv_cols](
+        q_out, k_cache_base, v_cache_base, partials_ptr, valid_len, pool)
+
+    merge_flash_partials[head_dim, num_q_heads](
+        q_out, partials_ptr, partial_stride, nw, pool)
+
+    partials_lease^.release()
+
+    var o_weight = attn.o_proj.bound(layer_base).as_ptr()
+    dispatch_gemv[rows=C.HIDDEN, cols=q_rows](q_out, o_weight, x, pool)
+
     q_lease^.release()
 
 
@@ -784,7 +812,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             src.ptrs[r] = embed_row.as_immutable()
             dst.ptrs[r] = topo.activations.x_main.bound(self.arena_base(r)).as_ptr()
 
-        broadcast[BF16, Self.degree](src, dst, self.pools, src_rank=owner)
+        dispatch_broadcast[BF16, Self.degree](src, dst, self.pools, src_rank=owner)
 
         var si = 0
         var fi = 0
@@ -813,13 +841,13 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
                 if is_full_layer(i):
                     var lb = topo.full.base(base, fi)
-                    full_attention_qkv[degree=Self.degree](
+                    dispatch_full_attention_qkv[degree=Self.degree](
                         x_residual, topo.full.proto.attn, lb,
                         pos, rank, fi, self.full_rope, kv,
                         scratch, self.pools[rank])
                 else:
                     var lb = topo.sliding.base(base, si)
-                    sliding_attention_qkv[degree=Self.degree](
+                    dispatch_sliding_attention_qkv[degree=Self.degree](
                         x_residual, topo.sliding.proto.attn, lb,
                         pos, rank, si, self.sliding_rope, kv,
                         scratch, self.pools[rank])
@@ -833,7 +861,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var p = topo.activations.x_residual.bound(base).as_ptr()
                 ar_src.ptrs[r] = p.as_immutable()
                 ar_dst.ptrs[r] = p
-            allreduce[BF16, Self.degree](ar_src, ar_dst, self.pools)
+            dispatch_allreduce[BF16, Self.degree](ar_src, ar_dst, self.pools)
 
             # Post-attention: fused residual add + norm for next stage
             # x_residual now holds allreduced attention output

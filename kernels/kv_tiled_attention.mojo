@@ -60,6 +60,17 @@ def accumulate_v_corrected[head_dim: Int](
 
 
 @always_inline
+def scale_acc[head_dim: Int](acc: F32Ptr, factor: Scalar[DType.float32]):
+    comptime PU = pick_port_unroll[W, head_dim]()
+    comptime STRIDE = PU * W
+    var f = SIMD[DType.float32, W](factor)
+    for i in range(head_dim // STRIDE):
+        comptime for p in range(PU):
+            var a = (acc + i * STRIDE + p * W).load[width=W]()
+            (acc + i * STRIDE + p * W).store(a * f)
+
+
+@always_inline
 def softmax_inplace(scores: F32Ptr, valid_len: Int):
     var m = scores[0]
     for i in range(1, valid_len):
@@ -228,104 +239,79 @@ struct FlashDecodeKernel[
         var my_partial = self.partials + self.worker_id * self.partial_stride
         comptime m_off = Self.num_q * Self.head_dim
         comptime l_off = m_off + Self.num_q
+        comptime TILE = W
 
         var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
         var q_ptrs = InlineArray[BF16Ptr, Self.num_q](uninitialized=True)
-        var m_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
-        var l_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
+        var m = InlineArray[Scalar[DType.float32], Self.num_q](
+            fill=Scalar[DType.float32](-1e30))
+        var l = InlineArray[Scalar[DType.float32], Self.num_q](
+            fill=Scalar[DType.float32](0))
 
         comptime for h in range(Self.num_q):
             acc_ptrs[h] = my_partial + h * Self.head_dim
             q_ptrs[h] = self.q + h * Self.head_dim
-            m_ptrs[h] = my_partial + m_off + h
-            l_ptrs[h] = my_partial + l_off + h
-            m_ptrs[h][] = Scalar[DType.float32](-1e30)
-            l_ptrs[h][] = Scalar[DType.float32](0)
             for j in range(0, Self.head_dim, W):
                 (acc_ptrs[h] + j).store(SIMD[DType.float32, W](0))
 
-        for p in range(self.start, self.end):
-            var cache_slot = (self.start_pos + p) & (Self.window - 1)
-            var k_row = self.k_base + cache_slot * Self.kv_stride
-            var v_row = self.v_base + cache_slot * Self.kv_stride
+        var pos = self.start
+        while pos < self.end:
+            var tile_len = min(TILE, self.end - pos)
 
             comptime for q_idx in range(Self.num_q):
                 comptime kv_h = q_idx // Self.gqa_ratio
-                var k_head = k_row + kv_h * Self.head_dim
-                var v_head = v_row + kv_h * Self.head_dim
 
-                var score = score_position[Self.head_dim](q_ptrs[q_idx], k_head)
+                var scores = SIMD[DType.float32, TILE](-1e30)
+                for t in range(tile_len):
+                    var cache_slot = (self.start_pos + pos + t) & (Self.window - 1)
+                    var k_head = self.k_base + cache_slot * Self.kv_stride + kv_h * Self.head_dim
+                    scores[t] = score_position[Self.head_dim](q_ptrs[q_idx], k_head)
 
-                var m_old = m_ptrs[q_idx][]
-                var m_new = score if score > m_old else m_old
-                var correction = fast_exp_softmax_biased[1](
-                    SIMD[DType.float32, 1](m_old - m_new))[0]
-                var weight = fast_exp_softmax_biased[1](
-                    SIMD[DType.float32, 1](score - m_new))[0]
+                var tile_max = scores.reduce_max()
+                var m_new = tile_max if tile_max > m[q_idx] else m[q_idx]
 
-                l_ptrs[q_idx][] = l_ptrs[q_idx][] * correction + weight
-                m_ptrs[q_idx][] = m_new
+                var corr = fast_exp_softmax_biased[1](
+                    SIMD[DType.float32, 1](m[q_idx] - m_new))[0]
+                var weights = fast_exp_softmax_biased[TILE](
+                    scores - SIMD[DType.float32, TILE](m_new))
 
-                accumulate_v_corrected[Self.head_dim](
-                    v_head, weight, correction, acc_ptrs[q_idx])
+                scale_acc[Self.head_dim](acc_ptrs[q_idx], corr)
+                l[q_idx] = l[q_idx] * corr + weights.reduce_add()
+                m[q_idx] = m_new
+
+                for t in range(tile_len):
+                    var cache_slot = (self.start_pos + pos + t) & (Self.window - 1)
+                    var v_head = self.v_base + cache_slot * Self.kv_stride + kv_h * Self.head_dim
+                    accumulate_v[Self.head_dim](v_head, weights[t], acc_ptrs[q_idx])
+
+            pos += TILE
+
+        comptime for h in range(Self.num_q):
+            (my_partial + m_off + h)[] = m[h]
+            (my_partial + l_off + h)[] = l[h]
 
     def over_range(self, start: Int, end: Int) -> Self:
         return Self(self.q, self.k_base, self.v_base, self.partials,
             self.partial_stride, self.worker_id, self.start_pos, start, end)
 
 
-@always_inline
-def merge_flash_partials[head_dim: Int, num_q: Int](
-    output: BF16Ptr, partials: F32Ptr, partial_stride: Int, num_workers: Int,
-):
-    comptime acc_off = 0
-    comptime m_off = num_q * head_dim
-    comptime l_off = m_off + num_q
 
-    for h in range(num_q):
-        var global_m = Scalar[DType.float32](-1e30)
-        for w_idx in range(num_workers):
-            var wm = (partials + w_idx * partial_stride + m_off + h)[]
-            if wm > global_m:
-                global_m = wm
-
-        var global_l = Scalar[DType.float32](0)
-        for w_idx in range(num_workers):
-            var wm = (partials + w_idx * partial_stride + m_off + h)[]
-            var wl = (partials + w_idx * partial_stride + l_off + h)[]
-            var corr = fast_exp_softmax_biased[1](
-                SIMD[DType.float32, 1](wm - global_m))[0]
-            global_l += wl * corr
-
-        var inv_l = Scalar[DType.float32](1.0) / global_l
-        for j in range(0, head_dim, W):
-            var merged = SIMD[DType.float32, W](0)
-            for w_idx in range(num_workers):
-                var wm = (partials + w_idx * partial_stride + m_off + h)[]
-                var corr = fast_exp_softmax_biased[1](
-                    SIMD[DType.float32, 1](wm - global_m))[0]
-                var acc_v = (partials + w_idx * partial_stride + acc_off
-                    + h * head_dim + j).load[width=W]()
-                merged += SIMD[DType.float32, W](corr) * acc_v
-            (output + h * head_dim + j).store(
-                (merged * SIMD[DType.float32, W](inv_l)).cast[DType.bfloat16]())
-
-
-def sliding_attention_single_pass[
+def dispatch_sliding_attention[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int,
 ](
     q: BF16Ptr, k_base: BF16Ptr, v_base: BF16Ptr,
-    output: BF16Ptr,
     partials_buf: F32Ptr,
     pos: Int, valid_len: Int,
     mut pool: P,
     num_workers: Int = 0,
-):
+) -> Int:
+    if valid_len <= 0:
+        return 0
+
     var start_pos = pos - valid_len + 1
     var nw = recommended_workers(valid_len * kv_stride * 2, pool.get_capacity()) if num_workers <= 0 else min(num_workers, pool.get_capacity())
-    var partial_stride = FLASH_PARTIAL_STRIDE[num_q, head_dim]
 
     var buf = DispatchBuffer[
         FlashDecodeKernel[head_dim, num_q, num_kv, gqa_ratio, kv_stride, window]]()
@@ -334,11 +320,7 @@ def sliding_attention_single_pass[
         buf.slot()[] = FlashDecodeKernel[
             head_dim, num_q, num_kv, gqa_ratio, kv_stride, window](
             q, k_base, v_base, partials_buf,
-            partial_stride, w_idx, start_pos, wr[0], wr[1])
+            FLASH_PARTIAL_STRIDE[num_q, head_dim], w_idx, start_pos, wr[0], wr[1])
     buf.dispatch(pool)
     pool.join()
-
-    merge_flash_partials[head_dim, num_q](output, partials_buf, partial_stride, nw)
-
-    merge_flash_partials_f32[head_dim, num_q](
-        rank_partial, worker_partials, partial_stride, nw)
+    return nw

@@ -13,7 +13,7 @@ from kernels.helpers import (
     RangedKernel, DispatchBuffer, RankBuffers,
     tile_dispatch, join_all, worker_range,
 )
-from kernels.reductions import allreduce
+from kernels.reductions import dispatch_allreduce
 from modeling.model_spec import BF16, Encoding
 
 
@@ -396,13 +396,7 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
             if avg < best_read:
                 best_read = avg
 
-        var pad = String("")
-        if n < 10:
-            pad = "       "
-        elif n < 100:
-            pad = "      "
-        else:
-            pad = "     "
+        var pad = "       " if n < 10 else "      " if n < 100 else "     "
         print("  " + String(n) + pad + "| " + String(best_dispatch)
             + " | " + String(best_read) + " | " + fmt_bw(count * 2, best_read))
 
@@ -452,14 +446,14 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
             db.ptrs[r] = dst[r]
 
         for _ in range(WARMUP):
-            allreduce[BF16, tp](rb, db, pools)
+            dispatch_allreduce[BF16, tp](rb, db, pools)
 
         var best = Int(1 << 60)
         for _ in range(TRIALS):
             var elapsed = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
-                allreduce[BF16, tp](rb, db, pools)
+                dispatch_allreduce[BF16, tp](rb, db, pools)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
             keep(db[0][0])

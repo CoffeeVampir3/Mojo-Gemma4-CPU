@@ -144,7 +144,7 @@ struct FusedResidualNormTokenKernel[
 comptime NORM_INLINE_TOKENS = 16
 
 
-def rms_norm[
+def dispatch_rms_norm[
     P: BurstThreadPool, //,
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
     scaled: Bool = True,
@@ -191,7 +191,7 @@ struct ScaledNormKernel[
         return Self(self.src, self.dst, self.weight, start, end)
 
 
-def rms_norm_qkv_heads[
+def dispatch_rms_norm_qkv_heads[
     P: BurstThreadPool, //,
     head_dim: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
     num_q: Int, num_kv: Int,

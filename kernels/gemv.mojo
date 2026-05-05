@@ -60,7 +60,7 @@ struct GemvKernel[rows: Int, cols: Int](RangedKernel):
 comptime GEMV_INLINE_ROWS = 4
 
 
-def gemv[
+def dispatch_gemv[
     P: BurstThreadPool, //,
     rows: Int, cols: Int,
 ](
@@ -98,7 +98,7 @@ struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](RangedKern
         return Self(self.x, self.weight, self.output, start, end)
 
 
-def gemv_chained_qkv[
+def dispatch_gemv_chained_qkv[
     P: BurstThreadPool, //,
     q_rows: Int, kv_rows: Int, cols: Int,
 ](

@@ -11,7 +11,7 @@ from threading.threading_traits import BurstKernel, BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.helpers import DispatchBuffer, RangedKernel, tile_dispatch, recommended_workers
 from kernels.gemv import (
-    dot_row, gemv_range, gemv, gemv_chained_qkv,
+    dot_row, gemv_range, dispatch_gemv_chained_qkv,
     GemvKernel, ScaledGemvKernel,
 )
 from simd_math import pick_port_unroll, tree_reduce_accs
@@ -265,8 +265,8 @@ def section_projection_sizes[P: BurstThreadPool](
         var mb = weight_bytes // (1024 * 1024)
         var name = names[p]
         var pad = ""
-        if len(name) < 20:
-            pad = " " * (20 - len(name))
+        if name.byte_length() < 20:
+            pad = " " * (20 - name.byte_length())
         print("  " + name + pad
             + "| " + String(rows)
             + "  | " + String(mb)
@@ -323,7 +323,7 @@ def section_chained_qkv[P: BurstThreadPool](
 
     # Chained: 1 dispatch+join cycle
     for _ in range(WARMUP):
-        gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN](
+        dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN](
             x, q_weight, k_weight, v_weight, q_out, k_out, v_out, pool)
 
     var best_chained = Int(1 << 60)
@@ -331,7 +331,7 @@ def section_chained_qkv[P: BurstThreadPool](
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN](
+            dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN](
                 x, q_weight, k_weight, v_weight, q_out, k_out, v_out, pool)
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0

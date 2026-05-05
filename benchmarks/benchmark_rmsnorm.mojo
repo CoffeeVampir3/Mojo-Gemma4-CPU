@@ -12,8 +12,8 @@ from notstdcollections import HeapMoveArray
 from kernels.helpers import DispatchBuffer, RangedKernel, tile_dispatch, recommended_workers
 from kernels.rmsnorm import (
     rms_reduce_row, rms_normalize_row, rms_norm_row,
-    rms_norm_row_no_weight, residual_add_rms_reduce_row,
-    fused_residual_norm_row, rms_norm, fused_residual_norm,
+    residual_add_rms_reduce_row,
+    fused_residual_norm_row, dispatch_rms_norm, fused_residual_norm,
     RmsNormTokenKernel, FusedResidualNormTokenKernel,
 )
 from simd_math.ops import sqrt
@@ -123,13 +123,13 @@ def section_row_primitives(src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr):
         + "  (" + fmt_bw(HIDDEN * 2 * 3, best_full) + " r+r+w)")
 
     for _ in range(WARMUP):
-        rms_norm_row_no_weight[HIDDEN, SQRT_N, N_EPS](src, dst)
+        rms_norm_row[HIDDEN, SQRT_N, N_EPS, scaled=False](src, dst, weight)
     var best_no_w = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            rms_norm_row_no_weight[HIDDEN, SQRT_N, N_EPS](src, dst)
+            rms_norm_row[HIDDEN, SQRT_N, N_EPS, scaled=False](src, dst, weight)
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
         var avg = elapsed // ITERS
@@ -270,14 +270,14 @@ def section_seq_sweep[P: BurstThreadPool](
         keep(dst[0])
 
         for _ in range(WARMUP):
-            rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
+            dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
                 src, dst, weight, seq, pool)
         var best_dispatched = Int(1 << 60)
         for _ in range(TRIALS):
             var elapsed = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
-                rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
+                dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
                     src, dst, weight, seq, pool)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0

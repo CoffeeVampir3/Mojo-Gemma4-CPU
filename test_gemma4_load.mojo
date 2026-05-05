@@ -24,10 +24,7 @@ def main():
     var model = loaded.take()
 
     var kv = model.new_kv_cache()
-    var dump = Path("dump/embed_test")
     var token_id = 2
-    print("forward: token_id=" + String(token_id) + " pos=0 dump=" + String(dump))
-    model.forward(token_id, 0, kv, dump_dir=dump)
-    print("dump written to " + String(dump))
+    model.forward(token_id, 0, kv)
 
     _ = model^

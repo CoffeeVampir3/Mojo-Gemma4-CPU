@@ -326,7 +326,7 @@ def make_scratch_config[
     )
 
 
-def allreduce[
+def dispatch_allreduce[
     P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
     E: Encoding, tp: Int, Accum: DType = DType.float32,
 ](
@@ -429,7 +429,7 @@ def reduce_writeback[
     join_all[tp](pools)
 
 
-def broadcast[
+def dispatch_broadcast[
     P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
     E: Encoding, tp: Int,
 ](
