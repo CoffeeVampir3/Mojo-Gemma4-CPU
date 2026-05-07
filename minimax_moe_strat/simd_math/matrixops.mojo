@@ -4,12 +4,7 @@ from std.utils import IndexList
 from std.math import iota
 
 
-def is_power_of_two[N: Int]() -> Bool:
-    return N > 0 and (N & (N - 1)) == 0
-
-
 def log2[N: Int]() -> Int:
-    comptime assert is_power_of_two[N](), "log2 requires a positive power-of-two input"
     comptime if N == 1:
         return 0
     else:
@@ -37,8 +32,6 @@ def interleave_idx[N: Int, i: Int, stride: Int, high: Bool]() -> Int:
 
 
 def interleave_mask[N: Int, stride: Int, high: Bool]() -> IndexList[N]:
-    comptime assert is_power_of_two[N](), "interleave_mask requires power-of-two N"
-    comptime assert stride > 0 and stride < N, "interleave_mask stride must be in [1, N)"
     var result = IndexList[N]()
     comptime for i in range(N):
         result[i] = interleave_idx[N, i, stride, high]()
@@ -49,23 +42,20 @@ def interleave_mask[N: Int, stride: Int, high: Bool]() -> IndexList[N]:
 def simd_interleave[T: DType, N: Int, stride: Int, high: Bool](
     a: SIMD[T, N], b: SIMD[T, N],
 ) -> SIMD[T, N]:
-    comptime assert is_power_of_two[N](), "simd_interleave requires power-of-two N"
-    comptime assert stride > 0 and stride < N, "simd_interleave stride must be in [1, N)"
     comptime idx = interleave_mask[N, stride, high]()
     return a.shuffle[mask=idx](b)
 
 
 @always_inline
-def transpose_rows[T: DType, N: Int, dst_origin: MutOrigin](
+def transpose_rows[T: DType, N: Int](
     mut rows: InlineArray[SIMD[T, N], N],
-    dst: UnsafePointer[Scalar[T], dst_origin], dst_stride: Int,
+    dst: UnsafePointer[Scalar[T], MutAnyOrigin], dst_stride: Int,
 ):
     """Butterfly transpose pre-loaded rows and store to dst.
 
     Rows are modified in-place during the butterfly stages.
     Caller loads rows (full or partial with zero padding).
     """
-    comptime assert is_power_of_two[N](), "transpose_rows requires power-of-two N"
     comptime num_stages = log2[N]()
     comptime for stage in range(num_stages):
         comptime stride = 1 << stage
@@ -91,9 +81,9 @@ def transpose_rows[T: DType, N: Int, dst_origin: MutOrigin](
 
 
 @always_inline
-def transpose_generic[T: DType, N: Int, dst_origin: MutOrigin](
+def transpose_generic[T: DType, N: Int](
     src: UnsafePointer[Scalar[T], _], src_stride: Int,
-    dst: UnsafePointer[Scalar[T], dst_origin], dst_stride: Int,
+    dst: UnsafePointer[Scalar[T], MutAnyOrigin], dst_stride: Int,
     mut scratch: InlineArray[SIMD[T, N], N],
 ):
     """In-register NxN transpose via butterfly interleave network.
@@ -102,7 +92,6 @@ def transpose_generic[T: DType, N: Int, dst_origin: MutOrigin](
     Loads N rows of N elements from src (strided by elements), performs
     log2(N) stages of interleave shuffles, then stores N rows to dst.
     """
-    comptime assert is_power_of_two[N](), "transpose_generic requires power-of-two N"
     comptime for i in range(N):
         scratch[i] = (src + i * src_stride).load[width=N]()
     transpose_rows[T, N](scratch, dst, dst_stride)
@@ -113,8 +102,6 @@ def butterfly_partner[i: Int, stride: Int]() -> Int:
 
 
 def butterfly_shuffle[width: Int, stride: Int]() -> IndexList[width]:
-    comptime assert is_power_of_two[width](), "butterfly_shuffle requires power-of-two width"
-    comptime assert stride > 0 and stride < width, "butterfly_shuffle stride must be in [1, width)"
     var result = IndexList[width]()
     comptime for i in range(width):
         result[i] = butterfly_partner[i, stride]()
@@ -136,8 +123,6 @@ def reduce_argmax[T: DType, width: Int, regs: Int](
     When `regs == 1` phase A collapses to a no-op and only the in-lane
     butterfly runs.
     """
-    comptime assert is_power_of_two[regs](), "reduce_argmax requires power-of-two regs"
-    comptime assert is_power_of_two[width](), "reduce_argmax requires power-of-two width"
     comptime stages_across = log2[regs]()
     comptime stages_within = log2[width]()
 
@@ -185,9 +170,6 @@ def reduce_top_k[T: DType, width: Int, regs: Int, k: Int](
     `out_values`. Each call runs k independent butterfly reductions plus a
     one-lane mask update between them — O(k · log(regs · width)) SIMD ops.
     """
-    comptime assert is_power_of_two[regs](), "reduce_top_k requires power-of-two regs"
-    comptime assert is_power_of_two[width](), "reduce_top_k requires power-of-two width"
-    comptime assert k >= 0 and k <= regs * width, "reduce_top_k requires 0 <= k <= regs * width"
     # Persistent workspace, written fully from source on the next line.
     var work_v = InlineArray[SIMD[T, width], regs](uninitialized=True)
     var work_i = InlineArray[SIMD[DType.int32, width], regs](uninitialized=True)
@@ -219,31 +201,50 @@ def reduce_top_k[T: DType, width: Int, regs: Int, k: Int](
 
 
 @always_inline
-def port_unroll_for[count: Int]() -> Int:
-    """Largest power-of-two N in {1,2,4,8} with N <= count.
-
-    Class-B picker: reduction along a non-SIMD axis (experts, chunks),
-    step = port_unroll. `count` is the comptime bound.
+def fill_lane_iota[width: Int, regs: Int](
+    mut indices: InlineArray[SIMD[DType.int32, width], regs],
+):
+    """Initialize an index bank so lane `w` of register `r` holds `r*width + w`.
     """
-    comptime assert count > 0, "port_unroll_for requires positive count"
+    comptime for r in range(regs):
+        indices[r] = iota[DType.int32, width](offset=Int32(r * width))
+
+
+# ============================================================================
+# Port-saturating accumulation
+#
+# Two classes of accumulation live here:
+#   A) Reduction along a SIMD axis — `cols` comptime, step = port_unroll*width.
+#      Picker: pick_port_unroll[width, cols]().
+#   B) Reduction along a non-SIMD axis (experts, chunks) — step = port_unroll.
+#      Picker: port_unroll_for[count](), where count is the comptime bound.
+#
+# Both classes merge their register banks via tree_reduce_accs.
+# ============================================================================
+
+
+@always_inline
+def port_unroll_for[count: Int]() -> Int:
+    """Largest power-of-two N in {1,2,4,8} with N <= count."""
     return 8 if count >= 8 else 4 if count >= 4 else 2 if count >= 2 else 1
 
 
 @always_inline
 def pick_port_unroll[width: Int, cols: Int]() -> Int:
-    """Class-A picker: reduction along a SIMD axis, `cols` comptime,
-    step = port_unroll * width. Returns the largest power-of-two PU in
-    {1,2,4,8} such that PU * width divides `cols` exactly — the loop
-    `for i in range(cols // (PU*width))` covers all of K with no tail."""
-    comptime assert cols >= width, "pick_port_unroll requires cols >= width"
-    comptime if cols % (8 * width) == 0:
-        return 8
-    elif cols % (4 * width) == 0:
-        return 4
-    elif cols % (2 * width) == 0:
-        return 2
-    else:
-        return 1
+    """Class-A picker: chains that fit within `cols` at `width` lanes each."""
+    return port_unroll_for[cols // width]()
+
+
+@always_inline
+def tree_reduce_accs[T: DType, width: Int, port_unroll: Int, //](
+    mut accs: InlineArray[SIMD[T, width], port_unroll],
+) -> Scalar[T]:
+    """Pairwise-add accumulator bank into lane-0, then horizontal reduce."""
+    comptime for stride in range(1, port_unroll):
+        comptime if (stride & (stride - 1)) == 0:
+            comptime for i in range(0, port_unroll, 2 * stride):
+                accs[i] += accs[i + stride]
+    return accs[0].reduce_add()
 
 
 @always_inline
@@ -255,19 +256,8 @@ def tree_merge_accs[T: DType, width: Int, port_unroll: Int, //](
     Used when the caller wants to keep the merged SIMD vector (e.g. to cast and
     store) rather than reduce to a scalar.
     """
-    comptime assert is_power_of_two[port_unroll](), (
-        "tree_merge_accs requires power-of-two port_unroll"
-    )
     comptime for stride in range(1, port_unroll):
         comptime if (stride & (stride - 1)) == 0:
             comptime for i in range(0, port_unroll, 2 * stride):
                 accs[i] += accs[i + stride]
     return accs[0]
-
-
-@always_inline
-def tree_reduce_accs[T: DType, width: Int, port_unroll: Int, //](
-    mut accs: InlineArray[SIMD[T, width], port_unroll],
-) -> Scalar[T]:
-    """Pairwise-add accumulator bank into lane-0, then horizontal reduce."""
-    return tree_merge_accs(accs).reduce_add()

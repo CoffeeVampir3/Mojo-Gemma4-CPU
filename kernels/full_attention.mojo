@@ -25,7 +25,7 @@ def dot[head_dim: Int](q: BF16Ptr, k: BF16Ptr) -> Scalar[DType.float32]:
         comptime for p in range(PU):
             var qv = (q + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
             var kv = (k + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
-            accs[p] = accs[p].fma(qv, kv)
+            accs[p] = qv.fma(kv, accs[p])
     return tree_reduce_accs(accs)
 
 

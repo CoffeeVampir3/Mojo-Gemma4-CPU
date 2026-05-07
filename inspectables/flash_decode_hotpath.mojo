@@ -73,7 +73,7 @@ def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Scalar[DType.fl
         comptime for p in range(PU_):
             var qv = (q + i * S_ + p * W).load[width=W]().cast[DType.float32]()
             var kv = (k_row + i * S_ + p * W).load[width=W]().cast[DType.float32]()
-            accs[p] = accs[p].fma(qv, kv)
+            accs[p] = qv.fma(kv, accs[p])
     return tree_reduce_accs(accs)
 
 

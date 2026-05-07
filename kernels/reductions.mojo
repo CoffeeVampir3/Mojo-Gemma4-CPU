@@ -442,8 +442,12 @@ def dispatch_broadcast[
     if src.count <= 0:
         return
 
-    if src[0] != dst[0]:
-        memcpy(dest=dst[0].as_any_origin(), src=src[0], count=src.count)
+    if src[src_rank] != dst[src_rank]:
+        memcpy(
+            dest=dst[src_rank].as_any_origin(),
+            src=src[src_rank],
+            count=src.count,
+        )
 
     if src.count * E.ELEMENT_BYTES <= inline_max_bytes:
         for r in range(tp):

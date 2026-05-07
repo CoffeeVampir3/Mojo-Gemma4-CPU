@@ -98,8 +98,11 @@ def tile_dispatch[
     K: RangedKernel, P: BurstThreadPool,
 ](mut buf: DispatchBuffer[K], proto: K, mut pool: P, total: Int,
   base: Int = 0, num_workers: Int = 0):
+    if total <= 0:
+        return
     var workers = pool.get_capacity() if num_workers <= 0 else min(
         num_workers, pool.get_capacity())
+    workers = min(workers, total)
     for w in range(workers):
         var wr = worker_range(total, workers, w, base)
         buf.slot()[] = proto.over_range(wr[0], wr[1])

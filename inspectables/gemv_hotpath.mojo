@@ -44,7 +44,7 @@ def dot_row[cols: Int, PU: Int](
         comptime for p in range(PU):
             var xv = (x + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
             var wv = (weight_row + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
-            accs[p] = accs[p].fma(xv, wv)
+            accs[p] = xv.fma(wv, accs[p])
 
 
 @no_inline

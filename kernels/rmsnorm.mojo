@@ -25,7 +25,7 @@ def rms_reduce_row[hidden: Int](src: BF16Ptr) -> Scalar[DType.float32]:
     for i in range(hidden // STRIDE):
         comptime for p in range(PU):
             var v = (src + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
-            accs[p] = accs[p].fma(v, v)
+            accs[p] = v.fma(v, accs[p])
     return tree_reduce_accs(accs)
 
 
@@ -73,7 +73,7 @@ def residual_add_rms_reduce_row[hidden: Int](
             var r_val = (residual + off).load[width=W]().cast[DType.float32]()
             var sum = p_val + r_val
             (dst + off).store(sum.cast[DType.bfloat16]())
-            accs[p] = accs[p].fma(sum, sum)
+            accs[p] = sum.fma(sum, accs[p])
     return tree_reduce_accs(accs)
 
 

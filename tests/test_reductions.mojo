@@ -4,7 +4,8 @@ from std.os import abort
 
 from kernels.helpers import RankBuffers
 from kernels.reductions import (
-    AddIntoDest, allreduce, reduce_writeback, broadcast, allgather,
+    AddIntoDest, dispatch_allreduce, reduce_writeback, dispatch_broadcast,
+    allgather,
 )
 from modeling.model_spec import BF16, F32
 from notstdcollections import HeapMoveArray
@@ -111,7 +112,7 @@ def test_allreduce_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
     for r in range(tp):
         src.ptrs[r] = raw[r].as_immutable()
         dst.ptrs[r] = out[r]
-    allreduce[BF16, tp](src, dst, pools, inline_max_bytes)
+    dispatch_allreduce[BF16, tp](src, dst, pools, inline_max_bytes)
     for i in range(n):
         var expected = Float32(0)
         for r in range(tp):
@@ -172,10 +173,40 @@ def test_broadcast_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
     for r in range(tp):
         src.ptrs[r] = raw[r].as_immutable()
         dst.ptrs[r] = out[r]
-    broadcast[BF16, tp](src, dst, pools, inline_max_bytes)
+    dispatch_broadcast[BF16, tp](
+        src, dst, pools, inline_max_bytes=inline_max_bytes)
     for i in range(n):
-        for r in range(1, tp):
+        for r in range(tp):
             check_bf16(out[r], i, Float32(i % 32), label + " r" + String(r))
+    for r in range(tp):
+        raw[r].free()
+        out[r].free()
+
+
+def test_broadcast_src_rank_exact[
+    tp: Int,
+](n: Int, label: String, inline_max_bytes: Int, src_rank: Int):
+    var pools = HeapMoveArray[TestPool](tp)
+    for _ in range(tp):
+        pools.push(TestPool(4, 0))
+    var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
+    var out = InlineArray[BF16Ptr, tp](uninitialized=True)
+    for r in range(tp):
+        raw[r] = alloc[Scalar[DType.bfloat16]](n)
+        out[r] = alloc[Scalar[DType.bfloat16]](n)
+    fill_rank_bf16[tp](raw, n)
+    var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
+    var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n)
+    for r in range(tp):
+        src.ptrs[r] = raw[r].as_immutable()
+        dst.ptrs[r] = out[r]
+    dispatch_broadcast[BF16, tp](
+        src, dst, pools, src_rank=src_rank,
+        inline_max_bytes=inline_max_bytes)
+    for i in range(n):
+        var expected = Float32(src_rank * 10 + i % 32)
+        for r in range(tp):
+            check_bf16(out[r], i, expected, label + " r" + String(r))
     for r in range(tp):
         raw[r].free()
         out[r].free()
@@ -216,6 +247,11 @@ def run_exact_suite[tp: Int](n: Int, tag: String):
     test_reduce_wb_exact[tp](n, "reduce_wb parallel " + d, 0)
     test_broadcast_exact[tp](n, "broadcast inline " + d, 16384)
     test_broadcast_exact[tp](n, "broadcast parallel " + d, 0)
+    comptime if tp > 1:
+        test_broadcast_src_rank_exact[tp](
+            n, "broadcast src_rank inline " + d, 16384, tp - 1)
+        test_broadcast_src_rank_exact[tp](
+            n, "broadcast src_rank parallel " + d, 0, tp - 1)
     test_allgather_exact[tp](n, "allgather inline " + d, 16384)
     test_allgather_exact[tp](n, "allgather parallel " + d, 0)
 
@@ -241,7 +277,7 @@ def accuracy_allreduce[tp: Int](
         src.ptrs[r] = raw[r].as_immutable()
         dst.ptrs[r] = out[r]
 
-    allreduce[BF16, tp](src, dst, pools, inline_max_bytes)
+    dispatch_allreduce[BF16, tp](src, dst, pools, inline_max_bytes)
 
     var max_ulp = Float64(0)
     var sum_ulp = Float64(0)
@@ -370,8 +406,8 @@ def accuracy_crosspath[tp: Int](n: Int, label: String):
         dst_i.ptrs[r] = out_inline[r]
         dst_p.ptrs[r] = out_parallel[r]
 
-    allreduce[BF16, tp](src, dst_i, pools_a, 16384)
-    allreduce[BF16, tp](src, dst_p, pools_b, 0)
+    dispatch_allreduce[BF16, tp](src, dst_i, pools_a, 16384)
+    dispatch_allreduce[BF16, tp](src, dst_p, pools_b, 0)
 
     var mismatches = 0
     for r in range(tp):

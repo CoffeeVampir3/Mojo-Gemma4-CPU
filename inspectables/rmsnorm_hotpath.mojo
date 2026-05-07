@@ -44,7 +44,7 @@ def rms_reduce_row(src: BF16Ptr) -> Scalar[DType.float32]:
     for i in range(HIDDEN // STRIDE):
         comptime for p in range(PU):
             var v = (src + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
-            accs[p] = accs[p].fma(v, v)
+            accs[p] = v.fma(v, accs[p])
     return tree_reduce_accs(accs)
 
 
