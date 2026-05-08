@@ -3,7 +3,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
 from numa import NumaArena
-from kernels.helpers import RangedKernel
+from kernels.helpers import OutputPartitionedKernel
 from kernels.rmsnorm import rms_norm_row
 from modeling.gemma4_common import Gemma4BaseConfig
 from simd_math import (
@@ -62,7 +62,7 @@ def insert_topk[top_k: Int](
 
 
 @fieldwise_init
-struct RouterStreamKernel[hidden: Int, num_experts: Int, top_k: Int](RangedKernel):
+struct RouterStreamKernel[hidden: Int, num_experts: Int, top_k: Int](OutputPartitionedKernel):
     var x: BF16Ptr
     var router_proj: BF16Ptr
     var router_scale: BF16Ptr
@@ -151,7 +151,7 @@ struct RouteGatherConfig[tp: Int](Copyable):
 @fieldwise_init
 struct RouteGatherDstKernel[
     tp: Int, top_k: Int, cfg_origin: ImmutOrigin,
-](RangedKernel):
+](OutputPartitionedKernel):
     var config: UnsafePointer[RouteGatherConfig[Self.tp], Self.cfg_origin]
     var dst_idx: I32Ptr
     var dst_w: F32Ptr
@@ -173,7 +173,7 @@ struct RouteGatherDstKernel[
 
 
 @fieldwise_init
-struct FillBF16Kernel(RangedKernel):
+struct FillBF16Kernel(OutputPartitionedKernel):
     var dst: BF16Ptr
     var start: Int
     var end: Int
@@ -196,7 +196,7 @@ struct FillBF16Kernel(RangedKernel):
 @fieldwise_init
 struct RmsNormBenchKernel[
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
-](RangedKernel):
+](OutputPartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
     var weight: BF16Ptr
@@ -216,7 +216,7 @@ struct RmsNormBenchKernel[
 
 
 @fieldwise_init
-struct ExpertCountSlotKernel[top_k: Int, num_local_experts: Int](RangedKernel):
+struct ExpertCountSlotKernel[top_k: Int, num_local_experts: Int](OutputPartitionedKernel):
     var indices: I32Ptr
     var counts_per_worker: I32Ptr
     var rank: Int
@@ -244,7 +244,7 @@ struct ExpertCountSlotKernel[top_k: Int, num_local_experts: Int](RangedKernel):
 
 
 @fieldwise_init
-struct PrefixKernel[num_local_experts: Int](RangedKernel):
+struct PrefixKernel[num_local_experts: Int](OutputPartitionedKernel):
     var counts_per_worker: I32Ptr
     var expert_offset: I32Ptr
     var worker_cursor: I32Ptr
@@ -274,7 +274,7 @@ struct PrefixKernel[num_local_experts: Int](RangedKernel):
 
 
 @fieldwise_init
-struct PlaceSlotKernel[top_k: Int, num_local_experts: Int](RangedKernel):
+struct PlaceSlotKernel[top_k: Int, num_local_experts: Int](OutputPartitionedKernel):
     var indices: I32Ptr
     var weights: F32Ptr
     var worker_cursor: I32Ptr

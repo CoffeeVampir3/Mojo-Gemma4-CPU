@@ -10,7 +10,8 @@ from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.kv_tiled_attention import dispatch_sliding_attention, FLASH_PARTIAL_STRIDE
-from kernels.logsum_merge import merge_flash_partials
+from kernels.logsum_merge import dispatch_merge_flash_partials
+from kernels.helpers import NumaPointerArray
 
 
 comptime ALIGNMENT = 64
@@ -30,6 +31,15 @@ comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
 
 
+def arena_bases[tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+) -> InlineArray[Int, tp]:
+    var bases = InlineArray[Int, tp](uninitialized=True)
+    for r in range(tp):
+        bases[r] = Int(arenas[r].base.value())
+    return bases
+
+
 def arena_alloc[dtype: DType](
     mut arena: NumaArena[alignment=ALIGNMENT], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
@@ -40,9 +50,27 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
+def arena_alloc_all[dtype: DType, tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+    var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
+    for r in range(tp):
+        var ptr = arena_alloc[dtype](arenas[r], count)
+        if r == 0:
+            first = ptr
+    return first
+
+
 def fill_pattern(ptr: BF16Ptr, count: Int):
     for i in range(count):
         ptr[i] = Scalar[DType.bfloat16](Float32((i % 127) - 63) * 0.01)
+
+
+def fill_pattern_all[tp: Int](
+    ptrs: NumaPointerArray[DType.bfloat16, tp], count: Int,
+):
+    for r in range(tp):
+        fill_pattern(ptrs[r], count)
 
 
 def fmt_ns(ns: Int) -> String:
@@ -61,9 +89,9 @@ def fmt_bw(total_bytes: Int, ns: Int) -> String:
     return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
 
 
-def section_context_sweep[P: BurstThreadPool](
-    mut pool: P, q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
-    output: BF16Ptr, partials: F32Ptr,
+def section_context_sweep[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
+    output: BF16Ptr, partials: F32Ptr, bases: InlineArray[Int, tp],
 ):
     print("\n=== Context sweep (dispatch_sliding_attention) ===")
     print("  valid_len | latency      | KV read  | BW")
@@ -80,11 +108,18 @@ def section_context_sweep[P: BurstThreadPool](
 
         for _ in range(WARMUP):
             var nw = dispatch_sliding_attention[
-                head_dim=HEAD_DIM, num_q=NUM_Q, num_kv=NUM_KV,
-                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW](
-                q, k_cache, v_cache, partials, pos, vl, pool)
-            merge_flash_partials[HEAD_DIM, NUM_Q](
-                output, partials, FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pool)
+                head_dim=HEAD_DIM, num_q=NUM_Q,
+                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
+                tp=tp](
+                NumaPointerArray[DType.bfloat16, tp](q, bases),
+                NumaPointerArray[DType.bfloat16, tp](k_cache, bases),
+                NumaPointerArray[DType.bfloat16, tp](v_cache, bases),
+                NumaPointerArray[DType.float32, tp](partials, bases),
+                pos, vl, pools)
+            dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
+                NumaPointerArray[DType.bfloat16, tp](output, bases),
+                NumaPointerArray[DType.float32, tp](partials, bases),
+                FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pools)
             keep(output[0])
 
         var best = Int(1 << 60)
@@ -93,11 +128,18 @@ def section_context_sweep[P: BurstThreadPool](
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
                 var nw = dispatch_sliding_attention[
-                    head_dim=HEAD_DIM, num_q=NUM_Q, num_kv=NUM_KV,
-                    gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW](
-                    q, k_cache, v_cache, partials, pos, vl, pool)
-                merge_flash_partials[HEAD_DIM, NUM_Q](
-                    output, partials, FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pool)
+                    head_dim=HEAD_DIM, num_q=NUM_Q,
+                    gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
+                    tp=tp](
+                    NumaPointerArray[DType.bfloat16, tp](q, bases),
+                    NumaPointerArray[DType.bfloat16, tp](k_cache, bases),
+                    NumaPointerArray[DType.bfloat16, tp](v_cache, bases),
+                    NumaPointerArray[DType.float32, tp](partials, bases),
+                    pos, vl, pools)
+                dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
+                    NumaPointerArray[DType.bfloat16, tp](output, bases),
+                    NumaPointerArray[DType.float32, tp](partials, bases),
+                    FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pools)
                 elapsed += Int(perf_counter_ns()) - t0
             keep(output[0])
             var avg = elapsed // ITERS
@@ -112,20 +154,27 @@ def section_context_sweep[P: BurstThreadPool](
             + "  | " + fmt_bw(kv_bytes, best))
 
 
-def section_validation[P: BurstThreadPool](
-    mut pool: P, q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
-    output: BF16Ptr, partials: F32Ptr,
+def section_validation[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
+    output: BF16Ptr, partials: F32Ptr, bases: InlineArray[Int, tp],
 ):
     print("\n=== Validation (valid_len=64) ===")
     comptime VL = 64
     var pos = VL - 1
 
     var nw = dispatch_sliding_attention[
-        head_dim=HEAD_DIM, num_q=NUM_Q, num_kv=NUM_KV,
-        gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW](
-        q, k_cache, v_cache, partials, pos, VL, pool)
-    merge_flash_partials[HEAD_DIM, NUM_Q](
-        output, partials, FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pool)
+        head_dim=HEAD_DIM, num_q=NUM_Q,
+        gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
+        tp=tp](
+        NumaPointerArray[DType.bfloat16, tp](q, bases),
+        NumaPointerArray[DType.bfloat16, tp](k_cache, bases),
+        NumaPointerArray[DType.bfloat16, tp](v_cache, bases),
+        NumaPointerArray[DType.float32, tp](partials, bases),
+        pos, VL, pools)
+    dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
+        NumaPointerArray[DType.bfloat16, tp](output, bases),
+        NumaPointerArray[DType.float32, tp](partials, bases),
+        FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pools)
 
     print("  output[0..3]: "
         + String(output[0].cast[DType.float32]()) + " "
@@ -146,15 +195,21 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
     comptime flash_stride = FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM]
-    var q = arena_alloc[DType.bfloat16](arenas[0], NUM_Q * HEAD_DIM)
-    var k_cache = arena_alloc[DType.bfloat16](arenas[0], WINDOW * KV_STRIDE)
-    var v_cache = arena_alloc[DType.bfloat16](arenas[0], WINDOW * KV_STRIDE)
-    var output = arena_alloc[DType.bfloat16](arenas[0], NUM_Q * HEAD_DIM)
-    var partials = arena_alloc[DType.float32](arenas[0], MAX_WORKERS * flash_stride)
+    var bases = arena_bases[tp](arenas)
+    var q = arena_alloc_all[DType.bfloat16, tp](arenas, NUM_Q * HEAD_DIM)
+    var k_cache = arena_alloc_all[DType.bfloat16, tp](arenas, WINDOW * KV_STRIDE)
+    var v_cache = arena_alloc_all[DType.bfloat16, tp](arenas, WINDOW * KV_STRIDE)
+    var output = arena_alloc_all[DType.bfloat16, tp](arenas, NUM_Q * HEAD_DIM)
+    var partials = arena_alloc_all[DType.float32, tp](arenas, MAX_WORKERS * flash_stride)
 
-    fill_pattern(q, NUM_Q * HEAD_DIM)
-    fill_pattern(k_cache, WINDOW * KV_STRIDE)
-    fill_pattern(v_cache, WINDOW * KV_STRIDE)
+    fill_pattern_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](q, bases), NUM_Q * HEAD_DIM)
+    fill_pattern_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](k_cache, bases), WINDOW * KV_STRIDE)
+    fill_pattern_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](v_cache, bases), WINDOW * KV_STRIDE)
+    for r in range(tp):
+        _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
     print("pool capacity: " + String(cap) + " workers")
@@ -162,8 +217,8 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         + " num_kv=" + String(NUM_KV) + " gqa=" + String(GQA_RATIO)
         + " window=" + String(WINDOW))
 
-    section_validation(pools[0], q, k_cache, v_cache, output, partials)
-    section_context_sweep(pools[0], q, k_cache, v_cache, output, partials)
+    section_validation[tp=tp](pools, q, k_cache, v_cache, output, partials, bases)
+    section_context_sweep[tp=tp](pools, q, k_cache, v_cache, output, partials, bases)
 
 
 def main():

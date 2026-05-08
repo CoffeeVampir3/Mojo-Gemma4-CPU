@@ -3,13 +3,13 @@ from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
 
-from numa import NumaArena, NumaInfo, NumaTopology
+from numa import NumaArena, NumaInfo
 from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.logsum_merge import merge_flash_partials, reduce_partials
-from kernels.helpers import RangedKernel, DispatchBuffer, tile_dispatch
+from kernels.logsum_merge import dispatch_merge_flash_partials
+from kernels.helpers import OutputPartitionedKernel, DispatchBuffer, tile_dispatch, NumaPointerArray
 
 
 comptime ALIGNMENT = 64
@@ -27,7 +27,7 @@ comptime PARTIAL_STRIDE[num_q: Int, head_dim: Int]: Int = (
 
 
 @fieldwise_init
-struct NoopKernel(RangedKernel):
+struct NoopKernel(OutputPartitionedKernel):
     var dst: F32Ptr
     var start: Int
     var end: Int
@@ -55,6 +55,26 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
+def arena_bases[tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+) -> InlineArray[Int, tp]:
+    var bases = InlineArray[Int, tp](uninitialized=True)
+    for r in range(tp):
+        bases[r] = Int(arenas[r].base.value())
+    return bases
+
+
+def arena_alloc_all[dtype: DType, tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+    var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
+    for r in range(tp):
+        var ptr = arena_alloc[dtype](arenas[r], count)
+        if r == 0:
+            first = ptr
+    return first
+
+
 def fill_partials[head_dim: Int, num_q: Int](
     buf: F32Ptr, stride: Int, num_sources: Int,
 ):
@@ -69,6 +89,18 @@ def fill_partials[head_dim: Int, num_q: Int](
             (sp + l_off + h)[] = Scalar[DType.float32](1.0)
 
 
+def fill_partials_all[head_dim: Int, num_q: Int, tp: Int](
+    ptrs: NumaPointerArray[DType.float32, tp],
+    stride: Int, num_sources: Int,
+):
+    for r in range(tp):
+        fill_partials[head_dim, num_q](ptrs[r], stride, num_sources)
+
+
+def source_counts[tp: Int](num_sources: Int) -> InlineArray[Int, tp]:
+    return InlineArray[Int, tp](fill=num_sources)
+
+
 def fmt_ns(ns: Int) -> String:
     if ns < 1000:
         return String(ns) + " ns"
@@ -78,15 +110,19 @@ def fmt_ns(ns: Int) -> String:
         return String(ns // 1000000) + "." + String((ns % 1000000) // 100000) + " ms"
 
 
-def measure_finalize[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
+def measure_finalize[
+    P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
+](
     output: BF16Ptr, partials: F32Ptr, stride: Int, scratch: F32Ptr,
-    num_sources: Int, nw: Int, mut pool: P,
+    num_sources: Int, mut pools: HeapMoveArray[P], bases: InlineArray[Int, tp],
 ) -> Int:
-    warm_pool(scratch, pool)
+    warm_pool(scratch, pools[0])
     for _ in range(WARMUP):
-        merge_flash_partials[head_dim, num_q](
-            output, partials, stride, num_sources, pool,
-            inline_max_bytes=0, num_workers=nw)
+        dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+            NumaPointerArray[DType.bfloat16, tp](output, bases),
+            NumaPointerArray[DType.float32, tp](partials, bases),
+            stride, source_counts[tp](num_sources), pools,
+            inline_max_bytes=0)
         keep(output[0])
 
     var best = Int(1 << 60)
@@ -94,9 +130,11 @@ def measure_finalize[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            merge_flash_partials[head_dim, num_q](
-                output, partials, stride, num_sources, pool,
-                inline_max_bytes=0, num_workers=nw)
+            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+                NumaPointerArray[DType.bfloat16, tp](output, bases),
+                NumaPointerArray[DType.float32, tp](partials, bases),
+                stride, source_counts[tp](num_sources), pools,
+                inline_max_bytes=0)
             keep(output[0])
             elapsed += Int(perf_counter_ns()) - t0
         var avg = elapsed // ITERS
@@ -105,14 +143,18 @@ def measure_finalize[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
     return best
 
 
-def measure_finalize_inline[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
+def measure_finalize_inline[
+    P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
+](
     output: BF16Ptr, partials: F32Ptr, stride: Int, scratch: F32Ptr,
-    num_sources: Int, mut pool: P,
+    num_sources: Int, mut pools: HeapMoveArray[P], bases: InlineArray[Int, tp],
 ) -> Int:
-    warm_pool(scratch, pool)
+    warm_pool(scratch, pools[0])
     for _ in range(WARMUP):
-        merge_flash_partials[head_dim, num_q](
-            output, partials, stride, num_sources, pool,
+        dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+            NumaPointerArray[DType.bfloat16, tp](output, bases),
+            NumaPointerArray[DType.float32, tp](partials, bases),
+            stride, source_counts[tp](num_sources), pools,
             inline_max_bytes=FORCE_INLINE)
         keep(output[0])
 
@@ -121,8 +163,10 @@ def measure_finalize_inline[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            merge_flash_partials[head_dim, num_q](
-                output, partials, stride, num_sources, pool,
+            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+                NumaPointerArray[DType.bfloat16, tp](output, bases),
+                NumaPointerArray[DType.float32, tp](partials, bases),
+                stride, source_counts[tp](num_sources), pools,
                 inline_max_bytes=FORCE_INLINE)
             keep(output[0])
             elapsed += Int(perf_counter_ns()) - t0
@@ -132,44 +176,42 @@ def measure_finalize_inline[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
     return best
 
 
-def run_config[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
-    mut arena: NumaArena[alignment=ALIGNMENT],
-    mut pool: P,
+def run_config[
+    P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
+](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: HeapMoveArray[P],
 ):
     comptime stride = PARTIAL_STRIDE[num_q, head_dim]
-    var partials = arena_alloc[DType.float32](arena, MAX_SOURCES * stride)
-    var output = arena_alloc[DType.bfloat16](arena, num_q * head_dim)
-    var scratch = arena_alloc[DType.float32](arena, pool.get_capacity())
+    var bases = arena_bases[tp](arenas)
+    var partials = arena_alloc_all[DType.float32, tp](arenas, MAX_SOURCES * stride)
+    var output = arena_alloc_all[DType.bfloat16, tp](arenas, num_q * head_dim)
+    var scratch = arena_alloc[DType.float32](arenas[0], pools[0].get_capacity())
 
-    fill_partials[head_dim, num_q](partials, stride, MAX_SOURCES)
+    fill_partials_all[head_dim, num_q, tp](
+        NumaPointerArray[DType.float32, tp](partials, bases),
+        stride, MAX_SOURCES)
+    for r in range(tp):
+        _ = arenas[r].prefault(0, arenas[r].used())
 
     print("\n=== head_dim=" + String(head_dim) + " num_q=" + String(num_q)
-        + " pool_capacity=" + String(pool.get_capacity()) + " ===")
-    print("  sources | data     | inline     | nw=2       | nw=4       | nw=8       | nw=" + String(num_q))
+        + " pool_capacity=" + String(pools[0].get_capacity()) + " ===")
+    print("  sources | data     | inline     | dispatched")
 
     var source_counts = InlineArray[Int, 7](fill=0)
     source_counts[0] = 2; source_counts[1] = 4; source_counts[2] = 8
     source_counts[3] = 16; source_counts[4] = 32; source_counts[5] = 64
     source_counts[6] = 128
 
-    var worker_counts = InlineArray[Int, 4](fill=0)
-    worker_counts[0] = 2; worker_counts[1] = 4
-    worker_counts[2] = 8; worker_counts[3] = num_q
-
     for s in range(7):
         var ns = source_counts[s]
         var data_bytes = ns * (head_dim + 2) * 4 * num_q
 
-        var t_inline = measure_finalize_inline[head_dim, num_q](
-            output, partials, stride, scratch, ns, pool)
+        var t_inline = measure_finalize_inline[head_dim, num_q, tp](
+            output, partials, stride, scratch, ns, pools, bases)
 
-        var results = InlineArray[Int, 4](fill=0)
-        for w in range(4):
-            var nw = worker_counts[w]
-            if nw > num_q:
-                nw = num_q
-            results[w] = measure_finalize[head_dim, num_q](
-                output, partials, stride, scratch, ns, nw, pool)
+        var t_dispatched = measure_finalize[head_dim, num_q, tp](
+            output, partials, stride, scratch, ns, pools, bases)
 
         var line = "  " + String(ns)
         if ns < 100:
@@ -181,46 +223,60 @@ def run_config[P: BurstThreadPool, //, head_dim: Int, num_q: Int](
         line += " " * (7 - kb_str.byte_length())
         line += "| " + fmt_ns(t_inline)
         line += " " * max(0, 11 - fmt_ns(t_inline).byte_length())
+        line += "| " + fmt_ns(t_dispatched)
 
-        for w in range(4):
-            var s_val = fmt_ns(results[w])
-            line += "| " + s_val
-            line += " " * max(0, 11 - s_val.byte_length())
-
-        var best_val = t_inline
-        var best_label = "inline"
-        for w in range(4):
-            if results[w] < best_val:
-                best_val = results[w]
-                best_label = "nw=" + String(worker_counts[w])
-        line += "-> " + best_label
+        var best_label = "inline" if t_inline <= t_dispatched else "dispatched"
+        line += " -> " + best_label
 
         print(line)
 
 
 def main():
     var numa = NumaInfo()
-    var topo = numa.plan_topology(1)
+    var topo = numa.plan_topology(numa.num_nodes)
+    var tp = numa.num_nodes
 
     print("logsum_merge worker count sweep")
     print(String(numa.num_nodes) + " NUMA node(s), "
         + String(len(numa.isolated_cpus)) + " isolated cpus")
 
     comptime ARENA_BYTES = 128 * 1024 * 1024
-    var arena = NumaArena[alignment=ALIGNMENT](topo[0], ARENA_BYTES)
-    if not arena:
-        print("arena alloc failed")
-        return
+    var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
+    for i in range(tp):
+        arenas.push(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
+        if not arenas[i]:
+            print("arena alloc failed on node", topo[i])
+            return
 
     if numa.has_isolation():
         print("mode: isolated")
-        var pools = HeapMoveArray[IsolatedBurstPool[]](1)
-        pools.push(IsolatedBurstPool[].for_topology(numa, topo[0]))
-        run_config[head_dim=256, num_q=8](arena, pools[0])
-        run_config[head_dim=512, num_q=16](arena, pools[0])
+        var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
+        for i in range(tp):
+            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+        if tp == 1:
+            run_config[head_dim=256, num_q=8, tp=1](arenas, pools)
+            run_config[head_dim=512, num_q=16, tp=1](arenas, pools)
+        elif tp == 2:
+            run_config[head_dim=256, num_q=8, tp=2](arenas, pools)
+            run_config[head_dim=512, num_q=16, tp=2](arenas, pools)
+        elif tp == 4:
+            run_config[head_dim=256, num_q=8, tp=4](arenas, pools)
+            run_config[head_dim=512, num_q=16, tp=4](arenas, pools)
+        else:
+            print("unsupported tp=" + String(tp))
     else:
         print("mode: spin-backoff")
-        var pools = HeapMoveArray[BurstPool[]](1)
-        pools.push(BurstPool[].for_topology(numa, topo[0]))
-        run_config[head_dim=256, num_q=8](arena, pools[0])
-        run_config[head_dim=512, num_q=16](arena, pools[0])
+        var pools = HeapMoveArray[BurstPool[]](tp)
+        for i in range(tp):
+            pools.push(BurstPool[].for_topology(numa, topo[i]))
+        if tp == 1:
+            run_config[head_dim=256, num_q=8, tp=1](arenas, pools)
+            run_config[head_dim=512, num_q=16, tp=1](arenas, pools)
+        elif tp == 2:
+            run_config[head_dim=256, num_q=8, tp=2](arenas, pools)
+            run_config[head_dim=512, num_q=16, tp=2](arenas, pools)
+        elif tp == 4:
+            run_config[head_dim=256, num_q=8, tp=4](arenas, pools)
+            run_config[head_dim=512, num_q=16, tp=4](arenas, pools)
+        else:
+            print("unsupported tp=" + String(tp))

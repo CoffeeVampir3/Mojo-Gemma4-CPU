@@ -7,14 +7,14 @@ from std.sys.info import simd_width_of
 from numa import NumaArena, NumaInfo, NumaTopology
 from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
-from threading.threading_traits import BurstKernel, BurstThreadPool
+from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.helpers import DispatchBuffer, RangedKernel, tile_dispatch, recommended_workers
+from kernels.helpers import DispatchBuffer, recommended_workers, NumaPointerArray
 from kernels.rmsnorm import (
     rms_reduce_row, rms_normalize_row, rms_norm_row,
-    residual_add_rms_reduce_row,
-    fused_residual_norm_row, dispatch_rms_norm, fused_residual_norm,
-    RmsNormTokenKernel, FusedResidualNormTokenKernel,
+    norm_residual_add_row,
+    dispatch_rms_norm, fused_norm_residual_add,
+    RmsNormTokenKernel,
 )
 from simd_math.ops import sqrt
 
@@ -41,6 +41,26 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
+def arena_bases[tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+) -> InlineArray[Int, tp]:
+    var bases = InlineArray[Int, tp](uninitialized=True)
+    for r in range(tp):
+        bases[r] = Int(arenas[r].base.value())
+    return bases
+
+
+def arena_alloc_all[dtype: DType, tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+    var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
+    for r in range(tp):
+        var ptr = arena_alloc[dtype](arenas[r], count)
+        if r == 0:
+            first = ptr
+    return first
+
+
 def fill_norm_input(ptr: BF16Ptr, count: Int):
     for i in range(count):
         ptr[i] = Scalar[DType.bfloat16](Float32((i % 127) - 63) * 0.01)
@@ -49,6 +69,20 @@ def fill_norm_input(ptr: BF16Ptr, count: Int):
 def fill_ones(ptr: BF16Ptr, count: Int):
     for i in range(count):
         ptr[i] = Scalar[DType.bfloat16](Float32(1.0) + Float32(i % 64) * 0.001)
+
+
+def fill_norm_input_all[tp: Int](
+    ptrs: NumaPointerArray[DType.bfloat16, tp], count: Int,
+):
+    for r in range(tp):
+        fill_norm_input(ptrs[r], count)
+
+
+def fill_ones_all[tp: Int](
+    ptrs: NumaPointerArray[DType.bfloat16, tp], count: Int,
+):
+    for r in range(tp):
+        fill_ones(ptrs[r], count)
 
 
 def fmt_ns(ns: Int) -> String:
@@ -141,48 +175,27 @@ def section_row_primitives(src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr):
 
 
 def section_fused_primitives(
-    partial: BF16Ptr, residual: BF16Ptr,
-    res_dst: BF16Ptr, norm_dst: BF16Ptr, weight: BF16Ptr,
+    src: BF16Ptr, residual: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
 ):
     print("\n=== Fused row primitives (single token) ===")
 
     for _ in range(WARMUP):
-        var s = residual_add_rms_reduce_row[HIDDEN](partial, residual, res_dst)
-        keep(s)
-    var best_rr = Int(1 << 60)
+        norm_residual_add_row[HIDDEN, SQRT_N, N_EPS](src, residual, dst, weight)
+    var best = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            var s = residual_add_rms_reduce_row[HIDDEN](partial, residual, res_dst)
-            keep(s)
+            norm_residual_add_row[HIDDEN, SQRT_N, N_EPS](
+                src, residual, dst, weight)
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
         var avg = elapsed // ITERS
-        if avg < best_rr:
-            best_rr = avg
-    print("  residual+reduce:     " + fmt_ns(best_rr)
-        + "  (" + fmt_bw(HIDDEN * 2 * 3, best_rr) + " r+r+w)")
-
-    for _ in range(WARMUP):
-        fused_residual_norm_row[HIDDEN, SQRT_N, N_EPS](
-            partial, residual, res_dst, norm_dst, weight)
-    var best_fused = Int(1 << 60)
-    for _ in range(TRIALS):
-        var elapsed = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            fused_residual_norm_row[HIDDEN, SQRT_N, N_EPS](
-                partial, residual, res_dst, norm_dst, weight)
-            var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // ITERS
-        if avg < best_fused:
-            best_fused = avg
-    keep(norm_dst[0])
-    print("  fused residual+norm: " + fmt_ns(best_fused)
-        + "  (" + fmt_bw(HIDDEN * 2 * 5, best_fused) + " 2r+w+r+w)")
-
+        if avg < best:
+            best = avg
+    keep(dst[0])
+    print("  norm+residual add: " + fmt_ns(best)
+        + "  (" + fmt_bw(HIDDEN * 2 * 4, best) + " 2r+w+w)")
 
 def section_dispatch_overhead[P: BurstThreadPool](
     mut pool: P, src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
@@ -229,8 +242,9 @@ def section_dispatch_overhead[P: BurstThreadPool](
     print("  overhead:    " + fmt_ns(best_1w - best_inline))
 
 
-def section_seq_sweep[P: BurstThreadPool](
-    mut pool: P, src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
+def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P], src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
+    bases: InlineArray[Int, tp],
 ):
     print("\n=== Standalone norm: seq_len sweep ===")
     print("  seq | inline       | dispatched   | workers | tokens/us")
@@ -270,15 +284,21 @@ def section_seq_sweep[P: BurstThreadPool](
         keep(dst[0])
 
         for _ in range(WARMUP):
-            dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
-                src, dst, weight, seq, pool)
+            dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
+                NumaPointerArray[DType.bfloat16, tp](src, bases),
+                NumaPointerArray[DType.bfloat16, tp](dst, bases),
+                NumaPointerArray[DType.bfloat16, tp](weight, bases),
+                seq, pools)
         var best_dispatched = Int(1 << 60)
         for _ in range(TRIALS):
             var elapsed = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
-                dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
-                    src, dst, weight, seq, pool)
+                dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
+                    NumaPointerArray[DType.bfloat16, tp](src, bases),
+                    NumaPointerArray[DType.bfloat16, tp](dst, bases),
+                    NumaPointerArray[DType.bfloat16, tp](weight, bases),
+                    seq, pools)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
             var avg = elapsed // ITERS
@@ -287,7 +307,7 @@ def section_seq_sweep[P: BurstThreadPool](
         keep(dst[0])
 
         var data_bytes = seq * HIDDEN * 2
-        var nw = recommended_workers(data_bytes, pool.get_capacity())
+        var nw = recommended_workers(data_bytes, pools[0].get_capacity())
         if seq <= 16:
             nw = 0
 
@@ -303,12 +323,13 @@ def section_seq_sweep[P: BurstThreadPool](
             + "       | " + String(throughput))
 
 
-def section_fused_sweep[P: BurstThreadPool](
-    mut pool: P, partial: BF16Ptr, residual: BF16Ptr,
-    res_dst: BF16Ptr, norm_dst: BF16Ptr, weight: BF16Ptr,
+def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P], partial: BF16Ptr, residual: BF16Ptr,
+    res_dst: BF16Ptr, weight: BF16Ptr,
+    bases: InlineArray[Int, tp],
 ):
-    print("\n=== Fused residual+norm: seq_len sweep ===")
-    print("  seq | standalone   | fused        | savings")
+    print("\n=== Norm+residual add: seq_len sweep ===")
+    print("  seq | inline       | dispatched   | workers | tokens/us")
 
     comptime NUM_SIZES = 9
     var sizes = InlineArray[Int, NUM_SIZES](fill=0)
@@ -327,49 +348,69 @@ def section_fused_sweep[P: BurstThreadPool](
 
         for _ in range(WARMUP):
             for tok in range(seq):
-                rms_norm_row[HIDDEN, SQRT_N, N_EPS](
-                    partial + tok * HIDDEN, res_dst + tok * HIDDEN, weight)
-        var best_standalone = Int(1 << 60)
+                norm_residual_add_row[HIDDEN, SQRT_N, N_EPS](
+                    partial + tok * HIDDEN, residual + tok * HIDDEN,
+                    res_dst + tok * HIDDEN, weight)
+        var best_inline = Int(1 << 60)
         for _ in range(TRIALS):
             var elapsed = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
                 for tok in range(seq):
-                    rms_norm_row[HIDDEN, SQRT_N, N_EPS](
-                        partial + tok * HIDDEN, res_dst + tok * HIDDEN, weight)
+                    norm_residual_add_row[HIDDEN, SQRT_N, N_EPS](
+                        partial + tok * HIDDEN, residual + tok * HIDDEN,
+                        res_dst + tok * HIDDEN, weight)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
             var avg = elapsed // ITERS
-            if avg < best_standalone:
-                best_standalone = avg
+            if avg < best_inline:
+                best_inline = avg
         keep(res_dst[0])
 
         for _ in range(WARMUP):
-            fused_residual_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
-                partial, residual, res_dst, norm_dst, weight, seq, pool)
-        var best_fused = Int(1 << 60)
+            fused_norm_residual_add[
+                hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp,
+            ](
+                NumaPointerArray[DType.bfloat16, tp](partial, bases),
+                NumaPointerArray[DType.bfloat16, tp](residual, bases),
+                NumaPointerArray[DType.bfloat16, tp](res_dst, bases),
+                NumaPointerArray[DType.bfloat16, tp](weight, bases),
+                seq, pools)
+        var best_dispatched = Int(1 << 60)
         for _ in range(TRIALS):
             var elapsed = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
-                fused_residual_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
-                    partial, residual, res_dst, norm_dst, weight, seq, pool)
+                fused_norm_residual_add[
+                    hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp,
+                ](
+                    NumaPointerArray[DType.bfloat16, tp](partial, bases),
+                    NumaPointerArray[DType.bfloat16, tp](residual, bases),
+                    NumaPointerArray[DType.bfloat16, tp](res_dst, bases),
+                    NumaPointerArray[DType.bfloat16, tp](weight, bases),
+                    seq, pools)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
             var avg = elapsed // ITERS
-            if avg < best_fused:
-                best_fused = avg
-        keep(norm_dst[0])
+            if avg < best_dispatched:
+                best_dispatched = avg
+        keep(res_dst[0])
 
-        var pct = 0
-        if best_standalone > 0:
-            pct = 100 - (best_fused * 100 // best_standalone)
+        var data_bytes = seq * HIDDEN * 4
+        var nw = recommended_workers(data_bytes, pools[0].get_capacity())
+        if seq <= 16:
+            nw = 0
+
+        var throughput = 0
+        if best_dispatched > 0:
+            throughput = seq * 1000 // best_dispatched
 
         var pad = "  " if seq < 10 else " " if seq < 100 else ""
         print("  " + String(seq) + pad
-            + "  | " + fmt_ns(best_standalone)
-            + " | " + fmt_ns(best_fused)
-            + " | " + String(pct) + "%")
+            + "  | " + fmt_ns(best_inline)
+            + " | " + fmt_ns(best_dispatched)
+            + " | " + String(nw)
+            + "       | " + String(throughput))
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -377,18 +418,23 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
     comptime MAX_TOKENS = 256
-    var src = arena_alloc[DType.bfloat16](arenas[0], MAX_TOKENS * HIDDEN)
-    var dst = arena_alloc[DType.bfloat16](arenas[0], MAX_TOKENS * HIDDEN)
-    var weight = arena_alloc[DType.bfloat16](arenas[0], HIDDEN)
-    var partial = arena_alloc[DType.bfloat16](arenas[0], MAX_TOKENS * HIDDEN)
-    var residual = arena_alloc[DType.bfloat16](arenas[0], MAX_TOKENS * HIDDEN)
-    var res_dst = arena_alloc[DType.bfloat16](arenas[0], MAX_TOKENS * HIDDEN)
-    var norm_dst = arena_alloc[DType.bfloat16](arenas[0], MAX_TOKENS * HIDDEN)
+    var bases = arena_bases[tp](arenas)
+    var src = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
+    var dst = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
+    var weight = arena_alloc_all[DType.bfloat16, tp](arenas, HIDDEN)
+    var partial = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
+    var residual = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
+    var res_dst = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
 
-    fill_norm_input(src, MAX_TOKENS * HIDDEN)
-    fill_norm_input(partial, MAX_TOKENS * HIDDEN)
-    fill_norm_input(residual, MAX_TOKENS * HIDDEN)
-    fill_ones(weight, HIDDEN)
+    fill_norm_input_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](src, bases), MAX_TOKENS * HIDDEN)
+    fill_norm_input_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](partial, bases), MAX_TOKENS * HIDDEN)
+    fill_norm_input_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](residual, bases), MAX_TOKENS * HIDDEN)
+    fill_ones_all[tp](NumaPointerArray[DType.bfloat16, tp](weight, bases), HIDDEN)
+    for r in range(tp):
+        _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
     print("pool capacity: " + String(cap) + " workers")
@@ -396,10 +442,10 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     print("sqrt(N): " + String(SQRT_N) + ", N*eps: " + String(N_EPS))
 
     section_row_primitives(src, dst, weight)
-    section_fused_primitives(partial, residual, res_dst, norm_dst, weight)
+    section_fused_primitives(partial, residual, res_dst, weight)
     section_dispatch_overhead(pools[0], src, dst, weight)
-    section_seq_sweep(pools[0], src, dst, weight)
-    section_fused_sweep(pools[0], partial, residual, res_dst, norm_dst, weight)
+    section_seq_sweep[tp=tp](pools, src, dst, weight, bases)
+    section_fused_sweep[tp=tp](pools, partial, residual, res_dst, weight, bases)
 
 
 def main():

@@ -5,40 +5,15 @@ from std.sys.info import simd_width_of
 
 from modeling.model_spec import Encoding
 from notstdcollections import HeapMoveArray
-from threading.threading_traits import BurstKernel, BurstThreadPool
+from threading.threading_traits import BurstThreadPool
 from .helpers import (
-    RangedKernel, RankBuffers, DispatchBuffer,
+    OutputPartitionedKernel, RankBuffers, DispatchBuffer,
     join_all, tile_dispatch, recommended_workers,
 )
 
 
 comptime DEFAULT_INLINE_BYTES = 16384
 comptime DstPtr[dtype: DType] = UnsafePointer[Scalar[dtype], MutAnyOrigin]
-
-
-trait Writeback:
-    @staticmethod
-    def apply[
-        dtype: DType, dst_origin: MutOrigin, Accum: DType, width: Int,
-    ](
-        dst: UnsafePointer[Scalar[dtype], dst_origin],
-        pos: Int,
-        reduced: SIMD[Accum, width],
-    ): ...
-
-
-struct AddIntoDest(Writeback):
-    @staticmethod
-    @always_inline
-    def apply[
-        dtype: DType, dst_origin: MutOrigin, Accum: DType, width: Int,
-    ](
-        dst: UnsafePointer[Scalar[dtype], dst_origin],
-        pos: Int,
-        reduced: SIMD[Accum, width],
-    ):
-        var old = (dst + pos).load[width=width]().cast[Accum]()
-        (dst + pos).store((old + reduced).cast[dtype]())
 
 
 @fieldwise_init
@@ -50,27 +25,7 @@ struct ReduceConfig[E: Encoding, tp: Int, src_origin: ImmutOrigin]:
 
 
 @fieldwise_init
-struct ScratchReduceConfig[E: Encoding, tp: Int, src_origin: ImmutOrigin, Accum: DType]:
-    var src: InlineArray[UnsafePointer[Scalar[Self.E.DTYPE], Self.src_origin], Self.tp]
-    var scratch: DstPtr[Self.Accum]
-
-
-@fieldwise_init
-struct GatherConfig[E: Encoding, tp: Int, src_origin: ImmutOrigin]:
-    var src: InlineArray[UnsafePointer[Scalar[Self.E.DTYPE], Self.src_origin], Self.tp]
-    var shard_count: Int
-
-
-@fieldwise_init
-struct ChunkedReduceConfig[E: Encoding, tp: Int, src_origin: ImmutOrigin, Accum: DType]:
-    var src: InlineArray[UnsafePointer[Scalar[Self.E.DTYPE], Self.src_origin], Self.tp]
-    var scratches: InlineArray[DstPtr[Self.Accum], Self.tp]
-    var chunk: Int
-    var rem: Int
-
-
-@fieldwise_init
-struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](RangedKernel):
+struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](OutputPartitionedKernel):
     var dst: DstPtr[Self.dtype]
     var src: UnsafePointer[Scalar[Self.dtype], Self.src_origin]
     var start: Int
@@ -88,7 +43,7 @@ struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](RangedKernel):
 struct ReduceStoreKernel[
     E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin,
     Accum: DType = DType.float32,
-](RangedKernel):
+](OutputPartitionedKernel):
     var config: UnsafePointer[ReduceConfig[Self.E, Self.tp, Self.src_origin], Self.cfg_origin]
     var rank: Int
     var start: Int
@@ -103,7 +58,7 @@ struct ReduceStoreKernel[
 
 
 @fieldwise_init
-struct GatherKernel[E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin](RangedKernel):
+struct GatherKernel[E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin](OutputPartitionedKernel):
     var config: UnsafePointer[ReduceConfig[Self.E, Self.tp, Self.src_origin], Self.cfg_origin]
     var rank: Int
     var start: Int
@@ -115,93 +70,6 @@ struct GatherKernel[E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: I
 
     def over_range(self, start: Int, end: Int) -> Self:
         return Self(self.config, self.rank, start, end)
-
-
-@fieldwise_init
-struct ChunkedReduceKernel[
-    E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin,
-    Accum: DType = DType.float32,
-](RangedKernel):
-    var config: UnsafePointer[
-        ChunkedReduceConfig[Self.E, Self.tp, Self.src_origin, Self.Accum],
-        Self.cfg_origin,
-    ]
-    var rank: Int
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        var rank_start = self.config[].chunk * self.rank
-        var srcs = InlineArray[
-            UnsafePointer[Scalar[Self.E.DTYPE], Self.src_origin], Self.tp,
-        ](uninitialized=True)
-        for i in range(Self.tp):
-            srcs[i] = self.config[].src[i] + rank_start
-        reduce_sources_to[Self.E.DTYPE, Self.Accum, Self.tp, Self.src_origin, Self.Accum](
-            srcs, self.config[].scratches[self.rank], self.start, self.end)
-
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.config, self.rank, start, end)
-
-
-@fieldwise_init
-struct DistributedWritebackKernel[
-    E: Encoding, tp: Int, W: Writeback,
-    src_origin: ImmutOrigin, cfg_origin: ImmutOrigin,
-    Accum: DType = DType.float32,
-](RangedKernel):
-    var config: UnsafePointer[
-        ChunkedReduceConfig[Self.E, Self.tp, Self.src_origin, Self.Accum],
-        Self.cfg_origin,
-    ]
-    var dst: DstPtr[Self.E.DTYPE]
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        var chunk_size = self.config[].chunk
-        var remainder = self.config[].rem
-        for c in range(Self.tp):
-            var chunk_start = chunk_size * c
-            var chunk_count = chunk_size + (remainder if c == Self.tp - 1 else 0)
-            var lo = max(self.start, chunk_start)
-            var hi = min(self.end, chunk_start + chunk_count)
-            if lo >= hi:
-                continue
-            var scratch_ptr = self.config[].scratches[c]
-            var scratch_off = lo - chunk_start
-            var dst_off = lo
-
-            def step[width: Int](idx: Int) {read}:
-                var values = (scratch_ptr + scratch_off + idx).load[width=width]()
-                Self.W.apply[Self.E.DTYPE, MutAnyOrigin, Self.Accum, width](
-                    self.dst, dst_off + idx, values)
-
-            vectorize[simd_width_of[Self.Accum]()](hi - lo, step)
-
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.config, self.dst, start, end)
-
-
-@fieldwise_init
-struct AllGatherKernel[E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin](RangedKernel):
-    var config: UnsafePointer[GatherConfig[Self.E, Self.tp, Self.src_origin], Self.cfg_origin]
-    var dst: DstPtr[Self.E.DTYPE]
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        var cfg = self.config
-        var count = self.end - self.start
-        for src_rank in range(Self.tp):
-            memcpy(
-                dest=self.dst + src_rank * cfg[].shard_count + self.start,
-                src=cfg[].src[src_rank] + self.start,
-                count=count,
-            )
-
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.config, self.dst, start, end)
 
 
 @always_inline
@@ -269,37 +137,6 @@ def gather_chunks[E: Encoding, tp: Int, src_origin: ImmutOrigin](
             max(start, src_start), min(end, src_start + src_count))
 
 
-@always_inline
-def reduce_to_scratch_range[
-    E: Encoding, tp: Int, src_origin: ImmutOrigin,
-    Accum: DType = DType.float32,
-](
-    config: UnsafePointer[ScratchReduceConfig[E, tp, src_origin, Accum], _],
-    start: Int, end: Int,
-):
-    var srcs = InlineArray[UnsafePointer[Scalar[E.DTYPE], src_origin], tp](
-        uninitialized=True)
-    for r in range(tp):
-        srcs[r] = config[].src[r]
-    reduce_sources_to[E.DTYPE, Accum, tp, src_origin, Accum](
-        srcs, config[].scratch, start, end)
-
-
-def writeback_range[
-    E: Encoding, W: Writeback, scratch_origin: ImmutOrigin,
-    Accum: DType = DType.float32,
-](
-    scratch: UnsafePointer[Scalar[Accum], scratch_origin],
-    dst: DstPtr[E.DTYPE], start: Int, end: Int,
-):
-    def step[width: Int](idx: Int) {read}:
-        var pos = start + idx
-        var values = (scratch + pos).load[width=width]()
-        W.apply[E.DTYPE, MutAnyOrigin, Accum, width](dst, pos, values)
-
-    vectorize[simd_width_of[Accum]()](end - start, step)
-
-
 def make_reduce_config[
     E: Encoding, tp: Int, src_origin: ImmutOrigin, dst_origin: MutOrigin,
 ](
@@ -312,17 +149,6 @@ def make_reduce_config[
         dst_ptrs[r] = dst.ptrs[r].as_any_origin()
     return ReduceConfig[E, tp, src_origin](
         src=src.ptrs, dst=dst_ptrs, chunk=chunk, rem=src.count - chunk * tp,
-    )
-
-
-def make_scratch_config[
-    E: Encoding, tp: Int, src_origin: ImmutOrigin, Accum: DType,
-](
-    src: RankBuffers[E.DTYPE, tp, src_origin],
-    scratch: DstPtr[Accum],
-) -> ScratchReduceConfig[E, tp, src_origin, Accum]:
-    return ScratchReduceConfig[E, tp, src_origin, Accum](
-        src=src.ptrs, scratch=scratch,
     )
 
 
@@ -368,67 +194,6 @@ def dispatch_allreduce[
             pools[r], src.count, num_workers=nw)
     join_all[tp](pools)
 
-
-def reduce_writeback[
-    P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
-    E: Encoding, tp: Int, W: Writeback, Accum: DType = DType.float32,
-](
-    src: RankBuffers[E.DTYPE, tp, src_origin],
-    output: RankBuffers[E.DTYPE, tp, dst_origin],
-    scratch: RankBuffers[Accum, tp, MutAnyOrigin],
-    mut pools: HeapMoveArray[P],
-    inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
-):
-    if src.count <= 0:
-        return
-
-    comptime scratch_ro = ImmutOrigin(MutAnyOrigin)
-
-    if src.count * E.ELEMENT_BYTES <= inline_max_bytes or tp <= 1:
-        var scfg = make_scratch_config[E, tp, src_origin, Accum](src, scratch.ptrs[0])
-        var sconfig = UnsafePointer(to=scfg).as_immutable()
-        reduce_to_scratch_range[E, tp, src_origin, Accum](sconfig, 0, src.count)
-        for r in range(tp):
-            writeback_range[E, W, scratch_ro, Accum](
-                scratch.ptrs[0].as_immutable(), output[r].as_any_origin(), 0, src.count)
-        return
-
-    var chunk = src.count // tp
-    var rem = src.count - chunk * tp
-
-    var scratch_ptrs = InlineArray[DstPtr[Accum], tp](uninitialized=True)
-    for r in range(tp):
-        scratch_ptrs[r] = scratch.ptrs[r]
-    var cfg = ChunkedReduceConfig[E, tp, src_origin, Accum](
-        src=src.ptrs, scratches=scratch_ptrs, chunk=chunk, rem=rem)
-    var config = UnsafePointer(to=cfg).as_immutable()
-    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
-
-    var data_bytes = src.count * E.ELEMENT_BYTES
-    var reduce_buf = DispatchBuffer[
-        ChunkedReduceKernel[E, tp, src_origin, cfg_ro, Accum],
-    ]()
-    for r in range(tp):
-        var rank_count = rank_chunk_count[tp](chunk, rem, r)
-        var nw = recommended_workers(rank_count * E.ELEMENT_BYTES, pools[r].get_capacity())
-        tile_dispatch(reduce_buf,
-            ChunkedReduceKernel[E, tp, src_origin, cfg_ro, Accum](
-                config, r, 0, 0),
-            pools[r], rank_count, num_workers=nw)
-    join_all[tp](pools)
-
-    var wb_buf = DispatchBuffer[
-        DistributedWritebackKernel[E, tp, W, src_origin, cfg_ro, Accum],
-    ]()
-    for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
-        tile_dispatch(wb_buf,
-            DistributedWritebackKernel[E, tp, W, src_origin, cfg_ro, Accum](
-                config, output[r].as_any_origin(), 0, 0),
-            pools[r], src.count, num_workers=nw)
-    join_all[tp](pools)
-
-
 def dispatch_broadcast[
     P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
     E: Encoding, tp: Int,
@@ -467,43 +232,3 @@ def dispatch_broadcast[
     for r in range(tp):
         if r != src_rank:
             pools[r].join()
-
-
-def allgather[
-    P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
-    E: Encoding, tp: Int,
-](
-    src: RankBuffers[E.DTYPE, tp, src_origin],
-    dst: RankBuffers[E.DTYPE, tp, dst_origin],
-    mut pools: HeapMoveArray[P],
-    inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
-):
-    if src.count <= 0:
-        return
-
-    if tp <= 1:
-        if src[0] != dst[0]:
-            memcpy(dest=dst[0].as_any_origin(), src=src[0], count=src.count)
-        return
-
-    if src.count * E.ELEMENT_BYTES <= inline_max_bytes:
-        for r in range(tp):
-            var d = dst[r].as_any_origin()
-            for src_rank in range(tp):
-                memcpy(dest=d + src_rank * src.count, src=src[src_rank],
-                       count=src.count)
-        return
-
-    var cfg = GatherConfig[E, tp, src_origin](src=src.ptrs, shard_count=src.count)
-    var config = UnsafePointer(to=cfg).as_immutable()
-    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
-
-    var data_bytes = src.count * E.ELEMENT_BYTES * tp
-    var buf = DispatchBuffer[AllGatherKernel[E, tp, src_origin, cfg_ro]]()
-    for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
-        tile_dispatch(buf,
-            AllGatherKernel[E, tp, src_origin, cfg_ro](
-                config, dst[r].as_any_origin(), 0, 0),
-            pools[r], src.count, num_workers=nw)
-    join_all[tp](pools)

@@ -4,7 +4,7 @@ from std.sys.info import simd_width_of
 
 from simd_math import pick_port_unroll, tree_reduce_accs
 from simd_math.ops import gelu_tanh_f32
-from kernels.helpers import RangedKernel
+from kernels.helpers import OutputPartitionedKernel
 from prototypes.dpbf16 import bf16_pair_dot, prefetch_l1
 
 
@@ -17,7 +17,7 @@ comptime W = simd_width_of[DType.float32]()
 @fieldwise_init
 struct ExpertRunnerSlotKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, num_local_experts: Int,
-](RangedKernel):
+](OutputPartitionedKernel):
     var x_normed: BF16Ptr
     var expert_offset: I32Ptr
     var bucket_token_idx: I32Ptr
@@ -101,7 +101,7 @@ comptime EXPERT_PU = 4
 @fieldwise_init
 struct ExpertBatchedKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, num_local_experts: Int,
-](RangedKernel):
+](OutputPartitionedKernel):
     var x_normed: BF16Ptr
     var expert_offset: I32Ptr
     var bucket_token_idx: I32Ptr
@@ -275,7 +275,7 @@ struct ExpertBatchedKernel[
 @fieldwise_init
 struct ExpertBatchedDpKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, num_local_experts: Int,
-](RangedKernel):
+](OutputPartitionedKernel):
     var x_normed: BF16Ptr
     var expert_offset: I32Ptr
     var bucket_token_idx: I32Ptr
@@ -455,7 +455,7 @@ struct ExpertBatchedDpKernel[
 @fieldwise_init
 struct ExpertBatchedDpDownKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, num_local_experts: Int,
-](RangedKernel):
+](OutputPartitionedKernel):
     var x_normed: BF16Ptr
     var expert_offset: I32Ptr
     var bucket_token_idx: I32Ptr

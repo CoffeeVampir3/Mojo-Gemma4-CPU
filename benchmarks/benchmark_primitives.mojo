@@ -10,7 +10,7 @@ from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstKernel, BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.helpers import (
-    RangedKernel, DispatchBuffer, RankBuffers,
+    OutputPartitionedKernel, DispatchBuffer, RankBuffers,
     tile_dispatch, join_all, worker_range,
 )
 from kernels.reductions import dispatch_allreduce
@@ -54,7 +54,7 @@ def print_bw(label: String, total_bytes: Int, ns: Int):
 
 
 @fieldwise_init
-struct ReadSweepKernel(RangedKernel):
+struct ReadSweepKernel(OutputPartitionedKernel):
     var src: BF16Ptr
     var start: Int
     var end: Int
@@ -73,7 +73,7 @@ struct ReadSweepKernel(RangedKernel):
 
 
 @fieldwise_init
-struct WriteSweepKernel(RangedKernel):
+struct WriteSweepKernel(OutputPartitionedKernel):
     var dst: BF16Ptr
     var start: Int
     var end: Int
@@ -91,7 +91,7 @@ struct WriteSweepKernel(RangedKernel):
 
 
 @fieldwise_init
-struct CopySweepKernel(RangedKernel):
+struct CopySweepKernel(OutputPartitionedKernel):
     var dst: BF16Ptr
     var src: BF16Ptr
     var start: Int

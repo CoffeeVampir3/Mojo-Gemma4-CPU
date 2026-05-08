@@ -4,17 +4,15 @@ from std.os import abort
 
 from kernels.helpers import RankBuffers
 from kernels.reductions import (
-    AddIntoDest, dispatch_allreduce, reduce_writeback, dispatch_broadcast,
-    allgather,
+    dispatch_allreduce, dispatch_broadcast,
 )
-from modeling.model_spec import BF16, F32
+from modeling.model_spec import BF16
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
 comptime ImmutExt = ImmutOrigin(MutExternalOrigin)
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutExternalOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutExternalOrigin]
 
 
 @fieldwise_init
@@ -75,21 +73,8 @@ def fill_rank_bf16[tp: Int](ptrs: InlineArray[BF16Ptr, tp], n: Int):
             ptrs[r][i] = Scalar[DType.bfloat16](Float32(r * 10 + i % 32))
 
 
-def fill_rank_f32[tp: Int](ptrs: InlineArray[F32Ptr, tp], n: Int):
-    for r in range(tp):
-        for i in range(n):
-            ptrs[r][i] = Float32(r * 10 + i % 32)
-
-
 def check_bf16(ptr: BF16Ptr, idx: Int, expected: Float32, msg: String):
     var got = Float32(ptr[idx])
-    check(got == expected,
-        msg + " [" + String(idx) + "] expected=" + String(expected)
-        + " got=" + String(got))
-
-
-def check_f32(ptr: F32Ptr, idx: Int, expected: Float32, msg: String):
-    var got = ptr[idx]
     check(got == expected,
         msg + " [" + String(idx) + "] expected=" + String(expected)
         + " got=" + String(got))
@@ -122,40 +107,6 @@ def test_allreduce_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
     for r in range(tp):
         raw[r].free()
         out[r].free()
-
-
-def test_reduce_wb_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
-    var pools = HeapMoveArray[TestPool](tp)
-    for _ in range(tp):
-        pools.push(TestPool(4, 0))
-    var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
-    var dst_ptrs = InlineArray[BF16Ptr, tp](uninitialized=True)
-    for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        dst_ptrs[r] = alloc[Scalar[DType.bfloat16]](n)
-    fill_rank_bf16[tp](raw, n)
-    for r in range(tp):
-        for i in range(n):
-            dst_ptrs[r][i] = Scalar[DType.bfloat16](Float32((r + 1) * 5 + i % 16))
-    var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
-    var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n)
-    var scratch = RankBuffers[DType.float32, tp, MutAnyOrigin](count=n)
-    for r in range(tp):
-        src.ptrs[r] = raw[r].as_immutable()
-        dst.ptrs[r] = dst_ptrs[r]
-        scratch.ptrs[r] = alloc[Scalar[DType.float32]](n).as_any_origin()
-    reduce_writeback[BF16, tp, AddIntoDest](src, dst, scratch, pools, inline_max_bytes)
-    for i in range(n):
-        var reduced = Float32(0)
-        for r in range(tp):
-            reduced += Float32(r * 10 + i % 32)
-        for r in range(tp):
-            var old_val = Float32((r + 1) * 5 + i % 16)
-            check_bf16(dst_ptrs[r], i, old_val + reduced,
-                label + " r" + String(r))
-    for r in range(tp):
-        raw[r].free()
-        dst_ptrs[r].free()
 
 
 def test_broadcast_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
@@ -212,39 +163,10 @@ def test_broadcast_src_rank_exact[
         out[r].free()
 
 
-def test_allgather_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
-    var pools = HeapMoveArray[TestPool](tp)
-    for _ in range(tp):
-        pools.push(TestPool(4, 0))
-    var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
-    var out = InlineArray[BF16Ptr, tp](uninitialized=True)
-    for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        out[r] = alloc[Scalar[DType.bfloat16]](n * tp)
-    fill_rank_bf16[tp](raw, n)
-    var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
-    var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n * tp)
-    for r in range(tp):
-        src.ptrs[r] = raw[r].as_immutable()
-        dst.ptrs[r] = out[r]
-    allgather[BF16, tp](src, dst, pools, inline_max_bytes)
-    for r in range(tp):
-        for shard in range(tp):
-            for i in range(n):
-                check_bf16(out[r], shard * n + i,
-                    Float32(shard * 10 + i % 32),
-                    label + " r" + String(r) + " s" + String(shard))
-    for r in range(tp):
-        raw[r].free()
-        out[r].free()
-
-
 def run_exact_suite[tp: Int](n: Int, tag: String):
     var d = "tp=" + String(tp) + " n=" + String(n) + " " + tag
     test_allreduce_exact[tp](n, "allreduce inline " + d, 16384)
     test_allreduce_exact[tp](n, "allreduce parallel " + d, 0)
-    test_reduce_wb_exact[tp](n, "reduce_wb inline " + d, 16384)
-    test_reduce_wb_exact[tp](n, "reduce_wb parallel " + d, 0)
     test_broadcast_exact[tp](n, "broadcast inline " + d, 16384)
     test_broadcast_exact[tp](n, "broadcast parallel " + d, 0)
     comptime if tp > 1:
@@ -252,8 +174,6 @@ def run_exact_suite[tp: Int](n: Int, tag: String):
             n, "broadcast src_rank inline " + d, 16384, tp - 1)
         test_broadcast_src_rank_exact[tp](
             n, "broadcast src_rank parallel " + d, 0, tp - 1)
-    test_allgather_exact[tp](n, "allgather inline " + d, 16384)
-    test_allgather_exact[tp](n, "allgather parallel " + d, 0)
 
 
 # ---- Accuracy tests (numerical error measurement) ----
@@ -315,74 +235,6 @@ def accuracy_allreduce[tp: Int](
         out[r].free()
 
 
-def accuracy_reduce_wb[tp: Int](
-    n: Int, label: String, hypothesis_ulp: Float64,
-    inline_max_bytes: Int,
-):
-    var pools = HeapMoveArray[TestPool](tp)
-    for _ in range(tp):
-        pools.push(TestPool(4, 0))
-    var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
-    var dst_ptrs = InlineArray[BF16Ptr, tp](uninitialized=True)
-    for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        dst_ptrs[r] = alloc[Scalar[DType.bfloat16]](n)
-        hash_fill(raw[r], n, r)
-        hash_fill(dst_ptrs[r], n, r + 100)
-    var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
-    var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n)
-    var scratch = RankBuffers[DType.float32, tp, MutAnyOrigin](count=n)
-    for r in range(tp):
-        src.ptrs[r] = raw[r].as_immutable()
-        dst.ptrs[r] = dst_ptrs[r]
-        scratch.ptrs[r] = alloc[Scalar[DType.float32]](n).as_any_origin()
-
-    var old_dst = InlineArray[BF16Ptr, tp](uninitialized=True)
-    for r in range(tp):
-        old_dst[r] = alloc[Scalar[DType.bfloat16]](n)
-        for i in range(n):
-            old_dst[r][i] = dst_ptrs[r][i]
-
-    reduce_writeback[BF16, tp, AddIntoDest](src, dst, scratch, pools, inline_max_bytes)
-
-    var max_ulp = Float64(0)
-    var sum_ulp = Float64(0)
-    var max_abs = Float64(0)
-    var total = 0
-    for r in range(tp):
-        for i in range(n):
-            var reduced = Float64(0)
-            for s in range(tp):
-                reduced += Float64(Float32(raw[s][i]))
-            var reference = Float64(Float32(old_dst[r][i])) + reduced
-            var actual = Float64(Float32(dst_ptrs[r][i]))
-            var err = abs(actual - reference)
-            if err > max_abs:
-                max_abs = err
-            var ulp = bf16_ulp_at(reference)
-            var ulp_err = err / ulp
-            if ulp_err > max_ulp:
-                max_ulp = ulp_err
-            sum_ulp += ulp_err
-            total += 1
-
-    var mean_ulp = sum_ulp / Float64(total) if total > 0 else Float64(0)
-    var accepted = max_ulp <= hypothesis_ulp
-    var status = "ACCEPT" if accepted else "REJECT"
-    print(label)
-    print("  hypothesis: max error <= " + String(hypothesis_ulp) + " ULP")
-    print("  measured:   max_ulp=" + String(max_ulp) + "  mean_ulp="
-        + String(mean_ulp) + "  max_abs=" + String(max_abs))
-    print("  " + status)
-    if not accepted:
-        abort("hypothesis rejected: " + label)
-
-    for r in range(tp):
-        raw[r].free()
-        dst_ptrs[r].free()
-        old_dst[r].free()
-
-
 def accuracy_crosspath[tp: Int](n: Int, label: String):
     var pools_a = HeapMoveArray[TestPool](tp)
     var pools_b = HeapMoveArray[TestPool](tp)
@@ -433,8 +285,6 @@ def run_accuracy_suite[tp: Int](n: Int, tag: String):
     var d = "tp=" + String(tp) + " n=" + String(n) + " " + tag
     accuracy_allreduce[tp](n, "allreduce bf16 inline " + d, 1.0, 16384)
     accuracy_allreduce[tp](n, "allreduce bf16 parallel " + d, 1.0, 0)
-    accuracy_reduce_wb[tp](n, "reduce_wb inline " + d, 1.0, 16384)
-    accuracy_reduce_wb[tp](n, "reduce_wb parallel " + d, 1.0, 0)
     accuracy_crosspath[tp](n, "allreduce crosspath " + d)
 
 

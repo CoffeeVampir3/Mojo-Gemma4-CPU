@@ -5,15 +5,16 @@ from std.sys.info import simd_width_of
 
 from simd_math.ops import sqrt
 from simd_math import pick_port_unroll, tree_reduce_accs
-from threading.threading_traits import BurstKernel, BurstThreadPool
+from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    Chain, RangedKernel, DispatchBuffer, tile_dispatch, recommended_workers,
+    Chain, OutputPartitionedKernel, DispatchBuffer,
+    tile_dispatch, recommended_workers, join_all,
+    NumaPointerArray,
 )
 
 
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
 comptime W = simd_width_of[DType.float32]()
 
 
@@ -60,44 +61,29 @@ def rms_norm_row[
 
 
 @always_inline
-def residual_add_rms_reduce_row[hidden: Int](
-    partial: BF16Ptr, residual: BF16Ptr, dst: BF16Ptr,
-) -> Scalar[DType.float32]:
-    comptime PU = pick_port_unroll[W, hidden]()
-    comptime STRIDE = PU * W
-    var accs = InlineArray[SIMD[DType.float32, W], PU](fill=SIMD[DType.float32, W](0))
-    for i in range(hidden // STRIDE):
-        comptime for p in range(PU):
-            var off = i * STRIDE + p * W
-            var p_val = (partial + off).load[width=W]().cast[DType.float32]()
-            var r_val = (residual + off).load[width=W]().cast[DType.float32]()
-            var sum = p_val + r_val
-            (dst + off).store(sum.cast[DType.bfloat16]())
-            accs[p] = sum.fma(sum, accs[p])
-    return tree_reduce_accs(accs)
-
-
-@always_inline
-def fused_residual_norm_row[
+def norm_residual_add_row[
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
 ](
-    partial: BF16Ptr, residual: BF16Ptr,
-    residual_dst: BF16Ptr, norm_dst: BF16Ptr,
-    weight: BF16Ptr,
+    src: BF16Ptr, residual: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
 ):
-    var sum_sq = residual_add_rms_reduce_row[hidden](partial, residual, residual_dst)
+    var sum_sq = rms_reduce_row[hidden](src)
     var inv_rms = sqrt_n / sqrt[DType.float32, 1](sum_sq + n_eps)
-    rms_normalize_row[hidden](residual_dst, norm_dst, weight, inv_rms)
 
+    def step[width: Int](idx: Int) {read}:
+        var x = (src + idx).load[width=width]().cast[DType.float32]()
+        var r = (residual + idx).load[width=width]().cast[DType.float32]()
+        var w = (weight + idx).load[width=width]().cast[DType.float32]()
+        var factor = SIMD[DType.float32, width](inv_rms)
+        (dst + idx).store((r + x * factor * w).cast[DType.bfloat16]())
 
-# === Dispatched kernels (token-parallel) ===
+    vectorize[W](hidden, step)
 
 
 @fieldwise_init
 struct RmsNormTokenKernel[
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
     scaled: Bool = True,
-](RangedKernel):
+](OutputPartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
     var weight: BF16Ptr
@@ -116,13 +102,12 @@ struct RmsNormTokenKernel[
 
 
 @fieldwise_init
-struct FusedResidualNormTokenKernel[
+struct NormResidualAddTokenKernel[
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
-](RangedKernel):
-    var partial: BF16Ptr
+](OutputPartitionedKernel):
+    var src: BF16Ptr
     var residual: BF16Ptr
-    var residual_dst: BF16Ptr
-    var norm_dst: BF16Ptr
+    var dst: BF16Ptr
     var weight: BF16Ptr
     var start: Int
     var end: Int
@@ -130,48 +115,51 @@ struct FusedResidualNormTokenKernel[
     def execute(mut self):
         for tok in range(self.start, self.end):
             var off = tok * Self.hidden
-            fused_residual_norm_row[Self.hidden, Self.sqrt_n, Self.n_eps](
-                self.partial + off, self.residual + off,
-                self.residual_dst + off, self.norm_dst + off,
+            norm_residual_add_row[Self.hidden, Self.sqrt_n, Self.n_eps](
+                self.src + off, self.residual + off, self.dst + off,
                 self.weight)
 
     def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.partial, self.residual, self.residual_dst,
-                    self.norm_dst, self.weight, start, end)
+        return Self(self.src, self.residual, self.dst, self.weight, start, end)
 
 
-# TODO: Make this a parameter
 comptime NORM_INLINE_TOKENS = 16
 
 
 def dispatch_rms_norm[
     P: BurstThreadPool, //,
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
-    scaled: Bool = True,
+    tp: Int, scaled: Bool = True,
 ](
-    src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
-    count: Int, mut pool: P,
+    src: NumaPointerArray[DType.bfloat16, tp],
+    dst: NumaPointerArray[DType.bfloat16, tp],
+    weight: NumaPointerArray[DType.bfloat16, tp],
+    count: Int,
+    mut pools: HeapMoveArray[P],
 ):
     if count <= NORM_INLINE_TOKENS:
-        for tok in range(count):
-            rms_norm_row[hidden, sqrt_n, n_eps, scaled](
-                src + tok * hidden, dst + tok * hidden, weight)
+        for r in range(tp):
+            for tok in range(count):
+                rms_norm_row[hidden, sqrt_n, n_eps, scaled](
+                    src[r] + tok * hidden, dst[r] + tok * hidden, weight[r])
         return
 
     var data_bytes = count * hidden * 2
-    var nw = recommended_workers(data_bytes, pool.get_capacity())
     var buf = DispatchBuffer[RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled]]()
-    tile_dispatch(buf,
-        RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled](src, dst, weight, 0, 0),
-        pool, count, num_workers=nw)
-    pool.join()
+    for r in range(tp):
+        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        tile_dispatch(buf,
+            RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled](
+                src[r], dst[r], weight[r], 0, 0),
+            pools[r], count, num_workers=nw)
+    join_all[tp](pools)
 
 
 @fieldwise_init
 struct ScaledNormKernel[
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
     scaled: Bool, numer: Int, denom: Int,
-](RangedKernel):
+](OutputPartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
     var weight: BF16Ptr
@@ -194,68 +182,80 @@ struct ScaledNormKernel[
 def dispatch_rms_norm_qkv_heads[
     P: BurstThreadPool, //,
     head_dim: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
-    num_q: Int, num_kv: Int,
+    num_q: Int, num_kv: Int, tp: Int,
 ](
-    q: BF16Ptr, k: BF16Ptr, v: BF16Ptr,
-    q_weight: BF16Ptr, k_weight: BF16Ptr,
-    mut pool: P,
+    q_src: NumaPointerArray[DType.bfloat16, tp],
+    q_dst: NumaPointerArray[DType.bfloat16, tp],
+    k_src: NumaPointerArray[DType.bfloat16, tp],
+    k_dst: NumaPointerArray[DType.bfloat16, tp],
+    v_src: NumaPointerArray[DType.bfloat16, tp],
+    v_dst: NumaPointerArray[DType.bfloat16, tp],
+    q_weight: NumaPointerArray[DType.bfloat16, tp],
+    k_weight: NumaPointerArray[DType.bfloat16, tp],
+    mut pools: HeapMoveArray[P],
 ):
     comptime total = num_q + num_kv + num_kv
 
     if total <= NORM_INLINE_TOKENS:
-        for h in range(num_q):
-            rms_norm_row[head_dim, sqrt_n, n_eps](
-                q + h * head_dim, q + h * head_dim, q_weight)
-        for h in range(num_kv):
-            rms_norm_row[head_dim, sqrt_n, n_eps](
-                k + h * head_dim, k + h * head_dim, k_weight)
-        for h in range(num_kv):
-            rms_norm_row[head_dim, sqrt_n, n_eps, scaled=False](
-                v + h * head_dim, v + h * head_dim, k_weight)
+        for r in range(tp):
+            for h in range(num_kv):
+                rms_norm_row[head_dim, sqrt_n, n_eps, scaled=False](
+                    v_src[r] + h * head_dim, v_dst[r] + h * head_dim, k_weight[r])
+            for h in range(num_q):
+                rms_norm_row[head_dim, sqrt_n, n_eps](
+                    q_src[r] + h * head_dim, q_dst[r] + h * head_dim, q_weight[r])
+            for h in range(num_kv):
+                rms_norm_row[head_dim, sqrt_n, n_eps](
+                    k_src[r] + h * head_dim, k_dst[r] + h * head_dim, k_weight[r])
         return
 
-    var nw = pool.get_capacity()
-
+    comptime VK = ScaledNormKernel[head_dim, sqrt_n, n_eps, False, num_kv, total]
     comptime QK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_q, total]
     comptime KK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_kv, total]
-    comptime VK = ScaledNormKernel[head_dim, sqrt_n, n_eps, False, num_kv, total]
-    comptime QKChain = Chain[QK, KK]
-    comptime QKVChain = Chain[QKChain, VK]
+    comptime VQChain = Chain[VK, QK]
+    comptime VQKChain = Chain[VQChain, KK]
 
-    var proto = QKVChain(
-        QKChain(
-            QK(q, q, q_weight, 0, 0),
-            KK(k, k, k_weight, 0, 0),
-        ),
-        VK(v, v, k_weight, 0, 0),
-    )
+    var buf = DispatchBuffer[VQKChain]()
+    for r in range(tp):
+        var nw = pools[r].get_capacity()
+        tile_dispatch(buf,
+            VQKChain(
+                VQChain(
+                    VK(v_src[r], v_dst[r], k_weight[r], 0, 0),
+                    QK(q_src[r], q_dst[r], q_weight[r], 0, 0),
+                ),
+                KK(k_src[r], k_dst[r], k_weight[r], 0, 0),
+            ),
+            pools[r], total, num_workers=nw)
+    join_all[tp](pools)
 
-    var buf = DispatchBuffer[QKVChain]()
-    tile_dispatch(buf, proto, pool, total, num_workers=nw)
-    pool.join()
 
-
-def fused_residual_norm[
+def fused_norm_residual_add[
     P: BurstThreadPool, //,
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    tp: Int,
 ](
-    partial: BF16Ptr, residual: BF16Ptr,
-    residual_dst: BF16Ptr, norm_dst: BF16Ptr,
-    weight: BF16Ptr, seq_len: Int, mut pool: P,
+    src: NumaPointerArray[DType.bfloat16, tp],
+    residual: NumaPointerArray[DType.bfloat16, tp],
+    dst: NumaPointerArray[DType.bfloat16, tp],
+    weight: NumaPointerArray[DType.bfloat16, tp],
+    seq_len: Int,
+    mut pools: HeapMoveArray[P],
 ):
     if seq_len <= NORM_INLINE_TOKENS:
-        for tok in range(seq_len):
-            var off = tok * hidden
-            fused_residual_norm_row[hidden, sqrt_n, n_eps](
-                partial + off, residual + off,
-                residual_dst + off, norm_dst + off, weight)
+        for r in range(tp):
+            for tok in range(seq_len):
+                var off = tok * hidden
+                norm_residual_add_row[hidden, sqrt_n, n_eps](
+                    src[r] + off, residual[r] + off, dst[r] + off, weight[r])
         return
 
     var data_bytes = seq_len * hidden * 4
-    var nw = recommended_workers(data_bytes, pool.get_capacity())
-    var buf = DispatchBuffer[FusedResidualNormTokenKernel[hidden, sqrt_n, n_eps]]()
-    tile_dispatch(buf,
-        FusedResidualNormTokenKernel[hidden, sqrt_n, n_eps](
-            partial, residual, residual_dst, norm_dst, weight, 0, 0),
-        pool, seq_len, num_workers=nw)
-    pool.join()
+    var buf = DispatchBuffer[NormResidualAddTokenKernel[hidden, sqrt_n, n_eps]]()
+    for r in range(tp):
+        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        tile_dispatch(buf,
+            NormResidualAddTokenKernel[hidden, sqrt_n, n_eps](
+                src[r], residual[r], dst[r], weight[r], 0, 0),
+            pools[r], seq_len, num_workers=nw)
+    join_all[tp](pools)

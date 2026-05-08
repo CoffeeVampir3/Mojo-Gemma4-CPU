@@ -9,8 +9,9 @@ python = ">=3.11"
 
 [tasks]
 test = { depends-on = ["test-all"] }
-test-all = { depends-on = ["test-reductions", "test-tokenizer", "test-threading", "test-threading-trait-proto"] }
+test-all = { depends-on = ["test-reductions", "test-rmsnorm", "test-tokenizer", "test-threading", "test-threading-trait-proto"] }
 test-reductions = "mojo run -I . tests/test_reductions.mojo"
+test-rmsnorm = "mojo run -I . tests/test_rmsnorm.mojo"
 test-tokenizer = "mojo run -I . correctness_tests/test_tokenizer.mojo"
 test-threading = "mojo run -I . test_threading.mojo"
 test-threading-trait-proto = "mojo run -I . prototypes/test_threading_trait_proto.mojo"

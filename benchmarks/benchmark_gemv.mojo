@@ -7,12 +7,12 @@ from std.sys.info import simd_width_of
 from numa import NumaArena, NumaInfo, NumaTopology
 from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
-from threading.threading_traits import BurstKernel, BurstThreadPool
+from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.helpers import DispatchBuffer, RangedKernel, tile_dispatch, recommended_workers
+from kernels.helpers import DispatchBuffer, tile_dispatch, NumaPointerArray
 from kernels.gemv import (
-    dot_row, gemv_range, dispatch_gemv_chained_qkv,
-    GemvKernel, ScaledGemvKernel,
+    dot_row, gemv_range, dispatch_gemv, dispatch_gemv_chained_qkv,
+    GemvKernel,
 )
 from simd_math import pick_port_unroll, tree_reduce_accs
 
@@ -42,9 +42,36 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
+def arena_bases[tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+) -> InlineArray[Int, tp]:
+    var bases = InlineArray[Int, tp](uninitialized=True)
+    for r in range(tp):
+        bases[r] = Int(arenas[r].base.value())
+    return bases
+
+
+def arena_alloc_all[dtype: DType, tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+    var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
+    for r in range(tp):
+        var ptr = arena_alloc[dtype](arenas[r], count)
+        if r == 0:
+            first = ptr
+    return first
+
+
 def fill_pattern(ptr: BF16Ptr, count: Int):
     for i in range(count):
         ptr[i] = Scalar[DType.bfloat16](Float32((i % 253) - 126) * 0.005)
+
+
+def fill_pattern_all[tp: Int](
+    ptrs: NumaPointerArray[DType.bfloat16, tp], count: Int,
+):
+    for r in range(tp):
+        fill_pattern(ptrs[r], count)
 
 
 def fmt_ns(ns: Int) -> String:
@@ -97,7 +124,7 @@ def section_dot_primitive(x: BF16Ptr, weight: BF16Ptr):
         + String(mflops) + " MFLOP/s)")
 
 
-def section_row_sweep(x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr):
+def section_row_sweep[rows: Int](x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr):
     print("\n=== gemv_range inline (row count sweep, no dispatch) ===")
     print("  rows  | time         | weight BW    | rows/us")
 
@@ -113,17 +140,19 @@ def section_row_sweep(x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr):
     sizes[7] = 2048
 
     for s in range(NUM_SIZES):
-        var rows = sizes[s]
+        var n_rows = sizes[s]
+        if n_rows > rows:
+            continue
 
         for _ in range(WARMUP):
-            gemv_range[Q_SLIDING, HIDDEN](x, weight, output, 0, rows)
+            gemv_range[rows, HIDDEN](x, weight, output, 0, n_rows)
 
         var best = Int(1 << 60)
         for _ in range(TRIALS):
             var elapsed = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
-                gemv_range[Q_SLIDING, HIDDEN](x, weight, output, 0, rows)
+                gemv_range[rows, HIDDEN](x, weight, output, 0, n_rows)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
             var avg = elapsed // ITERS
@@ -131,33 +160,33 @@ def section_row_sweep(x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr):
                 best = avg
         keep(output[0])
 
-        var weight_bytes = rows * HIDDEN * 2
+        var weight_bytes = n_rows * HIDDEN * 2
         var throughput = 0
         if best > 0:
-            throughput = rows * 1000 // best
-        var pad = "  " if rows < 10 else " " if rows < 100 else "" if rows < 1000 else ""
-        print("  " + String(rows) + pad
+            throughput = n_rows * 1000 // best
+        var pad = "  " if n_rows < 10 else " " if n_rows < 100 else "" if n_rows < 1000 else ""
+        print("  " + String(n_rows) + pad
             + "   | " + fmt_ns(best)
             + " | " + fmt_bw(weight_bytes, best)
             + " | " + String(throughput))
 
 
-def section_dispatch_scaling[P: BurstThreadPool](
+def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
     mut pool: P, x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
 ):
     var cap = pool.get_capacity()
-    print("\n=== Dispatch scaling (Q_SLIDING=" + String(Q_SLIDING)
+    print("\n=== Dispatch scaling (local Q rows=" + String(rows)
         + " rows, capacity=" + String(cap) + ") ===")
     print("  workers | time         | weight BW    | speedup")
 
     for _ in range(WARMUP):
-        gemv_range[Q_SLIDING, HIDDEN](x, weight, output, 0, Q_SLIDING)
+        gemv_range[rows, HIDDEN](x, weight, output, 0, rows)
     var best_inline = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            gemv_range[Q_SLIDING, HIDDEN](x, weight, output, 0, Q_SLIDING)
+            gemv_range[rows, HIDDEN](x, weight, output, 0, rows)
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
         var avg = elapsed // ITERS
@@ -165,17 +194,17 @@ def section_dispatch_scaling[P: BurstThreadPool](
             best_inline = avg
     keep(output[0])
 
-    var weight_bytes = Q_SLIDING * HIDDEN * 2
+    var weight_bytes = rows * HIDDEN * 2
     print("  inline  | " + fmt_ns(best_inline)
         + " | " + fmt_bw(weight_bytes, best_inline) + " | 1.0x")
 
     var nw = 1
     while nw <= cap:
-        var buf = DispatchBuffer[GemvKernel[Q_SLIDING, HIDDEN]]()
+        var buf = DispatchBuffer[GemvKernel[rows, HIDDEN]]()
         for _ in range(WARMUP):
             tile_dispatch(buf,
-                GemvKernel[Q_SLIDING, HIDDEN](x, weight, output, 0, 0),
-                pool, Q_SLIDING, num_workers=nw)
+                GemvKernel[rows, HIDDEN](x, weight, output, 0, 0),
+                pool, rows, num_workers=nw)
             pool.join()
 
         var best = Int(1 << 60)
@@ -184,8 +213,8 @@ def section_dispatch_scaling[P: BurstThreadPool](
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
                 tile_dispatch(buf,
-                    GemvKernel[Q_SLIDING, HIDDEN](x, weight, output, 0, 0),
-                    pool, Q_SLIDING, num_workers=nw)
+                    GemvKernel[rows, HIDDEN](x, weight, output, 0, 0),
+                    pool, rows, num_workers=nw)
                 pool.join()
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
@@ -209,111 +238,109 @@ def section_dispatch_scaling[P: BurstThreadPool](
             break
 
 
-def section_projection_sizes[P: BurstThreadPool](
-    mut pool: P, x: BF16Ptr,
-    mut arena: NumaArena[alignment=ALIGNMENT],
+def measure_dispatch_gemv[
+    P: BurstThreadPool, //, rows: Int, tp: Int,
+](
+    mut pools: HeapMoveArray[P], x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
+    bases: InlineArray[Int, tp],
+) -> Int:
+    var xs = NumaPointerArray[DType.bfloat16, tp](x, bases)
+    var ws = NumaPointerArray[DType.bfloat16, tp](weight, bases)
+    var outs = NumaPointerArray[DType.bfloat16, tp](output, bases)
+
+    for _ in range(WARMUP):
+        dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
+        keep(output[0])
+
+    var best = Int(1 << 60)
+    for _ in range(TRIALS):
+        var elapsed = 0
+        for _ in range(ITERS):
+            var t0 = Int(perf_counter_ns())
+            dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
+            var t1 = Int(perf_counter_ns())
+            elapsed += t1 - t0
+        var avg = elapsed // ITERS
+        if avg < best:
+            best = avg
+    keep(output[0])
+    return best
+
+
+def print_projection_row(name: String, rows: Int, ns: Int):
+    var weight_bytes = rows * HIDDEN * 2
+    var mb = weight_bytes // (1024 * 1024)
+    var pad = ""
+    if name.byte_length() < 20:
+        pad = " " * (20 - name.byte_length())
+    print("  " + name + pad
+        + "| " + String(rows)
+        + "  | " + String(mb)
+        + "        | " + fmt_ns(ns)
+        + " | " + fmt_bw(weight_bytes, ns))
+
+
+def section_projection_sizes[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P], x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
+    bases: InlineArray[Int, tp],
 ):
     print("\n=== Real projection sizes (full dispatch) ===")
     print("  projection         | rows  | weight MB | time         | BW")
 
-    var cap = pool.get_capacity()
+    comptime SL_Q = Q_SLIDING // tp
+    comptime SL_KV = KV_SLIDING // tp
+    comptime FL_Q = Q_FULL // tp
+    comptime FL_K = KV_FULL
 
-    comptime NUM_PROJS = 4
-    var names = InlineArray[String, NUM_PROJS](fill="")
-    var row_counts = InlineArray[Int, NUM_PROJS](fill=0)
-    names[0] = "Q sliding (TP=4)"
-    row_counts[0] = Q_SLIDING // 4
-    names[1] = "KV sliding (TP=4)"
-    row_counts[1] = KV_SLIDING // 4
-    names[2] = "Q full (TP=4)"
-    row_counts[2] = Q_FULL // 4
-    names[3] = "Q sliding (TP=1)"
-    row_counts[3] = Q_SLIDING
+    var sl_q = measure_dispatch_gemv[SL_Q, tp](
+        pools, x, weight, output, bases)
+    print_projection_row("sliding Q", SL_Q, sl_q)
 
-    comptime MAX_ROWS = Q_SLIDING
-    var weight = arena_alloc[DType.bfloat16](arena, MAX_ROWS * HIDDEN)
-    var output = arena_alloc[DType.bfloat16](arena, MAX_ROWS)
-    fill_pattern(weight, MAX_ROWS * HIDDEN)
+    var sl_kv = measure_dispatch_gemv[SL_KV, tp](
+        pools, x, weight, output, bases)
+    print_projection_row("sliding KV", SL_KV, sl_kv)
 
-    for p in range(NUM_PROJS):
-        var rows = row_counts[p]
+    var fl_q = measure_dispatch_gemv[FL_Q, tp](
+        pools, x, weight, output, bases)
+    print_projection_row("full Q", FL_Q, fl_q)
 
-        var buf = DispatchBuffer[GemvKernel[MAX_ROWS, HIDDEN]]()
-        for _ in range(WARMUP):
-            tile_dispatch(buf,
-                GemvKernel[MAX_ROWS, HIDDEN](x, weight, output, 0, 0),
-                pool, rows, num_workers=cap)
-            pool.join()
-
-        var best = Int(1 << 60)
-        for _ in range(TRIALS):
-            var elapsed = 0
-            for _ in range(ITERS):
-                var t0 = Int(perf_counter_ns())
-                tile_dispatch(buf,
-                    GemvKernel[MAX_ROWS, HIDDEN](x, weight, output, 0, 0),
-                    pool, rows, num_workers=cap)
-                pool.join()
-                var t1 = Int(perf_counter_ns())
-                elapsed += t1 - t0
-            var avg = elapsed // ITERS
-            if avg < best:
-                best = avg
-        keep(output[0])
-
-        var weight_bytes = rows * HIDDEN * 2
-        var mb = weight_bytes // (1024 * 1024)
-        var name = names[p]
-        var pad = ""
-        if name.byte_length() < 20:
-            pad = " " * (20 - name.byte_length())
-        print("  " + name + pad
-            + "| " + String(rows)
-            + "  | " + String(mb)
-            + "        | " + fmt_ns(best)
-            + " | " + fmt_bw(weight_bytes, best))
+    var fl_k = measure_dispatch_gemv[FL_K, tp](
+        pools, x, weight, output, bases)
+    print_projection_row("full K replicated", FL_K, fl_k)
 
 
-def section_chained_qkv[P: BurstThreadPool](
-    mut pool: P, x: BF16Ptr,
+def section_chained_qkv[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P], x: BF16Ptr,
     q_weight: BF16Ptr, k_weight: BF16Ptr, v_weight: BF16Ptr,
     q_out: BF16Ptr, k_out: BF16Ptr, v_out: BF16Ptr,
+    bases: InlineArray[Int, tp],
 ):
-    print("\n=== Chained QKV vs 3x separate dispatch (sliding, TP=4) ===")
+    print("\n=== Chained QKV vs 3x separate dispatch (sliding, TP="
+        + String(tp) + ") ===")
 
-    comptime Q_R = Q_SLIDING // 4
-    comptime KV_R = KV_SLIDING // 4
-    var cap = pool.get_capacity()
+    comptime Q_R = Q_SLIDING // tp
+    comptime KV_R = KV_SLIDING // tp
+    var xs = NumaPointerArray[DType.bfloat16, tp](x, bases)
+    var qw = NumaPointerArray[DType.bfloat16, tp](q_weight, bases)
+    var kw = NumaPointerArray[DType.bfloat16, tp](k_weight, bases)
+    var vw = NumaPointerArray[DType.bfloat16, tp](v_weight, bases)
+    var qo = NumaPointerArray[DType.bfloat16, tp](q_out, bases)
+    var ko = NumaPointerArray[DType.bfloat16, tp](k_out, bases)
+    var vo = NumaPointerArray[DType.bfloat16, tp](v_out, bases)
 
-    # Separate: 3 dispatch+join cycles
-    var buf_q = DispatchBuffer[GemvKernel[Q_R, HIDDEN]]()
-    var buf_k = DispatchBuffer[GemvKernel[KV_R, HIDDEN]]()
-    var buf_v = DispatchBuffer[GemvKernel[KV_R, HIDDEN]]()
     for _ in range(WARMUP):
-        tile_dispatch(buf_q, GemvKernel[Q_R, HIDDEN](x, q_weight, q_out, 0, 0),
-            pool, Q_R, num_workers=cap)
-        pool.join()
-        tile_dispatch(buf_k, GemvKernel[KV_R, HIDDEN](x, k_weight, k_out, 0, 0),
-            pool, KV_R, num_workers=cap)
-        pool.join()
-        tile_dispatch(buf_v, GemvKernel[KV_R, HIDDEN](x, v_weight, v_out, 0, 0),
-            pool, KV_R, num_workers=cap)
-        pool.join()
+        dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
+        dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, kw, ko, pools)
+        dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, vw, vo, pools)
 
     var best_separate = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            tile_dispatch(buf_q, GemvKernel[Q_R, HIDDEN](x, q_weight, q_out, 0, 0),
-                pool, Q_R, num_workers=cap)
-            pool.join()
-            tile_dispatch(buf_k, GemvKernel[KV_R, HIDDEN](x, k_weight, k_out, 0, 0),
-                pool, KV_R, num_workers=cap)
-            pool.join()
-            tile_dispatch(buf_v, GemvKernel[KV_R, HIDDEN](x, v_weight, v_out, 0, 0),
-                pool, KV_R, num_workers=cap)
-            pool.join()
+            dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
+            dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, kw, ko, pools)
+            dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, vw, vo, pools)
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
         var avg = elapsed // ITERS
@@ -321,18 +348,17 @@ def section_chained_qkv[P: BurstThreadPool](
             best_separate = avg
     keep(q_out[0])
 
-    # Chained: 1 dispatch+join cycle
     for _ in range(WARMUP):
-        dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN](
-            x, q_weight, k_weight, v_weight, q_out, k_out, v_out, pool)
+        dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN, tp=tp](
+            xs, qw, kw, vw, qo, ko, vo, pools)
 
     var best_chained = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN](
-                x, q_weight, k_weight, v_weight, q_out, k_out, v_out, pool)
+            dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN, tp=tp](
+                xs, qw, kw, vw, qo, ko, vo, pools)
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
         var avg = elapsed // ITERS
@@ -353,37 +379,46 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
-    comptime MAX_WEIGHT_ELEMS = Q_SLIDING * HIDDEN
-    var x = arena_alloc[DType.bfloat16](arenas[0], HIDDEN)
-    var weight = arena_alloc[DType.bfloat16](arenas[0], MAX_WEIGHT_ELEMS)
-    var output = arena_alloc[DType.bfloat16](arenas[0], Q_SLIDING)
+    comptime MAX_ROWS = max(max(Q_SLIDING // tp, Q_FULL // tp), KV_FULL)
+    comptime MAX_WEIGHT_ELEMS = MAX_ROWS * HIDDEN
+    var bases = arena_bases[tp](arenas)
+    var x = arena_alloc_all[DType.bfloat16, tp](arenas, HIDDEN)
+    var weight = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_WEIGHT_ELEMS)
+    var output = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_ROWS)
 
-    fill_pattern(x, HIDDEN)
-    fill_pattern(weight, MAX_WEIGHT_ELEMS)
+    fill_pattern_all[tp](NumaPointerArray[DType.bfloat16, tp](x, bases), HIDDEN)
+    fill_pattern_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](weight, bases), MAX_WEIGHT_ELEMS)
 
     var cap = pools[0].get_capacity()
     print("pool capacity: " + String(cap) + " workers")
     print("hidden: " + String(HIDDEN) + " (" + String(HIDDEN * 2) + " bytes per row)")
 
     section_dot_primitive(x, weight)
-    section_row_sweep(x, weight, output)
-    section_dispatch_scaling(pools[0], x, weight, output)
-    section_projection_sizes(pools[0], x, arenas[0])
+    section_row_sweep[Q_SLIDING // tp](x, weight, output)
+    section_dispatch_scaling[rows=Q_SLIDING // tp](pools[0], x, weight, output)
+    section_projection_sizes[tp=tp](pools, x, weight, output, bases)
 
-    comptime Q_R = Q_SLIDING // 4
-    comptime KV_R = KV_SLIDING // 4
-    var q_weight = arena_alloc[DType.bfloat16](arenas[0], Q_R * HIDDEN)
-    var k_weight = arena_alloc[DType.bfloat16](arenas[0], KV_R * HIDDEN)
-    var v_weight = arena_alloc[DType.bfloat16](arenas[0], KV_R * HIDDEN)
-    var q_out = arena_alloc[DType.bfloat16](arenas[0], Q_R)
-    var k_out = arena_alloc[DType.bfloat16](arenas[0], KV_R)
-    var v_out = arena_alloc[DType.bfloat16](arenas[0], KV_R)
-    fill_pattern(q_weight, Q_R * HIDDEN)
-    fill_pattern(k_weight, KV_R * HIDDEN)
-    fill_pattern(v_weight, KV_R * HIDDEN)
+    comptime Q_R = Q_SLIDING // tp
+    comptime KV_R = KV_SLIDING // tp
+    var q_weight = arena_alloc_all[DType.bfloat16, tp](arenas, Q_R * HIDDEN)
+    var k_weight = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R * HIDDEN)
+    var v_weight = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R * HIDDEN)
+    var q_out = arena_alloc_all[DType.bfloat16, tp](arenas, Q_R)
+    var k_out = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R)
+    var v_out = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R)
+    fill_pattern_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](q_weight, bases), Q_R * HIDDEN)
+    fill_pattern_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](k_weight, bases), KV_R * HIDDEN)
+    fill_pattern_all[tp](
+        NumaPointerArray[DType.bfloat16, tp](v_weight, bases), KV_R * HIDDEN)
 
-    section_chained_qkv(pools[0], x, q_weight, k_weight, v_weight,
-                        q_out, k_out, v_out)
+    for r in range(tp):
+        _ = arenas[r].prefault(0, arenas[r].used())
+
+    section_chained_qkv[tp=tp](pools, x, q_weight, k_weight, v_weight,
+                               q_out, k_out, v_out, bases)
 
 
 def main():

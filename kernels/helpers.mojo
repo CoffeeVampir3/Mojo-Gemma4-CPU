@@ -8,12 +8,12 @@ comptime MAX_WORKERS = 128
 comptime DISPATCH_BW_PRODUCT = 2280
 
 
-trait RangedKernel(BurstKernel):
+trait OutputPartitionedKernel(BurstKernel):
     def over_range(self, start: Int, end: Int) -> Self: ...
 
 
 @fieldwise_init
-struct Chain[A: RangedKernel, B: RangedKernel](RangedKernel):
+struct Chain[A: OutputPartitionedKernel, B: OutputPartitionedKernel](OutputPartitionedKernel):
     var a: Self.A
     var b: Self.B
 
@@ -85,6 +85,8 @@ comptime PARALLEL_AMORTIZED_BYTES = 1024 * 1024
 
 @always_inline
 def recommended_workers(data_bytes: Int, capacity: Int) -> Int:
+    if capacity <= 1:
+        return capacity
     if data_bytes >= PARALLEL_AMORTIZED_BYTES:
         return capacity
     var target = data_bytes // DISPATCH_BW_PRODUCT
@@ -94,8 +96,19 @@ def recommended_workers(data_bytes: Int, capacity: Int) -> Int:
     return n
 
 
+@fieldwise_init
+struct NumaPointerArray[dtype: DType, tp: Int](Copyable, ImplicitlyCopyable):
+    var ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+    var bases: InlineArray[Int, Self.tp]
+
+    @always_inline
+    def __getitem__(self, rank: Int) -> UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]:
+        return UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
+            unsafe_from_address=Int(self.ptr) + self.bases[rank] - self.bases[0])
+
+
 def tile_dispatch[
-    K: RangedKernel, P: BurstThreadPool,
+    K: OutputPartitionedKernel, P: BurstThreadPool,
 ](mut buf: DispatchBuffer[K], proto: K, mut pool: P, total: Int,
   base: Int = 0, num_workers: Int = 0):
     if total <= 0:

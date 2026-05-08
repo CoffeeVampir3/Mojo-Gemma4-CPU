@@ -6,7 +6,9 @@ from simd_math import pick_port_unroll, tree_reduce_accs
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    Chain, RangedKernel, DispatchBuffer, tile_dispatch, recommended_workers,
+    Chain, OutputPartitionedKernel, DispatchBuffer,
+    tile_dispatch, recommended_workers, join_all,
+    NumaPointerArray,
 )
 
 
@@ -42,7 +44,7 @@ def gemv_range[rows: Int, cols: Int](
 
 
 @fieldwise_init
-struct GemvKernel[rows: Int, cols: Int](RangedKernel):
+struct GemvKernel[rows: Int, cols: Int](OutputPartitionedKernel):
     var x: BF16Ptr
     var weight: BF16Ptr
     var output: BF16Ptr
@@ -62,26 +64,31 @@ comptime GEMV_INLINE_ROWS = 4
 
 def dispatch_gemv[
     P: BurstThreadPool, //,
-    rows: Int, cols: Int,
+    rows: Int, cols: Int, tp: Int,
 ](
-    x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    mut pool: P,
+    x: NumaPointerArray[DType.bfloat16, tp],
+    weight: NumaPointerArray[DType.bfloat16, tp],
+    output: NumaPointerArray[DType.bfloat16, tp],
+    mut pools: HeapMoveArray[P],
 ):
+    comptime data_bytes = rows * cols * 2
+
     if rows <= GEMV_INLINE_ROWS:
-        gemv_range[rows, cols](x, weight, output, 0, rows)
+        for r in range(tp):
+            gemv_range[rows, cols](x[r], weight[r], output[r], 0, rows)
         return
 
-    var data_bytes = rows * cols * 2
-    var nw = recommended_workers(data_bytes, pool.get_capacity())
     var buf = DispatchBuffer[GemvKernel[rows, cols]]()
-    tile_dispatch(buf,
-        GemvKernel[rows, cols](x, weight, output, 0, 0),
-        pool, rows, num_workers=nw)
-    pool.join()
+    for r in range(tp):
+        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        tile_dispatch(buf,
+            GemvKernel[rows, cols](x[r], weight[r], output[r], 0, 0),
+            pools[r], rows, num_workers=nw)
+    join_all[tp](pools)
 
 
 @fieldwise_init
-struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](RangedKernel):
+struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](OutputPartitionedKernel):
     var x: BF16Ptr
     var weight: BF16Ptr
     var output: BF16Ptr
@@ -100,30 +107,34 @@ struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](RangedKern
 
 def dispatch_gemv_chained_qkv[
     P: BurstThreadPool, //,
-    q_rows: Int, kv_rows: Int, cols: Int,
+    q_rows: Int, kv_rows: Int, cols: Int, tp: Int,
 ](
-    x: BF16Ptr,
-    q_weight: BF16Ptr, k_weight: BF16Ptr, v_weight: BF16Ptr,
-    q_out: BF16Ptr, k_out: BF16Ptr, v_out: BF16Ptr,
-    mut pool: P,
+    x: NumaPointerArray[DType.bfloat16, tp],
+    q_weight: NumaPointerArray[DType.bfloat16, tp],
+    k_weight: NumaPointerArray[DType.bfloat16, tp],
+    v_weight: NumaPointerArray[DType.bfloat16, tp],
+    q_out: NumaPointerArray[DType.bfloat16, tp],
+    k_out: NumaPointerArray[DType.bfloat16, tp],
+    v_out: NumaPointerArray[DType.bfloat16, tp],
+    mut pools: HeapMoveArray[P],
 ):
     comptime total_rows = q_rows + kv_rows + kv_rows
-    var nw = pool.get_capacity()
-
     comptime QKernel = ScaledGemvKernel[q_rows, cols, q_rows, total_rows]
     comptime KKernel = ScaledGemvKernel[kv_rows, cols, kv_rows, total_rows]
     comptime VKernel = ScaledGemvKernel[kv_rows, cols, kv_rows, total_rows]
     comptime QK = Chain[QKernel, KKernel]
     comptime QKV = Chain[QK, VKernel]
 
-    var proto = QKV(
-        QK(
-            QKernel(x, q_weight, q_out, 0, 0),
-            KKernel(x, k_weight, k_out, 0, 0),
-        ),
-        VKernel(x, v_weight, v_out, 0, 0),
-    )
-
     var buf = DispatchBuffer[QKV]()
-    tile_dispatch(buf, proto, pool, total_rows, num_workers=nw)
-    pool.join()
+    for r in range(tp):
+        var nw = pools[r].get_capacity()
+        tile_dispatch(buf,
+            QKV(
+                QK(
+                    QKernel(x[r], q_weight[r], q_out[r], 0, 0),
+                    KKernel(x[r], k_weight[r], k_out[r], 0, 0),
+                ),
+                VKernel(x[r], v_weight[r], v_out[r], 0, 0),
+            ),
+            pools[r], total_rows, num_workers=nw)
+    join_all[tp](pools)
