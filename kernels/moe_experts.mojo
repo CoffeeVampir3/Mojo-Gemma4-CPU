@@ -2,11 +2,15 @@ from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
-from simd_math import pick_port_unroll, tree_reduce_accs
+from notstdcollections import HeapMoveArray
+from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
-from kernels.helpers import OutputPartitionedKernel
-from prototypes.dpbf16 import bf16_pair_dot
-from prototypes.moe_phase_kernels import SparseRoutePtr
+from .helpers import (
+    OutputPartitionedKernel, DispatchBuffer, NumaPointerArray,
+    NumaTypedPointerArray, worker_range, join_all,
+)
+from .dpbf16 import bf16_pair_dot
+from .moe_router import SparseRoute, SparseRoutePtr
 
 
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
@@ -202,6 +206,41 @@ struct Phase1GateUpKernel[
         )
 
 
+def dispatch_phase1_gate_up[
+    P: BurstThreadPool, //,
+    hidden: Int, gate_up_fused: Int, intermediate: Int,
+    experts_per_rank: Int, tp: Int,
+](
+    x_normed: NumaPointerArray[DType.bfloat16, tp],
+    expert_offset: NumaPointerArray[DType.int32, tp],
+    routes: NumaTypedPointerArray[SparseRoute, tp],
+    experts_gate_up: NumaPointerArray[DType.bfloat16, tp],
+    gate_scratch: NumaPointerArray[DType.float32, tp],
+    hidden_bucket: NumaPointerArray[DType.bfloat16, tp],
+    mut pools: HeapMoveArray[P],
+):
+    comptime n_tiles = intermediate // PHASE1_TILE_J
+    comptime total_units = experts_per_rank * n_tiles
+
+    var buf = DispatchBuffer[
+        Phase1GateUpKernel[hidden, gate_up_fused, intermediate, experts_per_rank]
+    ]()
+    for r in range(tp):
+        var cap = pools[r].get_capacity()
+        var nw = min(cap, total_units)
+        for w in range(nw):
+            var wr = worker_range(total_units, nw, w)
+            buf.slot()[] = Phase1GateUpKernel[
+                hidden, gate_up_fused, intermediate, experts_per_rank,
+            ](
+                x_normed[r], expert_offset[r], routes[r],
+                experts_gate_up[r], gate_scratch[r], hidden_bucket[r],
+                w, wr[0], wr[1],
+            )
+        buf.dispatch(pools[r])
+    join_all[tp](pools)
+
+
 @fieldwise_init
 struct Phase2DownKernel[
     hidden: Int, intermediate: Int, experts_per_rank: Int,
@@ -221,9 +260,8 @@ struct Phase2DownKernel[
         comptime STRIDE_DN = PU_DN * BW
         comptime MR = PHASE2_MR
         comptime assert Self.intermediate % STRIDE_DN == 0, (
-            "Phase2: intermediate must be divisible by STRIDE_DN")
+            "Phase2: intermediate must divide STRIDE_DN")
 
-        # Zero this worker's hidden stripe across all tokens.
         for tok in range(self.seq_len):
             var acc_row = self.moe_accum + tok * Self.hidden
             var m = self.start
@@ -309,7 +347,6 @@ struct Phase2DownKernel[
 
                 tok_base += n_tok
 
-        # Final: cast our hidden stripe to bf16 in moe_partial.
         for tok in range(self.seq_len):
             var acc_row = self.moe_accum + tok * Self.hidden
             var dst_row = self.moe_partial + tok * Self.hidden
@@ -330,83 +367,35 @@ struct Phase2DownKernel[
         )
 
 
-@fieldwise_init
-struct ExpertRunnerSlotKernel[
-    hidden: Int, gate_up_fused: Int, intermediate: Int, num_local_experts: Int,
-](OutputPartitionedKernel):
-    var x_normed: BF16Ptr
-    var expert_offset: I32Ptr
-    var bucket_token_idx: I32Ptr
-    var bucket_weight: F32Ptr
-    var experts_gate_up: BF16Ptr
-    var experts_down: BF16Ptr
-    var gate_scratch: F32Ptr
-    var hidden_scratch: F32Ptr
-    var moe_partial: BF16Ptr
-    var worker_id: Int
-    var start: Int
-    var end: Int
+def dispatch_phase2_down[
+    P: BurstThreadPool, //,
+    hidden: Int, intermediate: Int, experts_per_rank: Int, tp: Int,
+](
+    expert_offset: NumaPointerArray[DType.int32, tp],
+    routes: NumaTypedPointerArray[SparseRoute, tp],
+    hidden_bucket: NumaPointerArray[DType.bfloat16, tp],
+    experts_down: NumaPointerArray[DType.bfloat16, tp],
+    moe_accum: NumaPointerArray[DType.float32, tp],
+    moe_partial: NumaPointerArray[DType.bfloat16, tp],
+    seq_len: Int,
+    mut pools: HeapMoveArray[P],
+):
+    comptime hidden_strides = hidden // W
 
-    def execute(mut self):
-        comptime PU_H = pick_port_unroll[W, Self.hidden]()
-        comptime STRIDE_H = PU_H * W
-        comptime PU_I = pick_port_unroll[W, Self.intermediate]()
-        comptime STRIDE_I = PU_I * W
-
-        var gu_scratch = self.gate_scratch + self.worker_id * Self.gate_up_fused
-        var h_scratch = self.hidden_scratch + self.worker_id * Self.intermediate
-
-        for e in range(self.start, self.end):
-            var rec_lo = Int(self.expert_offset[e])
-            var rec_hi = Int(self.expert_offset[e + 1])
-            var gu_w = self.experts_gate_up + e * Self.gate_up_fused * Self.hidden
-            var down_w = self.experts_down + e * Self.hidden * Self.intermediate
-
-            for rec in range(rec_lo, rec_hi):
-                var tok = Int(self.bucket_token_idx[rec])
-                var x_row = self.x_normed + tok * Self.hidden
-
-                for m in range(Self.gate_up_fused):
-                    var row = gu_w + m * Self.hidden
-                    var accs = InlineArray[SIMD[DType.float32, W], PU_H](
-                        fill=SIMD[DType.float32, W](0))
-                    for i in range(Self.hidden // STRIDE_H):
-                        comptime for p in range(PU_H):
-                            var off = i * STRIDE_H + p * W
-                            var xv = (x_row + off).load[width=W]().cast[DType.float32]()
-                            var wv = (row + off).load[width=W]().cast[DType.float32]()
-                            accs[p] = xv.fma(wv, accs[p])
-                    gu_scratch[m] = tree_reduce_accs(accs)
-
-                for j in range(0, Self.intermediate, W):
-                    var g = (gu_scratch + j).load[width=W]()
-                    var u = (gu_scratch + Self.intermediate + j).load[width=W]()
-                    (h_scratch + j).store(gelu_tanh_f32[W](g) * u)
-
-                var route_w = SIMD[DType.float32, W](self.bucket_weight[rec])
-                var dst = self.moe_partial + tok * Self.hidden
-                for m in range(Self.hidden):
-                    var row = down_w + m * Self.intermediate
-                    var accs = InlineArray[SIMD[DType.float32, W], PU_I](
-                        fill=SIMD[DType.float32, W](0))
-                    for i in range(Self.intermediate // STRIDE_I):
-                        comptime for p in range(PU_I):
-                            var off = i * STRIDE_I + p * W
-                            var xv = (h_scratch + off).load[width=W]()
-                            var wv = (row + off).load[width=W]().cast[DType.float32]()
-                            accs[p] = xv.fma(wv, accs[p])
-                    var out = tree_reduce_accs(accs)
-                    dst[m] = (dst[m].cast[DType.float32]() + out * route_w[0]).cast[DType.bfloat16]()
-
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.x_normed, self.expert_offset, self.bucket_token_idx,
-            self.bucket_weight, self.experts_gate_up, self.experts_down,
-            self.gate_scratch, self.hidden_scratch, self.moe_partial,
-            self.worker_id, start, end,
-        )
-
-
-comptime BaselineExpertKernel[
-    hidden: Int, gate_up_fused: Int, intermediate: Int, num_local_experts: Int,
-] = ExpertRunnerSlotKernel[hidden, gate_up_fused, intermediate, num_local_experts]
+    var buf = DispatchBuffer[
+        Phase2DownKernel[hidden, intermediate, experts_per_rank]
+    ]()
+    for r in range(tp):
+        var cap = pools[r].get_capacity()
+        var nw = min(cap, hidden_strides)
+        for w in range(nw):
+            var sr = worker_range(hidden_strides, nw, w)
+            buf.slot()[] = Phase2DownKernel[
+                hidden, intermediate, experts_per_rank,
+            ](
+                expert_offset[r], routes[r], hidden_bucket[r],
+                experts_down[r], moe_accum[r], moe_partial[r],
+                seq_len, sr[0] * W, sr[1] * W,
+            )
+        buf.dispatch(pools[r])
+    join_all[tp](pools)

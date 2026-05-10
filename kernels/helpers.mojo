@@ -107,6 +107,17 @@ struct NumaPointerArray[dtype: DType, tp: Int](Copyable, ImplicitlyCopyable):
             unsafe_from_address=Int(self.ptr) + self.bases[rank] - self.bases[0])
 
 
+@fieldwise_init
+struct NumaTypedPointerArray[T: AnyType, tp: Int](Copyable, ImplicitlyCopyable):
+    var ptr: UnsafePointer[Self.T, MutAnyOrigin]
+    var bases: InlineArray[Int, Self.tp]
+
+    @always_inline
+    def __getitem__(self, rank: Int) -> UnsafePointer[Self.T, MutAnyOrigin]:
+        return UnsafePointer[Self.T, MutAnyOrigin](
+            unsafe_from_address=Int(self.ptr) + self.bases[rank] - self.bases[0])
+
+
 def tile_dispatch[
     K: OutputPartitionedKernel, P: BurstThreadPool,
 ](mut buf: DispatchBuffer[K], proto: K, mut pool: P, total: Int,

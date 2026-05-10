@@ -25,6 +25,7 @@ def main():
 
     var kv = model.new_kv_cache()
     var token_id = 2
-    model.forward(token_id, 0, kv)
+    var next_token = model.forward(token_id, 0, kv)
+    print("next token:", next_token)
 
     _ = model^

@@ -8,7 +8,9 @@ from numa import NumaArena, NumaInfo, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.helpers import RankBuffers, NumaPointerArray
+from kernels.helpers import (
+    RankBuffers, NumaPointerArray, NumaTypedPointerArray, MAX_WORKERS,
+)
 from kernels.reductions import dispatch_broadcast, dispatch_allreduce
 from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
 from kernels.rmsnorm import fused_norm_residual_add
@@ -19,6 +21,15 @@ from kernels.full_attention import dispatch_full_attention, PARTIAL_STRIDE
 from kernels.logsum_merge import (
     dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
 )
+from kernels.moe_router import (
+    RouterCandidate, SparseRoute,
+    dispatch_router_sharded, merge_router_candidates, build_expert_schedules,
+)
+from kernels.moe_experts import (
+    dispatch_phase1_gate_up, dispatch_phase2_down,
+    PHASE1_TILE_J, PHASE1_MR,
+)
+from kernels.elementwise import dispatch_gelu_gate_up, dispatch_scalar_mul
 from modeling.linear_borrow_pool import ScratchPool
 from modeling.linear_borrow_pool import scratch_block_bytes
 from modeling.kv_cache import Gemma4KV, Gemma4KVSliding, Gemma4KVGlobal
@@ -93,6 +104,9 @@ struct Gemma4Shapes[degree: Int]:
     comptime FullQ       = Replicated[C.Q_DIM_FULL, C.HIDDEN]
     comptime FullK       = Replicated[C.KV_DIM_FULL, C.HIDDEN]
     comptime FullO       = TensorColumnSharded[C.HIDDEN, C.Q_DIM_FULL, Self.D]
+    comptime RouterProj  = ExpertRowBlockSharded[
+        C.NUM_EXPERTS, 1, C.HIDDEN, Self.D,
+    ]
     comptime ExpertsGateUp = ExpertRowBlockSharded[
         C.NUM_EXPERTS, C.MOE_GATE_UP_FUSED, C.HIDDEN, Self.D,
     ]
@@ -158,6 +172,11 @@ comptime DenseMlpShapeContract[degree: Int]: Bool = (
 
 comptime MoeShapeContract[degree: Int]: Bool = (
     MoeContract[degree]
+    and Gemma4Shapes[degree].RouterProj.DATA_N
+        == ExpertParallelRows[
+            C.NUM_EXPERTS, 1, Gemma4Shapes[degree].D,
+        ]
+    and Gemma4Shapes[degree].RouterProj.DATA_M == C.HIDDEN
     and Gemma4Shapes[degree].ExpertsGateUp.DATA_N
         == ExpertParallelRows[
             C.NUM_EXPERTS, C.MOE_GATE_UP_FUSED, Gemma4Shapes[degree].D,
@@ -215,7 +234,7 @@ struct BodyRefs[degree: Int](Copyable, ImplicitlyCopyable):
     var gate_proj:       TensorRef[BF16, Self.S.GateUp]
     var up_proj:         TensorRef[BF16, Self.S.GateUp]
     var down_proj:       TensorRef[BF16, Self.S.Down]
-    var router_proj:     TensorRef[BF16, Shape[C.NUM_EXPERTS, C.HIDDEN]]
+    var router_proj:     TensorRef[BF16, Self.S.RouterProj]
     var router_scale:    TensorRef[BF16, Shape[C.HIDDEN, 1]]
     var router_pes:      TensorRef[BF16, Shape[C.NUM_EXPERTS, 1]]
     var experts_gate_up: TensorRef[BF16, Self.S.ExpertsGateUp]
@@ -305,7 +324,7 @@ def emit_body[degree: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> Body
         gate_proj       = b.bfs[S.GateUp](e, "mlp.gate_proj.weight"),
         up_proj         = b.bfs[S.GateUp](e, "mlp.up_proj.weight"),
         down_proj       = b.bfs[S.Down](e, "mlp.down_proj.weight"),
-        router_proj     = b.bfs[Shape[NE, H]](e, "router.proj.weight"),
+        router_proj     = b.bfs[S.RouterProj](e, "router.proj.weight"),
         router_scale    = b.bfs[Shape[H, 1]](e, "router.scale"),
         router_pes      = b.bfs[Shape[NE, 1]](e, "router.per_expert_scale"),
         experts_gate_up = b.bfs[S.ExpertsGateUp](e, "experts.gate_up_proj"),
@@ -347,8 +366,13 @@ def emit_full[degree: Int](
 
 def calculate_peak_scratch[degree: Int]() -> Int:
     comptime bf16 = BF16.ELEMENT_BYTES
+    comptime f32 = F32.ELEMENT_BYTES
+    comptime i32 = 4
+    comptime cand_bytes = 8
+    comptime route_bytes = 8
     comptime seq = C.MAX_SEQ_LEN
     comptime S = Gemma4Shapes[degree]
+    comptime experts_per_rank = C.NUM_EXPERTS // degree
 
     comptime full_q = scratch_block_bytes[seq * S.FullQ.N * bf16]()
     comptime full_kv = scratch_block_bytes[seq * S.FullK.N * bf16]()
@@ -358,13 +382,40 @@ def calculate_peak_scratch[degree: Int]() -> Int:
     comptime sliding_kv = scratch_block_bytes[seq * S.SlidingKV.N * bf16]()
     comptime sliding_attn = max(sliding_q + 2 * sliding_kv, 2 * sliding_q)
 
-    comptime gate_up_block = scratch_block_bytes[seq * S.GateUp.N * bf16]()
-    comptime hidden_block = scratch_block_bytes[seq * C.HIDDEN * bf16]()
-    comptime topk_block = scratch_block_bytes[C.TOP_K * C.HIDDEN * bf16]()
-    comptime ffn_dense = 2 * gate_up_block
-    comptime ffn_moe = 2 * hidden_block + topk_block
+    comptime ffn_gate = scratch_block_bytes[seq * S.GateUp.N * bf16]()
+    comptime ffn_up = scratch_block_bytes[seq * S.GateUp.N * bf16]()
+    comptime ffn_dense_out = scratch_block_bytes[seq * C.HIDDEN * bf16]()
+    comptime ffn_outer = ffn_gate + ffn_up + ffn_dense_out
 
-    return max(max(ffn_dense, ffn_moe), max(full_attn, sliding_attn))
+    comptime moe_x_normed = scratch_block_bytes[seq * C.HIDDEN * bf16]()
+    comptime moe_hidden_bucket = scratch_block_bytes[
+        seq * C.TOP_K * C.MOE_INTERMEDIATE * bf16]()
+    comptime moe_accum = scratch_block_bytes[seq * C.HIDDEN * f32]()
+    comptime moe_route_idx = scratch_block_bytes[seq * C.TOP_K * i32]()
+    comptime moe_route_w = scratch_block_bytes[seq * C.TOP_K * f32]()
+    comptime moe_cands = scratch_block_bytes[seq * C.TOP_K * cand_bytes]()
+    comptime moe_routes = scratch_block_bytes[seq * C.TOP_K * route_bytes]()
+    comptime moe_expert_offset = scratch_block_bytes[
+        (experts_per_rank + 1) * i32]()
+    comptime moe_gate_scratch = scratch_block_bytes[
+        MAX_WORKERS * PHASE1_MR * 2 * PHASE1_TILE_J * f32]()
+    comptime moe_router_scaled = scratch_block_bytes[
+        MAX_WORKERS * C.HIDDEN * f32]()
+    comptime ffn_moe_inner = (
+        moe_x_normed + moe_hidden_bucket + moe_accum
+        + moe_route_idx + moe_route_w + moe_cands + moe_routes
+        + moe_expert_offset + moe_gate_scratch + moe_router_scaled
+    )
+
+    comptime ffn_peak = ffn_outer + ffn_moe_inner
+
+    comptime vocab_per_rank = C.VOCAB_SIZE // degree
+    comptime lm_head_logits = scratch_block_bytes[vocab_per_rank * bf16]()
+
+    return max(
+        max(ffn_peak, max(full_attn, sliding_attn)),
+        lm_head_logits,
+    )
 
 
 @fieldwise_init
@@ -677,6 +728,257 @@ def dispatch_full_attention_qkv[
     q_lease^.release()
 
 
+def dispatch_moe[
+    P: BurstThreadPool, //, degree: Int,
+](
+    body: BodyRefs[degree],
+    layer_base: Int,
+    arena_bases: InlineArray[Int, degree],
+    x_input: BF16Ptr,
+    moe_out: BF16Ptr,
+    seq_len: Int,
+    mut scratch: ScratchPool,
+    mut pools: HeapMoveArray[P],
+):
+    comptime experts_per_rank = C.NUM_EXPERTS // degree
+    comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
+    comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
+    comptime rms_eps = Scalar[DType.float32](C.RMS_NORM_EPS)
+    comptime immut = ImmutOrigin(MutAnyOrigin)
+
+    var router_proj_ptr = body.router_proj.bound(layer_base).as_ptr()
+    var router_scale_ptr = body.router_scale.bound(layer_base).as_ptr()
+    var per_expert_scale_ptr = body.router_pes.bound(layer_base).as_ptr()
+    var pre_ffn_norm_2_ptr = body.pre_ffn_norm_2.bound(layer_base).as_ptr()
+    var experts_gate_up_ptr = body.experts_gate_up.bound(layer_base).as_ptr()
+    var experts_down_ptr = body.experts_down.bound(layer_base).as_ptr()
+
+    var x_normed_lease = scratch.borrow[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
+    var cands_lease = scratch.borrow[
+        RouterCandidate, C.MAX_SEQ_LEN * C.TOP_K]()
+    var router_scaled_lease = scratch.borrow[
+        Scalar[DType.float32], MAX_WORKERS * C.HIDDEN]()
+    var route_idx_lease = scratch.borrow[
+        Scalar[DType.int32], C.MAX_SEQ_LEN * C.TOP_K]()
+    var route_w_lease = scratch.borrow[
+        Scalar[DType.float32], C.MAX_SEQ_LEN * C.TOP_K]()
+    var expert_offset_lease = scratch.borrow[
+        Scalar[DType.int32], experts_per_rank + 1]()
+    var routes_lease = scratch.borrow[
+        SparseRoute, C.MAX_SEQ_LEN * C.TOP_K]()
+    var hidden_bucket_lease = scratch.borrow[
+        Scalar[DType.bfloat16],
+        C.MAX_SEQ_LEN * C.TOP_K * C.MOE_INTERMEDIATE]()
+    var moe_accum_lease = scratch.borrow[
+        Scalar[DType.float32], C.MAX_SEQ_LEN * C.HIDDEN]()
+    var gate_scratch_lease = scratch.borrow[
+        Scalar[DType.float32],
+        MAX_WORKERS * PHASE1_MR * 2 * PHASE1_TILE_J]()
+
+    var x_input_ranks = NumaPointerArray[DType.bfloat16, degree](
+        x_input, arena_bases)
+    var moe_out_ranks = NumaPointerArray[DType.bfloat16, degree](
+        moe_out, arena_bases)
+    var router_proj_ranks = NumaPointerArray[DType.bfloat16, degree](
+        router_proj_ptr, arena_bases)
+    var router_scale_ranks = NumaPointerArray[DType.bfloat16, degree](
+        router_scale_ptr, arena_bases)
+    var pre_ffn_norm_2_ranks = NumaPointerArray[DType.bfloat16, degree](
+        pre_ffn_norm_2_ptr, arena_bases)
+    var experts_gate_up_ranks = NumaPointerArray[DType.bfloat16, degree](
+        experts_gate_up_ptr, arena_bases)
+    var experts_down_ranks = NumaPointerArray[DType.bfloat16, degree](
+        experts_down_ptr, arena_bases)
+
+    var x_normed_ranks = NumaPointerArray[DType.bfloat16, degree](
+        x_normed_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+    var cands_ranks = NumaTypedPointerArray[RouterCandidate, degree](
+        cands_lease.as_ptr[RouterCandidate](), arena_bases)
+    var router_scaled_ranks = NumaPointerArray[DType.float32, degree](
+        router_scaled_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+    var route_idx_ranks = NumaPointerArray[DType.int32, degree](
+        route_idx_lease.as_ptr[Scalar[DType.int32]](), arena_bases)
+    var route_w_ranks = NumaPointerArray[DType.float32, degree](
+        route_w_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+    var expert_offset_ranks = NumaPointerArray[DType.int32, degree](
+        expert_offset_lease.as_ptr[Scalar[DType.int32]](), arena_bases)
+    var routes_ranks = NumaTypedPointerArray[SparseRoute, degree](
+        routes_lease.as_ptr[SparseRoute](), arena_bases)
+    var hidden_bucket_ranks = NumaPointerArray[DType.bfloat16, degree](
+        hidden_bucket_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+    var moe_accum_ranks = NumaPointerArray[DType.float32, degree](
+        moe_accum_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+    var gate_scratch_ranks = NumaPointerArray[DType.float32, degree](
+        gate_scratch_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+
+    dispatch_router_sharded[
+        hidden=C.HIDDEN, experts_per_rank=experts_per_rank,
+        top_k=C.TOP_K, tp=degree, rms_eps=rms_eps,
+    ](x_input_ranks, router_proj_ranks, router_scale_ranks,
+      router_scaled_ranks, cands_ranks, seq_len, pools)
+
+    merge_router_candidates[degree, C.TOP_K](
+        cands_ranks, per_expert_scale_ptr,
+        route_idx_ranks, route_w_ranks, seq_len)
+
+    dispatch_rms_norm[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+    ](x_input_ranks, x_normed_ranks, pre_ffn_norm_2_ranks, seq_len, pools)
+
+    build_expert_schedules[degree, experts_per_rank, C.TOP_K](
+        route_idx_ranks, route_w_ranks,
+        expert_offset_ranks, routes_ranks, seq_len)
+
+    dispatch_phase1_gate_up[
+        hidden=C.HIDDEN, gate_up_fused=C.MOE_GATE_UP_FUSED,
+        intermediate=C.MOE_INTERMEDIATE,
+        experts_per_rank=experts_per_rank, tp=degree,
+    ](x_normed_ranks, expert_offset_ranks, routes_ranks,
+      experts_gate_up_ranks, gate_scratch_ranks, hidden_bucket_ranks, pools)
+
+    dispatch_phase2_down[
+        hidden=C.HIDDEN, intermediate=C.MOE_INTERMEDIATE,
+        experts_per_rank=experts_per_rank, tp=degree,
+    ](expert_offset_ranks, routes_ranks, hidden_bucket_ranks,
+      experts_down_ranks, moe_accum_ranks, moe_out_ranks, seq_len, pools)
+
+    var ar_src = RankBuffers[DType.bfloat16, degree, immut](
+        count=seq_len * C.HIDDEN)
+    var ar_dst = RankBuffers[DType.bfloat16, degree, MutAnyOrigin](
+        count=seq_len * C.HIDDEN)
+    for r in range(degree):
+        ar_src.ptrs[r] = moe_out_ranks[r].as_immutable()
+        ar_dst.ptrs[r] = moe_out_ranks[r]
+    dispatch_allreduce[BF16, degree](ar_src, ar_dst, pools)
+
+    gate_scratch_lease^.release()
+    moe_accum_lease^.release()
+    hidden_bucket_lease^.release()
+    routes_lease^.release()
+    expert_offset_lease^.release()
+    route_w_lease^.release()
+    route_idx_lease^.release()
+    router_scaled_lease^.release()
+    cands_lease^.release()
+    x_normed_lease^.release()
+
+
+def dispatch_ffn[
+    P: BurstThreadPool, //, degree: Int,
+](
+    body: BodyRefs[degree],
+    layer_base: Int,
+    arena_bases: InlineArray[Int, degree],
+    x_main: BF16Ptr,
+    x_residual: BF16Ptr,
+    seq_len: Int,
+    mut scratch: ScratchPool,
+    mut pools: HeapMoveArray[P],
+):
+    comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
+    comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
+    comptime intermediate_per_rank = Gemma4Shapes[degree].GateUp.DATA_N
+    comptime immut = ImmutOrigin(MutAnyOrigin)
+
+    var pre_ffn_norm_ptr = body.pre_ffn_norm.bound(layer_base).as_ptr()
+    var gate_proj_ptr = body.gate_proj.bound(layer_base).as_ptr()
+    var up_proj_ptr = body.up_proj.bound(layer_base).as_ptr()
+    var down_proj_ptr = body.down_proj.bound(layer_base).as_ptr()
+    var post_ffn_norm_1_ptr = body.post_ffn_norm_1.bound(layer_base).as_ptr()
+    var post_ffn_norm_2_ptr = body.post_ffn_norm_2.bound(layer_base).as_ptr()
+    var post_ffn_norm_ptr = body.post_ffn_norm.bound(layer_base).as_ptr()
+    var layer_scalar_ptr = body.layer_scalar.bound(layer_base).as_ptr()
+
+    var gate_lease = scratch.borrow[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * intermediate_per_rank]()
+    var up_lease = scratch.borrow[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * intermediate_per_rank]()
+    var dense_out_lease = scratch.borrow[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
+
+    var gate_ranks = NumaPointerArray[DType.bfloat16, degree](
+        gate_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+    var up_ranks = NumaPointerArray[DType.bfloat16, degree](
+        up_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+    var dense_out_ranks = NumaPointerArray[DType.bfloat16, degree](
+        dense_out_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+    var x_main_ranks = NumaPointerArray[DType.bfloat16, degree](
+        x_main, arena_bases)
+    var x_res_ranks = NumaPointerArray[DType.bfloat16, degree](
+        x_residual, arena_bases)
+    var pre_ffn_norm_ranks = NumaPointerArray[DType.bfloat16, degree](
+        pre_ffn_norm_ptr, arena_bases)
+    var gate_proj_ranks = NumaPointerArray[DType.bfloat16, degree](
+        gate_proj_ptr, arena_bases)
+    var up_proj_ranks = NumaPointerArray[DType.bfloat16, degree](
+        up_proj_ptr, arena_bases)
+    var down_proj_ranks = NumaPointerArray[DType.bfloat16, degree](
+        down_proj_ptr, arena_bases)
+    var post_ffn_norm_1_ranks = NumaPointerArray[DType.bfloat16, degree](
+        post_ffn_norm_1_ptr, arena_bases)
+    var post_ffn_norm_2_ranks = NumaPointerArray[DType.bfloat16, degree](
+        post_ffn_norm_2_ptr, arena_bases)
+    var post_ffn_norm_ranks = NumaPointerArray[DType.bfloat16, degree](
+        post_ffn_norm_ptr, arena_bases)
+
+    dispatch_rms_norm[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+    ](x_main_ranks, x_res_ranks, pre_ffn_norm_ranks, seq_len, pools)
+
+    dispatch_gemv[
+        rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
+    ](x_res_ranks, gate_proj_ranks, gate_ranks, pools)
+
+    dispatch_gemv[
+        rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
+    ](x_res_ranks, up_proj_ranks, up_ranks, pools)
+
+    dispatch_gelu_gate_up[
+        intermediate=intermediate_per_rank, tp=degree,
+    ](gate_ranks, up_ranks, gate_ranks, seq_len, pools)
+
+    dispatch_gemv[
+        rows=C.HIDDEN, cols=intermediate_per_rank, tp=degree,
+    ](gate_ranks, down_proj_ranks, dense_out_ranks, pools)
+
+    var dense_ar_src = RankBuffers[DType.bfloat16, degree, immut](
+        count=seq_len * C.HIDDEN)
+    var dense_ar_dst = RankBuffers[DType.bfloat16, degree, MutAnyOrigin](
+        count=seq_len * C.HIDDEN)
+    for r in range(degree):
+        dense_ar_src.ptrs[r] = dense_out_ranks[r].as_immutable()
+        dense_ar_dst.ptrs[r] = dense_out_ranks[r]
+    dispatch_allreduce[BF16, degree](dense_ar_src, dense_ar_dst, pools)
+
+    dispatch_moe[degree=degree](
+        body, layer_base, arena_bases,
+        x_main, x_residual, seq_len, scratch, pools)
+
+    dispatch_rms_norm[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+    ](dense_out_ranks, dense_out_ranks, post_ffn_norm_1_ranks, seq_len, pools)
+
+    fused_norm_residual_add[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+    ](x_res_ranks, dense_out_ranks, dense_out_ranks,
+      post_ffn_norm_2_ranks, seq_len, pools)
+
+    fused_norm_residual_add[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+    ](dense_out_ranks, x_main_ranks, x_main_ranks,
+      post_ffn_norm_ranks, seq_len, pools)
+
+    var ls_value = layer_scalar_ptr[0].cast[DType.float32]()
+    dispatch_scalar_mul[
+        hidden=C.HIDDEN, tp=degree,
+    ](x_main_ranks, x_main_ranks, ls_value, seq_len, pools)
+
+    dense_out_lease^.release()
+    up_lease^.release()
+    gate_lease^.release()
+
+
 struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[Self.Pool]
@@ -724,18 +1026,6 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     lane.store((v * inv_sqrt_hidden).cast[DType.bfloat16]())
         print("  router constants baked")
 
-        comptime embed_scale = sqrt[DType.float32, 1](C.HIDDEN).cast[DType.bfloat16]().cast[DType.float32]()
-        comptime shard_rows = Gemma4TailShapes[Self.degree].Embed.DATA_N
-        for rank in range(Self.degree):
-            var p = topo.tail.embed.bound(self.arena_base(rank)).as_ptr()
-            for row in range(shard_rows):
-                var row_ptr = p + row * C.HIDDEN
-                for j in range(0, C.HIDDEN, width):
-                    var lane = row_ptr + j
-                    var v = lane.load[width=width]().cast[DType.float32]()
-                    lane.store((v * embed_scale).cast[DType.bfloat16]())
-        print("  embedding scale baked")
-
         from kernels.rope import init_rope_table, init_rope_table_partial_strided
         for rank in range(Self.degree):
             var base = self.arena_bases[rank]
@@ -766,7 +1056,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 topo.full_kv.proto.v.bound(lb).as_ptr())
         return kv^
 
-    def forward(mut self, token_id: Int, pos: Int, mut kv: Gemma4KV[Self.degree]):
+    def forward(mut self, token_id: Int, pos: Int, mut kv: Gemma4KV[Self.degree]) -> Int:
         # Forward (one step). `pos` = absolute sequence position of the token being processed.
         #
         # Embed:
@@ -857,6 +1147,11 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         var x_res_ranks = NumaPointerArray[DType.bfloat16, Self.degree](
             x_residual, self.arena_bases)
 
+        comptime embed_scale = sqrt[DType.float32, 1](C.HIDDEN).cast[DType.bfloat16]().cast[DType.float32]()
+        dispatch_scalar_mul[
+            hidden=C.HIDDEN, tp=Self.degree,
+        ](x_main_ranks, x_main_ranks, embed_scale, 1, self.pools)
+
         comptime immut_ar = ImmutOrigin(MutAnyOrigin)
         var ar_src = RankBuffers[DType.bfloat16, Self.degree, immut_ar](count=C.HIDDEN)
         var ar_dst = RankBuffers[DType.bfloat16, Self.degree, MutAnyOrigin](count=C.HIDDEN)
@@ -867,18 +1162,20 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         var si = 0
         var fi = 0
         for i in range(C.NUM_LAYERS):
-            var norm_w: BF16Ptr
+            var body: BodyRefs[Self.degree]
+            var lb: Int
             if is_full_layer(i):
-                var lb = topo.full.base(self.arena_bases[0], fi)
-                norm_w = topo.full.proto.body.input_norm.bound(lb).as_ptr()
+                lb = topo.full.base(self.arena_bases[0], fi)
+                body = topo.full.proto.body
             else:
-                var lb = topo.sliding.base(self.arena_bases[0], si)
-                norm_w = topo.sliding.proto.body.input_norm.bound(lb).as_ptr()
+                lb = topo.sliding.base(self.arena_bases[0], si)
+                body = topo.sliding.proto.body
 
+            var input_norm_w = body.input_norm.bound(lb).as_ptr()
             dispatch_rms_norm[
                 hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
             ](x_main_ranks, x_res_ranks,
-              NumaPointerArray[DType.bfloat16, Self.degree](norm_w, self.arena_bases),
+              NumaPointerArray[DType.bfloat16, Self.degree](input_norm_w, self.arena_bases),
               1, self.pools)
 
             if is_full_layer(i):
@@ -892,24 +1189,55 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
             dispatch_allreduce[BF16, Self.degree](ar_src, ar_dst, self.pools)
 
-            var post_attn_w: BF16Ptr
-            if is_full_layer(i):
-                var lb = topo.full.base(self.arena_bases[0], fi)
-                post_attn_w = topo.full.proto.body.post_attn_norm.bound(lb).as_ptr()
-            else:
-                var lb = topo.sliding.base(self.arena_bases[0], si)
-                post_attn_w = topo.sliding.proto.body.post_attn_norm.bound(lb).as_ptr()
-
+            var post_attn_w = body.post_attn_norm.bound(lb).as_ptr()
             fused_norm_residual_add[
                 hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
             ](x_res_ranks, x_main_ranks, x_main_ranks,
               NumaPointerArray[DType.bfloat16, Self.degree](post_attn_w, self.arena_bases),
               1, self.pools)
 
+            dispatch_ffn[degree=Self.degree](
+                body, lb, self.arena_bases,
+                x_main, x_residual, 1, self.scratch, self.pools)
+
             if is_full_layer(i):
                 fi += 1
             else:
                 si += 1
+
+        var final_norm_w = topo.tail.final_norm.bound(self.arena_bases[0]).as_ptr()
+        dispatch_rms_norm[
+            hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
+        ](x_main_ranks, x_main_ranks,
+          NumaPointerArray[DType.bfloat16, Self.degree](final_norm_w, self.arena_bases),
+          1, self.pools)
+
+        comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
+        var logits_lease = self.scratch.borrow[Scalar[DType.bfloat16], vocab_per_rank]()
+        var logits_p = logits_lease.as_ptr[Scalar[DType.bfloat16]]()
+        var logits_ranks = NumaPointerArray[DType.bfloat16, Self.degree](
+            logits_p, self.arena_bases)
+        var embed_ptr = topo.tail.embed.bound(self.arena_bases[0]).as_ptr()
+        dispatch_gemv[
+            rows=vocab_per_rank, cols=C.HIDDEN, tp=Self.degree,
+        ](
+            x_main_ranks,
+            NumaPointerArray[DType.bfloat16, Self.degree](embed_ptr, self.arena_bases),
+            logits_ranks, self.pools,
+        )
+
+        var best_val = Float32(-1.0e30)
+        var best_idx = 0
+        for r in range(Self.degree):
+            var rank_logits = logits_ranks[r]
+            for v in range(vocab_per_rank):
+                var val = rank_logits[v].cast[DType.float32]()
+                if val > best_val:
+                    best_val = val
+                    best_idx = r * vocab_per_rank + v
+
+        logits_lease^.release()
+        return best_idx
 
     @staticmethod
     def load(

@@ -1,3 +1,4 @@
+from std.memory import UnsafePointer
 from std.sys import CompilationTarget, llvm_intrinsic
 from std.sys.info import simd_width_of, size_of
 
@@ -22,11 +23,10 @@ def bf16_pair_dot(
     `acc[j] += bf16_to_f32(a[2j])   * bf16_to_f32(b[2j])
             +  bf16_to_f32(a[2j+1]) * bf16_to_f32(b[2j+1])`.
 
-    On AVX-512BF16 targets emits one VDPBF16PS for the native SIMD width.
+    On AVX-512BF16 emits one VDPBF16PS for the native SIMD width.
     Otherwise falls back to deinterleave + cast + FMAs with the same
-    per-lane semantics."""
-    comptime assert BF16W == 2 * F32W, (
-        "bf16_pair_dot requires two bf16 lanes per f32 accumulator lane")
+    per-lane semantics.
+    """
     comptime vector_bits = size_of[SIMD[DType.float32, F32W]]() * 8
     comptime if has_avx512_bf16():
         return llvm_intrinsic[
@@ -34,9 +34,6 @@ def bf16_pair_dot(
             SIMD[DType.float32, F32W],
         ](acc, a, b)
     else:
-        # `rebind` bridges Mojo's type-checker: deinterleave returns
-        # SIMD[.., BF16W // 2], which is the same lane count as the f32
-        # accumulator on current CPU targets. The rebind is a runtime no-op.
         var ae_ao = a.deinterleave()
         var be_bo = b.deinterleave()
         var ae = rebind[SIMD[DType.bfloat16, F32W]](ae_ao[0]).cast[DType.float32]()
