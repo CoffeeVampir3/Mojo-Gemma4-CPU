@@ -16,14 +16,15 @@ from modeling.gemma4_common import Gemma4BaseConfig
 from simd_math.ops import sqrt
 
 from prototypes.expert_kernels import (
-    ActiveExpertKernel, BaselineExpertKernel, EXPERT_TOK_TILE,
+    Phase1GateUpKernel, Phase2DownKernel, BaselineExpertKernel,
+    PHASE1_TILE_J, PHASE1_MR,
 )
 from prototypes.moe_phase_kernels import (
-    arena_alloc, fill_bf16, fill_bf16_positive,
-    RouterStreamKernel, RouteGatherConfig, RouteGatherDstKernel,
-    FillBF16Kernel, RmsNormBenchKernel,
-    ExpertCountSlotKernel, PrefixKernel, PlaceSlotKernel,
-    RankState,
+    arena_alloc, arena_alloc_t, fill_bf16, fill_bf16_positive,
+    RouterShardedKernel, RouterCandidate, RouterCandidatePtr,
+    SparseRoute, SparseRoutePtr,
+    merge_candidates_inline, build_schedule_inline,
+    RmsNormBenchKernel, RankState,
 )
 
 
@@ -33,6 +34,7 @@ comptime CORR_SEQ = 128
 comptime CORR_TP = 1
 comptime CORR_LOCAL_EXPERTS = C.NUM_EXPERTS // CORR_TP
 comptime ARENA_BYTES = 3 * 1024 * 1024 * 1024
+comptime W = simd_width_of[DType.float32]()
 
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime F32Ptr  = UnsafePointer[Scalar[DType.float32],  MutAnyOrigin]
@@ -74,11 +76,24 @@ def fingerprint_i32(ptr: I32Ptr, count: Int) -> Int:
     return s
 
 
+@fieldwise_init
+struct BaselineSlotState(Copyable, ImplicitlyCopyable):
+    """Side buffers used only by the slot-phased BaselineExpertKernel.
+    The baseline runs single-worker and bucketizes per-slot from the
+    common route_idx/route_w state."""
+    var bucket_token_idx: I32Ptr
+    var bucket_weight: F32Ptr
+    var slot_offset: I32Ptr
+    var hidden_scratch: F32Ptr
+    var gate_scratch: F32Ptr
+
+
 def alloc_state(
     mut arena: NumaArena[alignment=ALIGNMENT], capacity: Int,
-) -> RankState:
+) -> Tuple[RankState, BaselineSlotState]:
     var x = arena_alloc[DType.bfloat16](arena, CORR_SEQ * C.HIDDEN)
-    var router_proj = arena_alloc[DType.bfloat16](arena, C.NUM_EXPERTS * C.HIDDEN)
+    var router_proj = arena_alloc[DType.bfloat16](
+        arena, CORR_LOCAL_EXPERTS * C.HIDDEN)
     var router_scale = arena_alloc[DType.bfloat16](arena, C.HIDDEN)
     var pes = arena_alloc[DType.bfloat16](arena, C.NUM_EXPERTS)
     var norm_w = arena_alloc[DType.bfloat16](arena, C.HIDDEN)
@@ -87,24 +102,21 @@ def alloc_state(
     var router_scaled = arena_alloc[DType.float32](arena, capacity * C.HIDDEN)
     var x_normed = arena_alloc[DType.bfloat16](arena, CORR_SEQ * C.HIDDEN)
     var partial = arena_alloc[DType.bfloat16](arena, CORR_SEQ * C.HIDDEN)
-    var counts = arena_alloc[DType.int32](arena, capacity * CORR_LOCAL_EXPERTS)
-    var offsets = arena_alloc[DType.int32](arena, CORR_LOCAL_EXPERTS + 1)
-    var cursors = arena_alloc[DType.int32](arena, capacity * CORR_LOCAL_EXPERTS)
-    var bucket_idx = arena_alloc[DType.int32](arena, CORR_SEQ)
-    var bucket_w = arena_alloc[DType.float32](arena, CORR_SEQ)
+    var cands = arena_alloc_t[RouterCandidate](arena, CORR_SEQ * C.TOP_K)
+    var expert_offset = arena_alloc[DType.int32](arena, CORR_LOCAL_EXPERTS + 1)
+    var routes = arena_alloc_t[SparseRoute](arena, CORR_SEQ * C.TOP_K)
+    var hidden_bucket = arena_alloc[DType.bfloat16](
+        arena, CORR_SEQ * C.TOP_K * C.MOE_INTERMEDIATE)
+    var moe_accum = arena_alloc[DType.float32](arena, CORR_SEQ * C.HIDDEN)
     var experts_gu = arena_alloc[DType.bfloat16](
         arena, CORR_LOCAL_EXPERTS * C.MOE_GATE_UP_FUSED * C.HIDDEN)
     var experts_down = arena_alloc[DType.bfloat16](
         arena, CORR_LOCAL_EXPERTS * C.HIDDEN * C.MOE_INTERMEDIATE)
     var gate_scratch = arena_alloc[DType.float32](
-        arena, capacity * EXPERT_TOK_TILE * C.MOE_GATE_UP_FUSED)
-    var hidden_scratch = arena_alloc[DType.float32](
-        arena, capacity * EXPERT_TOK_TILE * C.MOE_INTERMEDIATE)
-    var hidden_scratch_bf16 = arena_alloc[DType.bfloat16](
-        arena, capacity * EXPERT_TOK_TILE * C.MOE_INTERMEDIATE)
+        arena, capacity * PHASE1_MR * 2 * PHASE1_TILE_J)
 
     fill_bf16_x_input(x, CORR_SEQ * C.HIDDEN, 11)
-    fill_bf16_small(router_proj, C.NUM_EXPERTS * C.HIDDEN, 23)
+    fill_bf16_small(router_proj, CORR_LOCAL_EXPERTS * C.HIDDEN, 23)
     fill_bf16_unit_scale(router_scale, C.HIDDEN)
     fill_bf16_unit_scale(pes, C.NUM_EXPERTS)
     fill_bf16_unit_scale(norm_w, C.HIDDEN)
@@ -113,33 +125,29 @@ def alloc_state(
     fill_bf16_small(experts_down,
         CORR_LOCAL_EXPERTS * C.HIDDEN * C.MOE_INTERMEDIATE, 59)
 
-    return RankState(
-        x, router_proj, router_scale, pes, norm_w,
-        route_idx, route_w, router_scaled, x_normed, partial,
-        counts, offsets, cursors, bucket_idx, bucket_w,
-        experts_gu, experts_down, gate_scratch, hidden_scratch,
-        hidden_scratch_bf16,
+    var rank_state = RankState(
+        x=x, router_proj=router_proj, router_scale=router_scale,
+        per_expert_scale=pes, pre_ffn_norm_2=norm_w,
+        route_idx=route_idx, route_w=route_w, router_scaled=router_scaled,
+        x_normed=x_normed, moe_partial=partial,
+        cands=cands, expert_offset=expert_offset, routes=routes,
+        hidden_bucket=hidden_bucket, moe_accum=moe_accum,
+        experts_gate_up=experts_gu, experts_down=experts_down,
+        gate_scratch=gate_scratch,
     )
 
+    var bucket_idx = arena_alloc[DType.int32](arena, CORR_SEQ)
+    var bucket_w = arena_alloc[DType.float32](arena, CORR_SEQ)
+    var slot_offset = arena_alloc[DType.int32](arena, CORR_LOCAL_EXPERTS + 1)
+    var h_scratch = arena_alloc[DType.float32](arena, C.MOE_INTERMEDIATE)
+    var bgu_scratch = arena_alloc[DType.float32](arena, C.MOE_GATE_UP_FUSED)
+    var baseline = BaselineSlotState(
+        bucket_token_idx=bucket_idx, bucket_weight=bucket_w,
+        slot_offset=slot_offset, hidden_scratch=h_scratch,
+        gate_scratch=bgu_scratch,
+    )
 
-def run_router[P: BurstThreadPool](
-    state: RankState, mut pool: P,
-):
-    var cap = pool.get_capacity()
-    var buf = DispatchBuffer[
-        RouterStreamKernel[C.HIDDEN, C.NUM_EXPERTS, C.TOP_K]
-    ]()
-    for w in range(cap):
-        var wr = worker_range(CORR_SEQ, cap, w)
-        buf.slot()[] = RouterStreamKernel[
-            C.HIDDEN, C.NUM_EXPERTS, C.TOP_K,
-        ](
-            state.x, state.router_proj, state.router_scale,
-            state.per_expert_scale, state.router_scaled,
-            state.route_idx, state.route_w, w, wr[0], wr[1],
-        )
-    buf.dispatch(pool)
-    pool.join()
+    return (rank_state, baseline)
 
 
 def run_norm[P: BurstThreadPool](
@@ -160,86 +168,98 @@ def run_norm[P: BurstThreadPool](
     pool.join()
 
 
-def run_zero[P: BurstThreadPool](
+def run_phase1[P: BurstThreadPool](
     state: RankState, mut pool: P,
 ):
-    var elems = CORR_SEQ * C.HIDDEN
+    comptime n_tiles = C.MOE_INTERMEDIATE // PHASE1_TILE_J
+    comptime total_units = CORR_LOCAL_EXPERTS * n_tiles
     var cap = pool.get_capacity()
-    var buf = DispatchBuffer[FillBF16Kernel]()
-    for w in range(cap):
-        var wr = worker_range(elems, cap, w)
-        buf.slot()[] = FillBF16Kernel(state.moe_partial, wr[0], wr[1])
-    buf.dispatch(pool)
-    pool.join()
-
-
-def run_bucketize_slot[P: BurstThreadPool](
-    state: RankState, mut pool: P, slot: Int,
-):
-    var cap = pool.get_capacity()
-
-    var c_buf = DispatchBuffer[
-        ExpertCountSlotKernel[C.TOP_K, CORR_LOCAL_EXPERTS]
-    ]()
-    for w in range(cap):
-        var wr = worker_range(CORR_SEQ, cap, w)
-        c_buf.slot()[] = ExpertCountSlotKernel[C.TOP_K, CORR_LOCAL_EXPERTS](
-            state.route_idx, state.counts_per_worker, 0, w, slot, wr[0], wr[1],
-        )
-    c_buf.dispatch(pool)
-    pool.join()
-
-    var p_buf = DispatchBuffer[PrefixKernel[CORR_LOCAL_EXPERTS]]()
-    p_buf.slot()[] = PrefixKernel[CORR_LOCAL_EXPERTS](
-        state.counts_per_worker, state.expert_offset, state.worker_cursor,
-        cap, 0, 1,
-    )
-    p_buf.dispatch(pool)
-    pool.join()
-
-    var pl_buf = DispatchBuffer[PlaceSlotKernel[C.TOP_K, CORR_LOCAL_EXPERTS]]()
-    for w in range(cap):
-        var wr = worker_range(CORR_SEQ, cap, w)
-        pl_buf.slot()[] = PlaceSlotKernel[C.TOP_K, CORR_LOCAL_EXPERTS](
-            state.route_idx, state.route_w, state.worker_cursor,
-            state.bucket_token_idx, state.bucket_weight, 0, w, slot,
-            wr[0], wr[1],
-        )
-    pl_buf.dispatch(pool)
-    pool.join()
-
-
-def run_active_expert[P: BurstThreadPool](
-    state: RankState, mut pool: P,
-):
-    var cap = pool.get_capacity()
+    var nw = min(cap, total_units)
     var buf = DispatchBuffer[
-        ActiveExpertKernel[
+        Phase1GateUpKernel[
             C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
             CORR_LOCAL_EXPERTS,
         ]
     ]()
-    for w in range(cap):
-        var wr = worker_range(CORR_LOCAL_EXPERTS, cap, w)
-        buf.slot()[] = ActiveExpertKernel[
+    for w in range(nw):
+        var wr = worker_range(total_units, nw, w)
+        buf.slot()[] = Phase1GateUpKernel[
             C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
             CORR_LOCAL_EXPERTS,
         ](
-            state.x_normed, state.expert_offset,
-            state.bucket_token_idx, state.bucket_weight,
-            state.experts_gate_up, state.experts_down,
-            state.gate_scratch, state.hidden_scratch,
-            state.hidden_scratch_bf16,
-            state.moe_partial, w, wr[0], wr[1],
+            state.x_normed, state.expert_offset, state.routes,
+            state.experts_gate_up, state.gate_scratch,
+            state.hidden_bucket, w, wr[0], wr[1],
         )
     buf.dispatch(pool)
     pool.join()
 
 
-def run_baseline_expert[P: BurstThreadPool](
+def run_phase2[P: BurstThreadPool](
     state: RankState, mut pool: P,
 ):
-    # SINGLE-WORKER DIAGNOSTIC: assign all experts to worker 0.
+    comptime hidden_strides = C.HIDDEN // W
+    var cap = pool.get_capacity()
+    var nw = min(cap, hidden_strides)
+    var buf = DispatchBuffer[
+        Phase2DownKernel[C.HIDDEN, C.MOE_INTERMEDIATE, CORR_LOCAL_EXPERTS]
+    ]()
+    for w in range(nw):
+        var sr = worker_range(hidden_strides, nw, w)
+        buf.slot()[] = Phase2DownKernel[
+            C.HIDDEN, C.MOE_INTERMEDIATE, CORR_LOCAL_EXPERTS,
+        ](
+            state.expert_offset, state.routes, state.hidden_bucket,
+            state.experts_down, state.moe_accum, state.moe_partial,
+            CORR_SEQ, sr[0] * W, sr[1] * W,
+        )
+    buf.dispatch(pool)
+    pool.join()
+
+
+def bucketize_slot_inline(
+    route_idx: I32Ptr, route_w: F32Ptr,
+    slot: Int, num_local_experts: Int, seq_len: Int,
+    expert_offset: I32Ptr,
+    bucket_token_idx: I32Ptr, bucket_weight: F32Ptr,
+):
+    """Single-threaded per-slot bucketize: count, prefix-sum, scatter
+    only the records at column `slot` of route_idx/route_w. Used by the
+    baseline path where each slot is a single-writer-per-token phase."""
+    var counts = InlineArray[Int32, CORR_LOCAL_EXPERTS](fill=Int32(0))
+    var rank = 0
+    var first = rank * num_local_experts
+    var last = first + num_local_experts
+
+    for tok in range(seq_len):
+        var e = Int(route_idx[tok * C.TOP_K + slot])
+        if e >= first and e < last:
+            counts[e - first] += Int32(1)
+
+    var running = Int32(0)
+    var write_offsets = InlineArray[Int32, CORR_LOCAL_EXPERTS](
+        uninitialized=True)
+    for e in range(num_local_experts):
+        expert_offset[e] = running
+        write_offsets[e] = running
+        running += counts[e]
+    expert_offset[num_local_experts] = running
+
+    for tok in range(seq_len):
+        var e = Int(route_idx[tok * C.TOP_K + slot])
+        if e >= first and e < last:
+            var local = e - first
+            var pos = Int(write_offsets[local])
+            bucket_token_idx[pos] = Int32(tok)
+            bucket_weight[pos] = route_w[tok * C.TOP_K + slot]
+            write_offsets[local] = Int32(pos + 1)
+
+
+def run_baseline_expert[P: BurstThreadPool](
+    state: RankState, baseline: BaselineSlotState, mut pool: P,
+):
+    """Single-worker slot-phased reference. Runs the slot kernel with all
+    experts assigned to worker 0, fed by the slot-local bucket arrays."""
     var cap = 1
     var buf = DispatchBuffer[
         BaselineExpertKernel[
@@ -247,20 +267,23 @@ def run_baseline_expert[P: BurstThreadPool](
             CORR_LOCAL_EXPERTS,
         ]
     ]()
-    for w in range(cap):
-        buf.slot()[] = BaselineExpertKernel[
-            C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
-            CORR_LOCAL_EXPERTS,
-        ](
-            state.x_normed, state.expert_offset,
-            state.bucket_token_idx, state.bucket_weight,
-            state.experts_gate_up, state.experts_down,
-            state.gate_scratch, state.hidden_scratch,
-            state.hidden_scratch_bf16,
-            state.moe_partial, w, 0, CORR_LOCAL_EXPERTS,
-        )
+    buf.slot()[] = BaselineExpertKernel[
+        C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
+        CORR_LOCAL_EXPERTS,
+    ](
+        state.x_normed, baseline.slot_offset,
+        baseline.bucket_token_idx, baseline.bucket_weight,
+        state.experts_gate_up, state.experts_down,
+        baseline.gate_scratch, baseline.hidden_scratch,
+        state.moe_partial, 0, 0, CORR_LOCAL_EXPERTS,
+    )
     buf.dispatch(pool)
     pool.join()
+
+
+def zero_bf16(ptr: BF16Ptr, count: Int):
+    for i in range(count):
+        ptr[i] = Scalar[DType.bfloat16](0)
 
 
 def copy_partial(src: BF16Ptr, dst: BF16Ptr, count: Int):
@@ -273,10 +296,8 @@ def compute_ground_truth(
     gt_out: BF16Ptr,
     mut arena: NumaArena[alignment=ALIGNMENT],
 ):
-    """Compute the full MoE prefill in scalar Float32 with no kernel dispatch.
-    Reads bf16 weights/inputs, casts each to f32 element-wise, accumulates in
-    f32 in canonical sum order. Quantizes to bf16 once at the very end. This
-    is THE answer that any kernel approximates.
+    """Scalar f32 reference: bf16 weights/inputs cast to f32 element-wise,
+    f32 accumulation in canonical sum order, single bf16 quantize at end.
     """
     var acc = arena_alloc[DType.float32](arena, CORR_SEQ * C.HIDDEN)
     var gu_temp = arena_alloc[DType.float32](arena, C.MOE_GATE_UP_FUSED)
@@ -293,7 +314,6 @@ def compute_ground_truth(
             var gu_w_base = state.experts_gate_up + e * C.MOE_GATE_UP_FUSED * C.HIDDEN
             var down_w_base = state.experts_down + e * C.HIDDEN * C.MOE_INTERMEDIATE
 
-            # gate_up GEMM: 1408 dots of K=2816 each, scalar f32 accumulation.
             for m in range(C.MOE_GATE_UP_FUSED):
                 var s = Float32(0)
                 var w_row = gu_w_base + m * C.HIDDEN
@@ -301,13 +321,11 @@ def compute_ground_truth(
                     s += x_row[h].cast[DType.float32]() * w_row[h].cast[DType.float32]()
                 gu_temp[m] = s
 
-            # GELU(gate) * up via gelu_tanh_f32 (uses minimax exp, no libm).
             for j in range(C.MOE_INTERMEDIATE):
                 var g_simd = SIMD[DType.float32, 1](gu_temp[j])
                 var g_out = gelu_tanh_f32[1](g_simd)
                 h_temp[j] = g_out[0] * gu_temp[C.MOE_INTERMEDIATE + j]
 
-            # down GEMM: 2816 dots of K=704 each, scatter-add weighted.
             var acc_row = acc + t * C.HIDDEN
             for m in range(C.HIDDEN):
                 var s = Float32(0)
@@ -316,7 +334,6 @@ def compute_ground_truth(
                     s += h_temp[k] * w_row[k].cast[DType.float32]()
                 acc_row[m] += w * s
 
-    # Quantize to bf16 once at the end.
     for i in range(CORR_SEQ * C.HIDDEN):
         gt_out[i] = Scalar[DType.bfloat16](acc[i])
 
@@ -344,7 +361,6 @@ def compare(active: BF16Ptr, baseline: BF16Ptr, count: Int, tol: Float32) -> Boo
     var n_pos = 0
     var n_neg = 0
     var n_zero = 0
-    # 4 buckets by |baseline|: <0.001, 0.001..0.01, 0.01..0.1, >=0.1
     var bk_n = InlineArray[Int, 4](fill=0)
     var bk_sum_signed = InlineArray[Float64, 4](fill=0.0)
     var bk_sum_abs = InlineArray[Float64, 4](fill=0.0)
@@ -384,7 +400,6 @@ def compare(active: BF16Ptr, baseline: BF16Ptr, count: Int, tol: Float32) -> Boo
             max_rel = rel
         if rel > tol:
             n_bad += 1
-        # Bucket by |baseline|
         var bk = 0
         if b_abs >= 0.1: bk = 3
         elif b_abs >= 0.01: bk = 2
@@ -441,23 +456,32 @@ def compare(active: BF16Ptr, baseline: BF16Ptr, count: Int, tol: Float32) -> Boo
 def run_pipeline_active[P: BurstThreadPool](
     state: RankState, mut pool: P,
 ):
-    run_zero(state, pool)
-    for slot in range(C.TOP_K):
-        run_bucketize_slot(state, pool, slot)
-        run_active_expert(state, pool)
+    """Active path: build single sparse schedule, then phase1 + phase2.
+    moe_partial is fully written (zeroed inline in phase2)."""
+    _ = build_schedule_inline[CORR_LOCAL_EXPERTS, C.TOP_K](
+        state.route_idx, state.route_w, CORR_SEQ, 0,
+        state.expert_offset, state.routes)
+    run_phase1(state, pool)
+    run_phase2(state, pool)
 
 
 def run_pipeline_baseline[P: BurstThreadPool](
-    state: RankState, mut pool: P,
+    state: RankState, baseline: BaselineSlotState, mut pool: P,
 ):
-    run_zero(state, pool)
+    """Baseline path: slot-phased single-writer single-worker reference.
+    moe_partial must be zero-initialized by caller."""
     for slot in range(C.TOP_K):
-        run_bucketize_slot(state, pool, slot)
-        run_baseline_expert(state, pool)
+        bucketize_slot_inline(
+            state.route_idx, state.route_w,
+            slot, CORR_LOCAL_EXPERTS, CORR_SEQ,
+            baseline.slot_offset,
+            baseline.bucket_token_idx, baseline.bucket_weight,
+        )
+        run_baseline_expert(state, baseline, pool)
 
 
 def main():
-    print("Gemma4 MoE prefill correctness harness")
+    print("Gemma4 MoE prefill correctness harness (minimax-style)")
     print("  seq=" + String(CORR_SEQ)
         + " hidden=" + String(C.HIDDEN)
         + " experts=" + String(C.NUM_EXPERTS)
@@ -478,9 +502,11 @@ def main():
     var pool = BurstPool[].for_topology(numa, topo[0])
     print("  workers=" + String(pool.get_capacity()))
 
-    var state = alloc_state(arena, pool.get_capacity())
+    var alloc = alloc_state(arena, pool.get_capacity())
+    var state = alloc[0]
+    var baseline = alloc[1]
 
-    # Build deterministic synthetic state — bypass router/norm to keep the
+    # Deterministic synthetic state — bypass router/norm to keep the
     # active-vs-baseline expert diff numerically meaningful.
     fill_bf16_unit_scale(state.x_normed, CORR_SEQ * C.HIDDEN)
     for t in range(CORR_SEQ):
@@ -496,15 +522,17 @@ def main():
     var snapshot_baseline = arena_alloc[DType.bfloat16](arena, elems)
     var gt_out = arena_alloc[DType.bfloat16](arena, elems)
 
-    # Active path
+    # Active path: phase2 zeros moe_accum stripes inline; moe_partial
+    # is fully written by the cast at the end of phase2.
     run_pipeline_active(state, pool)
     copy_partial(state.moe_partial, snapshot_active, elems)
 
-    # Baseline path
-    run_pipeline_baseline(state, pool)
+    # Baseline path: slot-phased writes RMW into moe_partial, so it
+    # must start zero.
+    zero_bf16(state.moe_partial, elems)
+    run_pipeline_baseline(state, baseline, pool)
     copy_partial(state.moe_partial, snapshot_baseline, elems)
 
-    # Ground truth — scalar f64 accumulation, single bf16 quantize at output.
     print("Computing f64 scalar ground truth (this takes a few seconds)...")
     compute_ground_truth(state, gt_out, arena)
     print("  fp_ground_truth: " + String(fingerprint(gt_out, elems)))
@@ -514,7 +542,7 @@ def main():
     print("\n========== BASELINE vs GROUND TRUTH ==========")
     var ok_baseline = compare(snapshot_baseline, gt_out, elems, 1.0e-3)
     print("\n========== ACTIVE vs BASELINE ==========")
-    var ok_ab = compare(snapshot_active, snapshot_baseline, elems, 1.0e-3)
+    _ = compare(snapshot_active, snapshot_baseline, elems, 1.0e-3)
 
     if ok_active and ok_baseline:
         print("\nPASS")

@@ -19,6 +19,22 @@ comptime I32Ptr  = UnsafePointer[Scalar[DType.int32],    MutAnyOrigin]
 comptime W = simd_width_of[DType.float32]()
 
 
+@fieldwise_init
+struct RouterCandidate(Copyable, ImplicitlyCopyable):
+    var expert: Int32
+    var logit: Float32
+
+
+@fieldwise_init
+struct SparseRoute(Copyable, ImplicitlyCopyable):
+    var token: Int32
+    var weight: Float32
+
+
+comptime RouterCandidatePtr = UnsafePointer[RouterCandidate, MutAnyOrigin]
+comptime SparseRoutePtr = UnsafePointer[SparseRoute, MutAnyOrigin]
+
+
 def arena_alloc[
     align: Int, //, dtype: DType,
 ](
@@ -28,6 +44,18 @@ def arena_alloc[
     if not ptr:
         print("arena alloc failed for", count, "elements")
         return UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
+    return ptr.value()
+
+
+def arena_alloc_t[
+    align: Int, //, T: AnyType,
+](
+    mut arena: NumaArena[alignment=align], count: Int,
+) -> UnsafePointer[T, MutAnyOrigin]:
+    var ptr = arena.alloc[T](count)
+    if not ptr:
+        print("arena alloc failed for", count, "elements")
+        return UnsafePointer[T, MutAnyOrigin].unsafe_dangling()
     return ptr.value()
 
 
@@ -43,33 +71,37 @@ def fill_bf16_positive(ptr: BF16Ptr, count: Int):
 
 
 @always_inline
-def insert_topk[top_k: Int](
-    value: Scalar[DType.float32],
-    idx: Int,
-    mut top_values: InlineArray[Scalar[DType.float32], top_k],
-    mut top_indices: InlineArray[Int, top_k],
+def insert_candidate[top_k: Int](
+    expert: Int32,
+    logit: Float32,
+    mut cands: InlineArray[RouterCandidate, top_k],
 ):
+    """Sorted descending by logit; tie-break to lower expert id."""
     for k in range(top_k):
-        if value > top_values[k] or (value == top_values[k] and idx < top_indices[k]):
+        var c = cands[k]
+        if logit > c.logit or (logit == c.logit and Int(expert) < Int(c.expert)):
             var j = top_k - 1
             while j > k:
-                top_values[j] = top_values[j - 1]
-                top_indices[j] = top_indices[j - 1]
+                cands[j] = cands[j - 1]
                 j -= 1
-            top_values[k] = value
-            top_indices[k] = idx
+            cands[k] = RouterCandidate(expert, logit)
             return
 
 
 @fieldwise_init
-struct RouterStreamKernel[hidden: Int, num_experts: Int, top_k: Int](OutputPartitionedKernel):
+struct RouterShardedKernel[
+    hidden: Int, experts_per_rank: Int, top_k: Int,
+](OutputPartitionedKernel):
+    """Per-rank router: rmsnorm-scale, GEMV against expert-sharded
+    router_proj, local top_k. Emits RouterCandidate[seq, top_k] with
+    GLOBAL expert ids and raw logits. Cross-rank merge + softmax happens
+    on the main thread after dispatch."""
     var x: BF16Ptr
     var router_proj: BF16Ptr
     var router_scale: BF16Ptr
-    var per_expert_scale: BF16Ptr
     var scaled_scratch: F32Ptr
-    var out_idx: I32Ptr
-    var out_w: F32Ptr
+    var cands_out: RouterCandidatePtr
+    var expert_base: Int
     var worker_id: Int
     var start: Int
     var end: Int
@@ -80,7 +112,7 @@ struct RouterStreamKernel[hidden: Int, num_experts: Int, top_k: Int](OutputParti
         comptime sqrt_n = sqrt[DType.float32, 1](Float32(Self.hidden))
         comptime n_eps = Scalar[DType.float32](
             Float32(Self.hidden) * Float32(C.RMS_NORM_EPS))
-        comptime sentinel = Scalar[DType.float32](-1.0e30)
+        comptime sentinel = Float32(-1.0e30)
 
         var scratch = self.scaled_scratch + self.worker_id * Self.hidden
         for tok in range(self.start, self.end):
@@ -101,10 +133,9 @@ struct RouterStreamKernel[hidden: Int, num_experts: Int, top_k: Int](OutputParti
                 var sv = (self.router_scale + j).load[width=W]().cast[DType.float32]()
                 (scratch + j).store(xv * sv * inv_vec)
 
-            var top_values = InlineArray[Scalar[DType.float32], Self.top_k](
-                fill=sentinel)
-            var top_indices = InlineArray[Int, Self.top_k](fill=0)
-            for e in range(Self.num_experts):
+            var cands = InlineArray[RouterCandidate, Self.top_k](
+                fill=RouterCandidate(Int32(0), sentinel))
+            for e in range(Self.experts_per_rank):
                 var row = self.router_proj + e * Self.hidden
                 var accs = InlineArray[SIMD[DType.float32, W], PU](
                     fill=SIMD[DType.float32, W](0))
@@ -114,62 +145,104 @@ struct RouterStreamKernel[hidden: Int, num_experts: Int, top_k: Int](OutputParti
                         var xv = (scratch + off).load[width=W]()
                         var wv = (row + off).load[width=W]().cast[DType.float32]()
                         accs[p] = xv.fma(wv, accs[p])
-                insert_topk[Self.top_k](tree_reduce_accs(accs), e, top_values, top_indices)
+                var logit = tree_reduce_accs(accs)
+                insert_candidate[Self.top_k](
+                    Int32(self.expert_base + e), logit, cands)
 
-            var max_v = top_values[0]
-            var sum_v = Scalar[DType.float32](0)
-            var exp_values = InlineArray[Scalar[DType.float32], Self.top_k](
-                uninitialized=True)
+            var dst = self.cands_out + tok * Self.top_k
             comptime for k in range(Self.top_k):
-                var ev = fast_exp_softmax_biased[1](
-                    SIMD[DType.float32, 1](top_values[k] - max_v))[0]
-                exp_values[k] = ev
-                sum_v += ev
-            var inv_sum = Scalar[DType.float32](1.0) / sum_v
-            var idx_row = self.out_idx + tok * Self.top_k
-            var w_row = self.out_w + tok * Self.top_k
-            comptime for k in range(Self.top_k):
-                var expert = top_indices[k]
-                var scale = (self.per_expert_scale + expert)[].cast[DType.float32]()
-                (idx_row + k)[] = Int32(expert)
-                (w_row + k)[] = exp_values[k] * inv_sum * scale
+                dst[k] = cands[k]
 
     def over_range(self, start: Int, end: Int) -> Self:
         return Self(
-            self.x, self.router_proj, self.router_scale, self.per_expert_scale,
-            self.scaled_scratch, self.out_idx, self.out_w,
+            self.x, self.router_proj, self.router_scale,
+            self.scaled_scratch, self.cands_out, self.expert_base,
             self.worker_id, start, end,
         )
 
 
-@fieldwise_init
-struct RouteGatherConfig[tp: Int](Copyable):
-    var src_idx: InlineArray[I32Ptr, Self.tp]
-    var src_w: InlineArray[F32Ptr, Self.tp]
+def merge_candidates_inline[tp: Int, top_k: Int](
+    cands_per_rank: InlineArray[RouterCandidatePtr, tp],
+    per_expert_scale: BF16Ptr,
+    route_idx_per_rank: InlineArray[I32Ptr, tp],
+    route_w_per_rank: InlineArray[F32Ptr, tp],
+    seq_len: Int,
+):
+    """Single-threaded merge across tp ranks. For each token: gather
+    tp*top_k candidates, pick global top_k by logit (ties by expert id),
+    softmax over chosen logits, multiply by per_expert_scale, replicate
+    result to every rank's route_idx/route_w buffer.
+    """
+    comptime sentinel = Float32(-1.0e30)
+    for tok in range(seq_len):
+        var merged = InlineArray[RouterCandidate, top_k](
+            fill=RouterCandidate(Int32(0), sentinel))
+        for r in range(tp):
+            var src = cands_per_rank[r] + tok * top_k
+            for k in range(top_k):
+                var c = src[k]
+                insert_candidate[top_k](c.expert, c.logit, merged)
+
+        var max_logit = merged[0].logit
+        var sum_v = Float32(0)
+        var exp_values = InlineArray[Float32, top_k](uninitialized=True)
+        comptime for k in range(top_k):
+            var ev = fast_exp_softmax_biased[1](
+                SIMD[DType.float32, 1](merged[k].logit - max_logit))[0]
+            exp_values[k] = ev
+            sum_v += ev
+        var inv_sum = Float32(1.0) / sum_v
+
+        for r in range(tp):
+            var idx_dst = route_idx_per_rank[r] + tok * top_k
+            var w_dst = route_w_per_rank[r] + tok * top_k
+            comptime for k in range(top_k):
+                var expert = merged[k].expert
+                var scale = (per_expert_scale + Int(expert))[].cast[DType.float32]()
+                idx_dst[k] = expert
+                w_dst[k] = exp_values[k] * inv_sum * scale
 
 
-@fieldwise_init
-struct RouteGatherDstKernel[
-    tp: Int, top_k: Int, cfg_origin: ImmutOrigin,
-](OutputPartitionedKernel):
-    var config: UnsafePointer[RouteGatherConfig[Self.tp], Self.cfg_origin]
-    var dst_idx: I32Ptr
-    var dst_w: F32Ptr
-    var seq_len: Int
-    var start: Int
-    var end: Int
+def build_schedule_inline[experts_per_rank: Int, top_k: Int](
+    route_idx: I32Ptr,
+    route_w: F32Ptr,
+    seq_len: Int,
+    rank: Int,
+    expert_offset: I32Ptr,
+    routes: SparseRoutePtr,
+) -> Int:
+    """Single-threaded count -> prefix -> scatter into rank-local buckets.
+    Returns total local route count (= expert_offset[experts_per_rank]).
+    """
+    var counts = InlineArray[Int32, experts_per_rank](fill=Int32(0))
+    var first = rank * experts_per_rank
+    var last = first + experts_per_rank
 
-    def execute(mut self):
-        for rec in range(self.start, self.end):
-            var tok = rec // Self.top_k
-            var owner = tok * Self.tp // self.seq_len
-            self.dst_idx[rec] = self.config[].src_idx[owner][rec]
-            self.dst_w[rec] = self.config[].src_w[owner][rec]
+    for tok in range(seq_len):
+        for k in range(top_k):
+            var e = Int(route_idx[tok * top_k + k])
+            if e >= first and e < last:
+                counts[e - first] += Int32(1)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.config, self.dst_idx, self.dst_w, self.seq_len, start, end,
-        )
+    var running = Int32(0)
+    var write_offsets = InlineArray[Int32, experts_per_rank](uninitialized=True)
+    for e in range(experts_per_rank):
+        expert_offset[e] = running
+        write_offsets[e] = running
+        running += counts[e]
+    expert_offset[experts_per_rank] = running
+
+    for tok in range(seq_len):
+        for k in range(top_k):
+            var idx = tok * top_k + k
+            var e = Int(route_idx[idx])
+            if e >= first and e < last:
+                var local = e - first
+                var pos = Int(write_offsets[local])
+                routes[pos] = SparseRoute(Int32(tok), route_w[idx])
+                write_offsets[local] = Int32(pos + 1)
+
+    return Int(running)
 
 
 @fieldwise_init
@@ -216,99 +289,6 @@ struct RmsNormBenchKernel[
 
 
 @fieldwise_init
-struct ExpertCountSlotKernel[top_k: Int, num_local_experts: Int](OutputPartitionedKernel):
-    var indices: I32Ptr
-    var counts_per_worker: I32Ptr
-    var rank: Int
-    var worker_id: Int
-    var slot: Int
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        var counts = self.counts_per_worker + self.worker_id * Self.num_local_experts
-        for e in range(Self.num_local_experts):
-            counts[e] = Int32(0)
-        var first = self.rank * Self.num_local_experts
-        var last = first + Self.num_local_experts
-        for tok in range(self.start, self.end):
-            var expert = Int(self.indices[tok * Self.top_k + self.slot])
-            if expert >= first and expert < last:
-                counts[expert - first] += 1
-
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.indices, self.counts_per_worker, self.rank,
-            self.worker_id, self.slot, start, end,
-        )
-
-
-@fieldwise_init
-struct PrefixKernel[num_local_experts: Int](OutputPartitionedKernel):
-    var counts_per_worker: I32Ptr
-    var expert_offset: I32Ptr
-    var worker_cursor: I32Ptr
-    var num_workers: Int
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        if self.start != 0:
-            return
-        var running = 0
-        for e in range(Self.num_local_experts):
-            self.expert_offset[e] = Int32(running)
-            var per_e = 0
-            for w in range(self.num_workers):
-                var c = Int(self.counts_per_worker[w * Self.num_local_experts + e])
-                self.worker_cursor[w * Self.num_local_experts + e] = Int32(running + per_e)
-                per_e += c
-            running += per_e
-        self.expert_offset[Self.num_local_experts] = Int32(running)
-
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.counts_per_worker, self.expert_offset, self.worker_cursor,
-            self.num_workers, start, end,
-        )
-
-
-@fieldwise_init
-struct PlaceSlotKernel[top_k: Int, num_local_experts: Int](OutputPartitionedKernel):
-    var indices: I32Ptr
-    var weights: F32Ptr
-    var worker_cursor: I32Ptr
-    var bucket_token_idx: I32Ptr
-    var bucket_weight: F32Ptr
-    var rank: Int
-    var worker_id: Int
-    var slot: Int
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        var cursors = self.worker_cursor + self.worker_id * Self.num_local_experts
-        var first = self.rank * Self.num_local_experts
-        var last = first + Self.num_local_experts
-        for tok in range(self.start, self.end):
-            var row = tok * Self.top_k + self.slot
-            var expert = Int(self.indices[row])
-            if expert >= first and expert < last:
-                var local = expert - first
-                var pos = Int(cursors[local])
-                cursors[local] = Int32(pos + 1)
-                self.bucket_token_idx[pos] = Int32(tok)
-                self.bucket_weight[pos] = self.weights[row]
-
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.indices, self.weights, self.worker_cursor,
-            self.bucket_token_idx, self.bucket_weight, self.rank,
-            self.worker_id, self.slot, start, end,
-        )
-
-
-@fieldwise_init
 struct RankState(Copyable, ImplicitlyCopyable):
     var x: BF16Ptr
     var router_proj: BF16Ptr
@@ -320,13 +300,11 @@ struct RankState(Copyable, ImplicitlyCopyable):
     var router_scaled: F32Ptr
     var x_normed: BF16Ptr
     var moe_partial: BF16Ptr
-    var counts_per_worker: I32Ptr
+    var cands: RouterCandidatePtr
     var expert_offset: I32Ptr
-    var worker_cursor: I32Ptr
-    var bucket_token_idx: I32Ptr
-    var bucket_weight: F32Ptr
+    var routes: SparseRoutePtr
+    var hidden_bucket: BF16Ptr
+    var moe_accum: F32Ptr
     var experts_gate_up: BF16Ptr
     var experts_down: BF16Ptr
     var gate_scratch: F32Ptr
-    var hidden_scratch: F32Ptr
-    var hidden_scratch_bf16: BF16Ptr

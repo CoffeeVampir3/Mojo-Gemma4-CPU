@@ -17,13 +17,15 @@ from kernels.reductions import dispatch_allreduce
 from modeling.model_spec import BF16
 from modeling.gemma4_common import Gemma4BaseConfig
 from simd_math.ops import sqrt
-from prototypes.expert_kernels import ActiveExpertKernel, EXPERT_TOK_TILE
+from prototypes.expert_kernels import (
+    Phase1GateUpKernel, Phase2DownKernel, PHASE1_TILE_J, PHASE1_MR,
+)
 from prototypes.moe_phase_kernels import (
-    arena_alloc, fill_bf16, fill_bf16_positive,
-    RouterStreamKernel, RouteGatherConfig, RouteGatherDstKernel,
-    FillBF16Kernel, RmsNormBenchKernel,
-    ExpertCountSlotKernel, PrefixKernel, PlaceSlotKernel,
-    RankState,
+    arena_alloc, arena_alloc_t, fill_bf16, fill_bf16_positive,
+    RouterShardedKernel, RouterCandidate, RouterCandidatePtr,
+    SparseRoute, SparseRoutePtr,
+    merge_candidates_inline, build_schedule_inline,
+    RmsNormBenchKernel, RankState,
 )
 
 
@@ -96,11 +98,11 @@ struct PhaseTiming(Copyable, ImplicitlyCopyable):
 @fieldwise_init
 struct PhaseTotals(Copyable, ImplicitlyCopyable):
     var router: PhaseTiming
-    var gather: PhaseTiming
+    var merge: PhaseTiming
     var norm: PhaseTiming
-    var zero: PhaseTiming
-    var bucket: PhaseTiming
-    var expert: PhaseTiming
+    var schedule: PhaseTiming
+    var phase1: PhaseTiming
+    var phase2: PhaseTiming
     var allreduce: PhaseTiming
     var total_wall_ns: Int
 
@@ -117,35 +119,29 @@ def empty_totals() -> PhaseTotals:
 
 
 @always_inline
-def add_timing(mut dst: PhaseTiming, src: PhaseTiming):
-    dst.wall_ns += src.wall_ns
-    dst.worker_ns += src.worker_ns
-
-
-@always_inline
 def better(candidate: PhaseTotals, incumbent: PhaseTotals) -> Bool:
     return incumbent.total_wall_ns == 0 or candidate.total_wall_ns < incumbent.total_wall_ns
 
 
-
-def dispatch_router_phase[P: BurstThreadPool, //, tp: Int, num_local_experts: Int](
+def dispatch_router_sharded_phase[
+    P: BurstThreadPool, //, tp: Int, num_local_experts: Int,
+](
     states: InlineArray[RankState, tp], mut pools: HeapMoveArray[P],
 ) -> PhaseTiming:
     var t0 = Int(perf_counter_ns())
     for r in range(tp):
         var cap = pools[r].get_capacity()
         var buf = DispatchBuffer[
-            RouterStreamKernel[C.HIDDEN, C.NUM_EXPERTS, C.TOP_K]
+            RouterShardedKernel[C.HIDDEN, num_local_experts, C.TOP_K]
         ]()
-        var stripe = worker_range(BENCH_SEQ, tp, r)
         for w in range(cap):
-            var wr = worker_range(stripe[1] - stripe[0], cap, w, stripe[0])
-            buf.slot()[] = RouterStreamKernel[
-                C.HIDDEN, C.NUM_EXPERTS, C.TOP_K,
+            var wr = worker_range(BENCH_SEQ, cap, w)
+            buf.slot()[] = RouterShardedKernel[
+                C.HIDDEN, num_local_experts, C.TOP_K,
             ](
                 states[r].x, states[r].router_proj, states[r].router_scale,
-                states[r].per_expert_scale, states[r].router_scaled,
-                states[r].route_idx, states[r].route_w, w, wr[0], wr[1],
+                states[r].router_scaled, states[r].cands,
+                r * num_local_experts, w, wr[0], wr[1],
             )
         buf.dispatch(pools[r])
     join_all[tp](pools)
@@ -154,35 +150,21 @@ def dispatch_router_phase[P: BurstThreadPool, //, tp: Int, num_local_experts: In
     return PhaseTiming(t1 - t0, worker)
 
 
-def dispatch_route_gather_phase[P: BurstThreadPool, //, tp: Int](
-    states: InlineArray[RankState, tp], mut pools: HeapMoveArray[P],
+def merge_step[tp: Int](
+    states: InlineArray[RankState, tp], seq_len: Int,
 ) -> PhaseTiming:
-    var src_idx = InlineArray[I32Ptr, tp](uninitialized=True)
-    var src_w = InlineArray[F32Ptr, tp](uninitialized=True)
-    for r in range(tp):
-        src_idx[r] = states[r].route_idx
-        src_w[r] = states[r].route_w
-    var cfg = RouteGatherConfig[tp](src_idx, src_w)
-    var config = UnsafePointer(to=cfg).as_immutable()
-    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
-
-    var total_records = BENCH_SEQ * C.TOP_K
     var t0 = Int(perf_counter_ns())
-    for dst in range(tp):
-        var cap = pools[dst].get_capacity()
-        var buf = DispatchBuffer[RouteGatherDstKernel[tp, C.TOP_K, cfg_ro]]()
-        var nw = recommended_workers(total_records * 8, cap)
-        for w in range(nw):
-            var wr = worker_range(total_records, nw, w)
-            buf.slot()[] = RouteGatherDstKernel[tp, C.TOP_K, cfg_ro](
-                config, states[dst].route_idx, states[dst].route_w,
-                BENCH_SEQ, wr[0], wr[1],
-            )
-        buf.dispatch(pools[dst])
-    join_all[tp](pools)
-    var worker = max_worker_ts[tp=tp](pools) - t0
+    var cands = InlineArray[RouterCandidatePtr, tp](uninitialized=True)
+    var idx_per = InlineArray[I32Ptr, tp](uninitialized=True)
+    var w_per = InlineArray[F32Ptr, tp](uninitialized=True)
+    for r in range(tp):
+        cands[r] = states[r].cands
+        idx_per[r] = states[r].route_idx
+        w_per[r] = states[r].route_w
+    merge_candidates_inline[tp, C.TOP_K](
+        cands, states[0].per_expert_scale, idx_per, w_per, seq_len)
     var t1 = Int(perf_counter_ns())
-    return PhaseTiming(t1 - t0, worker)
+    return PhaseTiming(t1 - t0, t1 - t0)
 
 
 def dispatch_norm_phase[P: BurstThreadPool, //, tp: Int](
@@ -206,99 +188,77 @@ def dispatch_norm_phase[P: BurstThreadPool, //, tp: Int](
     var worker = max_worker_ts[tp=tp](pools) - t0
     var t1 = Int(perf_counter_ns())
     return PhaseTiming(t1 - t0, worker)
- 
-
-def dispatch_zero_phase[P: BurstThreadPool, //, tp: Int](
-    states: InlineArray[RankState, tp], mut pools: HeapMoveArray[P],
-) -> PhaseTiming:
-    var elems = BENCH_SEQ * C.HIDDEN
-    var t0 = Int(perf_counter_ns())
-    for r in range(tp):
-        var buf = DispatchBuffer[FillBF16Kernel]()
-        var nw = recommended_workers(elems * 2, pools[r].get_capacity())
-        for w in range(nw):
-            var wr = worker_range(elems, nw, w)
-            buf.slot()[] = FillBF16Kernel(states[r].moe_partial, wr[0], wr[1])
-        buf.dispatch(pools[r])
-    join_all[tp](pools)
-    var worker = max_worker_ts[tp=tp](pools) - t0
-    var t1 = Int(perf_counter_ns())
-    return PhaseTiming(t1 - t0, worker)
 
 
-def dispatch_bucket_slot_phase[
-    P: BurstThreadPool, //, tp: Int, num_local_experts: Int,
-](
-    states: InlineArray[RankState, tp], mut pools: HeapMoveArray[P], slot: Int,
+def schedule_step[tp: Int, num_local_experts: Int](
+    states: InlineArray[RankState, tp], seq_len: Int,
 ) -> PhaseTiming:
     var t0 = Int(perf_counter_ns())
     for r in range(tp):
-        var cap = pools[r].get_capacity()
-        var buf = DispatchBuffer[
-            ExpertCountSlotKernel[C.TOP_K, num_local_experts]
-        ]()
-        for w in range(cap):
-            var wr = worker_range(BENCH_SEQ, cap, w)
-            buf.slot()[] = ExpertCountSlotKernel[C.TOP_K, num_local_experts](
-                states[r].route_idx, states[r].counts_per_worker,
-                r, w, slot, wr[0], wr[1],
-            )
-        buf.dispatch(pools[r])
-    join_all[tp](pools)
-
-    for r in range(tp):
-        var buf = DispatchBuffer[PrefixKernel[num_local_experts]]()
-        buf.slot()[] = PrefixKernel[num_local_experts](
-            states[r].counts_per_worker, states[r].expert_offset,
-            states[r].worker_cursor, pools[r].get_capacity(), 0, 1,
-        )
-        buf.dispatch(pools[r])
-    join_all[tp](pools)
-
-    for r in range(tp):
-        var cap = pools[r].get_capacity()
-        var buf = DispatchBuffer[PlaceSlotKernel[C.TOP_K, num_local_experts]]()
-        for w in range(cap):
-            var wr = worker_range(BENCH_SEQ, cap, w)
-            buf.slot()[] = PlaceSlotKernel[C.TOP_K, num_local_experts](
-                states[r].route_idx, states[r].route_w,
-                states[r].worker_cursor, states[r].bucket_token_idx,
-                states[r].bucket_weight, r, w, slot, wr[0], wr[1],
-            )
-        buf.dispatch(pools[r])
-    join_all[tp](pools)
-
-    var worker = max_worker_ts[tp=tp](pools) - t0
+        _ = build_schedule_inline[num_local_experts, C.TOP_K](
+            states[r].route_idx, states[r].route_w, seq_len, r,
+            states[r].expert_offset, states[r].routes)
     var t1 = Int(perf_counter_ns())
-    return PhaseTiming(t1 - t0, worker)
+    return PhaseTiming(t1 - t0, t1 - t0)
 
 
-def dispatch_expert_slot_phase[
+def dispatch_phase1_step[
     P: BurstThreadPool, //, tp: Int, num_local_experts: Int,
 ](
     states: InlineArray[RankState, tp], mut pools: HeapMoveArray[P],
 ) -> PhaseTiming:
+    comptime n_tiles = C.MOE_INTERMEDIATE // PHASE1_TILE_J
+    comptime total_units = num_local_experts * n_tiles
     var t0 = Int(perf_counter_ns())
     for r in range(tp):
         var cap = pools[r].get_capacity()
+        var nw = min(cap, total_units)
         var buf = DispatchBuffer[
-            ActiveExpertKernel[
+            Phase1GateUpKernel[
                 C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
                 num_local_experts,
-            ],
+            ]
         ]()
-        for w in range(cap):
-            var wr = worker_range(num_local_experts, cap, w)
-            buf.slot()[] = ActiveExpertKernel[
+        for w in range(nw):
+            var wr = worker_range(total_units, nw, w)
+            buf.slot()[] = Phase1GateUpKernel[
                 C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
                 num_local_experts,
             ](
-                states[r].x_normed, states[r].expert_offset,
-                states[r].bucket_token_idx, states[r].bucket_weight,
-                states[r].experts_gate_up, states[r].experts_down,
-                states[r].gate_scratch, states[r].hidden_scratch,
-                states[r].hidden_scratch_bf16,
-                states[r].moe_partial, w, wr[0], wr[1],
+                states[r].x_normed, states[r].expert_offset, states[r].routes,
+                states[r].experts_gate_up, states[r].gate_scratch,
+                states[r].hidden_bucket,
+                w, wr[0], wr[1],
+            )
+        buf.dispatch(pools[r])
+    join_all[tp](pools)
+    var worker = max_worker_ts[tp=tp](pools) - t0
+    var t1 = Int(perf_counter_ns())
+    return PhaseTiming(t1 - t0, worker)
+
+
+def dispatch_phase2_step[
+    P: BurstThreadPool, //, tp: Int, num_local_experts: Int,
+](
+    states: InlineArray[RankState, tp], mut pools: HeapMoveArray[P], seq_len: Int,
+) -> PhaseTiming:
+    comptime hidden_strides = C.HIDDEN // W
+    var t0 = Int(perf_counter_ns())
+    for r in range(tp):
+        var cap = pools[r].get_capacity()
+        var nw = min(cap, hidden_strides)
+        var buf = DispatchBuffer[
+            Phase2DownKernel[C.HIDDEN, C.MOE_INTERMEDIATE, num_local_experts]
+        ]()
+        for w in range(nw):
+            var sr = worker_range(hidden_strides, nw, w)
+            buf.slot()[] = Phase2DownKernel[
+                C.HIDDEN, C.MOE_INTERMEDIATE, num_local_experts,
+            ](
+                states[r].expert_offset, states[r].routes,
+                states[r].hidden_bucket, states[r].experts_down,
+                states[r].moe_accum, states[r].moe_partial,
+                seq_len, sr[0] * W, sr[1] * W,
             )
         buf.dispatch(pools[r])
     join_all[tp](pools)
@@ -329,20 +289,18 @@ def run_iteration[P: BurstThreadPool, //, tp: Int, num_local_experts: Int](
     var total = empty_totals()
     var t0 = Int(perf_counter_ns())
 
-    total.router = dispatch_router_phase[tp=tp, num_local_experts=num_local_experts](states, pools)
-    total.gather = dispatch_route_gather_phase[tp=tp](states, pools)
+    total.router = dispatch_router_sharded_phase[
+        tp=tp, num_local_experts=num_local_experts](states, pools)
+    total.merge = merge_step[tp=tp](states, BENCH_SEQ)
     total.norm = dispatch_norm_phase[tp=tp](states, pools)
-    total.zero = dispatch_zero_phase[tp=tp](states, pools)
-
-    for slot in range(C.TOP_K):
-        var bt = dispatch_bucket_slot_phase[tp=tp, num_local_experts=num_local_experts](
-            states, pools, slot)
-        add_timing(total.bucket, bt)
-        var et = dispatch_expert_slot_phase[tp=tp, num_local_experts=num_local_experts](
-            states, pools)
-        add_timing(total.expert, et)
-
+    total.schedule = schedule_step[
+        tp=tp, num_local_experts=num_local_experts](states, BENCH_SEQ)
+    total.phase1 = dispatch_phase1_step[
+        tp=tp, num_local_experts=num_local_experts](states, pools)
+    total.phase2 = dispatch_phase2_step[
+        tp=tp, num_local_experts=num_local_experts](states, pools, BENCH_SEQ)
     total.allreduce = dispatch_allreduce_phase[tp=tp](states, pools)
+
     total.total_wall_ns = Int(perf_counter_ns()) - t0
     keep(states[0].moe_partial[0])
     return total
@@ -351,16 +309,13 @@ def run_iteration[P: BurstThreadPool, //, tp: Int, num_local_experts: Int](
 def print_totals[tp: Int](totals: PhaseTotals):
     print("\n=== Best phase timings (seq=" + String(BENCH_SEQ)
         + ", tp=" + String(tp) + ") ===")
-    print_phase("router_stream_topk", totals.router.wall_ns, totals.router.worker_ns)
-    print_phase("route_metadata_gather", totals.gather.wall_ns, totals.gather.worker_ns,
-        BENCH_SEQ * C.TOP_K * 8 * tp)
+    print_phase("router_sharded", totals.router.wall_ns, totals.router.worker_ns)
+    print_phase("merge_softmax",  totals.merge.wall_ns, totals.merge.worker_ns)
     print_phase("pre_moe_norm", totals.norm.wall_ns, totals.norm.worker_ns,
         BENCH_SEQ * C.HIDDEN * 4 * tp)
-    print_phase("zero_local_partial", totals.zero.wall_ns, totals.zero.worker_ns,
-        BENCH_SEQ * C.HIDDEN * 2 * tp)
-    print_phase("bucketize_all_slots", totals.bucket.wall_ns, totals.bucket.worker_ns,
-        BENCH_SEQ * C.TOP_K * 8 * tp * 2)
-    print_phase("expert_runner_all_slots", totals.expert.wall_ns, totals.expert.worker_ns)
+    print_phase("build_schedule", totals.schedule.wall_ns, totals.schedule.worker_ns)
+    print_phase("phase1_gate_up", totals.phase1.wall_ns, totals.phase1.worker_ns)
+    print_phase("phase2_down",    totals.phase2.wall_ns, totals.phase2.worker_ns)
     print_phase("output_allreduce", totals.allreduce.wall_ns, totals.allreduce.worker_ns,
         BENCH_SEQ * C.HIDDEN * 2 * tp * 2)
     print("  total wall=" + fmt_ns(totals.total_wall_ns))
@@ -373,33 +328,33 @@ def alloc_states[tp: Int, num_local_experts: Int](
     var states = InlineArray[RankState, tp](uninitialized=True)
     for r in range(tp):
         var x = arena_alloc[DType.bfloat16](arenas[r], BENCH_SEQ * C.HIDDEN)
-        var router_proj = arena_alloc[DType.bfloat16](arenas[r], C.NUM_EXPERTS * C.HIDDEN)
+        var router_proj = arena_alloc[DType.bfloat16](
+            arenas[r], num_local_experts * C.HIDDEN)
         var router_scale = arena_alloc[DType.bfloat16](arenas[r], C.HIDDEN)
         var pes = arena_alloc[DType.bfloat16](arenas[r], C.NUM_EXPERTS)
         var norm_w = arena_alloc[DType.bfloat16](arenas[r], C.HIDDEN)
         var route_idx = arena_alloc[DType.int32](arenas[r], BENCH_SEQ * C.TOP_K)
         var route_w = arena_alloc[DType.float32](arenas[r], BENCH_SEQ * C.TOP_K)
-        var router_scaled = arena_alloc[DType.float32](arenas[r], capacities[r] * C.HIDDEN)
+        var router_scaled = arena_alloc[DType.float32](
+            arenas[r], capacities[r] * C.HIDDEN)
         var x_normed = arena_alloc[DType.bfloat16](arenas[r], BENCH_SEQ * C.HIDDEN)
         var partial = arena_alloc[DType.bfloat16](arenas[r], BENCH_SEQ * C.HIDDEN)
-        var counts = arena_alloc[DType.int32](arenas[r], capacities[r] * num_local_experts)
-        var offsets = arena_alloc[DType.int32](arenas[r], num_local_experts + 1)
-        var cursors = arena_alloc[DType.int32](arenas[r], capacities[r] * num_local_experts)
-        var bucket_idx = arena_alloc[DType.int32](arenas[r], BENCH_SEQ)
-        var bucket_w = arena_alloc[DType.float32](arenas[r], BENCH_SEQ)
+        var cands = arena_alloc_t[RouterCandidate](arenas[r], BENCH_SEQ * C.TOP_K)
+        var expert_offset = arena_alloc[DType.int32](
+            arenas[r], num_local_experts + 1)
+        var routes = arena_alloc_t[SparseRoute](arenas[r], BENCH_SEQ * C.TOP_K)
+        var hidden_bucket = arena_alloc[DType.bfloat16](
+            arenas[r], BENCH_SEQ * C.TOP_K * C.MOE_INTERMEDIATE)
+        var moe_accum = arena_alloc[DType.float32](arenas[r], BENCH_SEQ * C.HIDDEN)
         var experts_gu = arena_alloc[DType.bfloat16](
             arenas[r], num_local_experts * C.MOE_GATE_UP_FUSED * C.HIDDEN)
         var experts_down = arena_alloc[DType.bfloat16](
             arenas[r], num_local_experts * C.HIDDEN * C.MOE_INTERMEDIATE)
         var gate_scratch = arena_alloc[DType.float32](
-            arenas[r], capacities[r] * EXPERT_TOK_TILE * C.MOE_GATE_UP_FUSED)
-        var hidden_scratch = arena_alloc[DType.float32](
-            arenas[r], capacities[r] * EXPERT_TOK_TILE * C.MOE_INTERMEDIATE)
-        var hidden_scratch_bf16 = arena_alloc[DType.bfloat16](
-            arenas[r], capacities[r] * EXPERT_TOK_TILE * C.MOE_INTERMEDIATE)
+            arenas[r], capacities[r] * PHASE1_MR * 2 * PHASE1_TILE_J)
 
         fill_bf16(x, BENCH_SEQ * C.HIDDEN, 11 + r)
-        fill_bf16(router_proj, C.NUM_EXPERTS * C.HIDDEN, 23 + r)
+        fill_bf16(router_proj, num_local_experts * C.HIDDEN, 23 + r)
         fill_bf16_positive(router_scale, C.HIDDEN)
         fill_bf16_positive(pes, C.NUM_EXPERTS)
         fill_bf16_positive(norm_w, C.HIDDEN)
@@ -407,11 +362,14 @@ def alloc_states[tp: Int, num_local_experts: Int](
         fill_bf16(experts_down, num_local_experts * C.HIDDEN * C.MOE_INTERMEDIATE, 59 + r)
 
         states[r] = RankState(
-            x, router_proj, router_scale, pes, norm_w,
-            route_idx, route_w, router_scaled, x_normed, partial,
-            counts, offsets, cursors, bucket_idx, bucket_w,
-            experts_gu, experts_down, gate_scratch, hidden_scratch,
-            hidden_scratch_bf16,
+            x=x, router_proj=router_proj, router_scale=router_scale,
+            per_expert_scale=pes, pre_ffn_norm_2=norm_w,
+            route_idx=route_idx, route_w=route_w, router_scaled=router_scaled,
+            x_normed=x_normed, moe_partial=partial,
+            cands=cands, expert_offset=expert_offset, routes=routes,
+            hidden_bucket=hidden_bucket, moe_accum=moe_accum,
+            experts_gate_up=experts_gu, experts_down=experts_down,
+            gate_scratch=gate_scratch,
         )
     return states
 
@@ -457,7 +415,7 @@ def main():
     var topo = numa.plan_topology(numa.num_nodes)
     var tp = numa.num_nodes
 
-    print("Gemma4 MoE prefill phase benchmark")
+    print("Gemma4 MoE prefill phase benchmark (minimax-style)")
     print(String(tp) + " NUMA node(s), "
         + String(len(numa.isolated_cpus)) + " isolated cpus")
 
@@ -465,7 +423,6 @@ def main():
         print("unsupported tp=" + String(tp))
         return
 
-    # Full Gemma4 local expert weights dominate the arena requirement.
     comptime ARENA_BYTES = 3 * 1024 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
     for i in range(tp):
