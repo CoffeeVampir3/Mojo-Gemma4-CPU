@@ -4,14 +4,14 @@ from std.os import abort
 from std.sys.info import simd_width_of
 
 from kernels.gemv import dispatch_gemv_softcap, softcap_value
-from kernels.helpers import NumaPointerArray
+from kernels.helpers import Binding, ArenaBases
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
 comptime W = simd_width_of[DType.float32]()
 comptime ROWS = 6
-comptime BASES = InlineArray[Int, 1](fill=0)
+comptime BASES = ArenaBases[1].fill(0)
 
 
 @fieldwise_init
@@ -84,9 +84,9 @@ def test_gemv_softcap():
     dispatch_gemv_softcap[
         rows=ROWS, cols=W, tp=1, cap=30.0,
     ](
-        NumaPointerArray[DType.bfloat16, 1](x.as_any_origin(), BASES),
-        NumaPointerArray[DType.bfloat16, 1](weight.as_any_origin(), BASES),
-        NumaPointerArray[DType.bfloat16, 1](output.as_any_origin(), BASES),
+        Binding[Scalar[DType.bfloat16], 1](x.as_any_origin(), BASES),
+        Binding[Scalar[DType.bfloat16], 1](weight.as_any_origin(), BASES),
+        Binding[Scalar[DType.bfloat16], 1](output.as_any_origin(), BASES),
         pools,
     )
 

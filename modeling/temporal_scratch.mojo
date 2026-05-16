@@ -4,6 +4,9 @@ from std.memory import UnsafePointer
 from std.reflection import reflect
 from std.sys.info import size_of
 
+from kernels.helpers import ArenaBases, Binding
+from modeling.slot import BindContext
+
 
 comptime SCRATCH_ALIGNMENT = 64
 comptime MAX_SCRATCH_SLOTS = 64
@@ -182,6 +185,24 @@ struct TemporalScratchPool[size: Int](Movable):
             MutAnyOrigin,
         ](unsafe_from_address=Int(self.base) + off)
 
+    @always_inline
+    def binding[
+        I: ScratchIsland, name: StringLiteral, tp: Int,
+    ](self, bases: ArenaBases[tp]) -> Binding[
+        downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
+        tp,
+    ]:
+        return bases.bind(self.slot[I, name]())
+
+    @always_inline
+    def binding[
+        I: ScratchIsland, name: StringLiteral, tp: Int,
+    ](self, ctx: BindContext[tp]) -> Binding[
+        downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
+        tp,
+    ]:
+        return self.binding[I, name](ctx.arena_bases)
+
 
 @explicit_destroy
 struct TemporalLogitsView[
@@ -192,12 +213,12 @@ struct TemporalLogitsView[
     comptime VOCAB_PER_RANK = Self.vocab // Self.degree
 
     var ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
-    var bases: InlineArray[Int, Self.degree]
+    var bases: ArenaBases[Self.degree]
 
     def __init__(
         out self,
         ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
-        bases: InlineArray[Int, Self.degree],
+        bases: ArenaBases[Self.degree],
     ):
         self.ptr = ptr
         self.bases = bases

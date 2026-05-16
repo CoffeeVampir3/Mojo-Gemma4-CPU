@@ -6,8 +6,8 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, NumaPointerArray,
-    NumaTypedPointerArray, worker_range, join_all,
+    OutputPartitionedKernel, DispatchBuffer, Binding,
+    worker_range, join_all,
 )
 from .dpbf16 import bf16_pair_dot
 from .moe_router import SparseRoute, SparseRoutePtr
@@ -211,12 +211,12 @@ def dispatch_phase1_gate_up[
     hidden: Int, gate_up_fused: Int, intermediate: Int,
     experts_per_rank: Int, tp: Int,
 ](
-    x_normed: NumaPointerArray[DType.bfloat16, tp],
-    expert_offset: NumaPointerArray[DType.int32, tp],
-    routes: NumaTypedPointerArray[SparseRoute, tp],
-    experts_gate_up: NumaPointerArray[DType.bfloat16, tp],
-    gate_scratch: NumaPointerArray[DType.float32, tp],
-    hidden_bucket: NumaPointerArray[DType.bfloat16, tp],
+    x_normed: Binding[Scalar[DType.bfloat16], tp],
+    expert_offset: Binding[Scalar[DType.int32], tp],
+    routes: Binding[SparseRoute, tp],
+    experts_gate_up: Binding[Scalar[DType.bfloat16], tp],
+    gate_scratch: Binding[Scalar[DType.float32], tp],
+    hidden_bucket: Binding[Scalar[DType.bfloat16], tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime n_tiles = intermediate // PHASE1_TILE_J
@@ -371,12 +371,12 @@ def dispatch_phase2_down[
     P: BurstThreadPool, //,
     hidden: Int, intermediate: Int, experts_per_rank: Int, tp: Int,
 ](
-    expert_offset: NumaPointerArray[DType.int32, tp],
-    routes: NumaTypedPointerArray[SparseRoute, tp],
-    hidden_bucket: NumaPointerArray[DType.bfloat16, tp],
-    experts_down: NumaPointerArray[DType.bfloat16, tp],
-    moe_accum: NumaPointerArray[DType.float32, tp],
-    moe_partial: NumaPointerArray[DType.bfloat16, tp],
+    expert_offset: Binding[Scalar[DType.int32], tp],
+    routes: Binding[SparseRoute, tp],
+    hidden_bucket: Binding[Scalar[DType.bfloat16], tp],
+    experts_down: Binding[Scalar[DType.bfloat16], tp],
+    moe_accum: Binding[Scalar[DType.float32], tp],
+    moe_partial: Binding[Scalar[DType.bfloat16], tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):

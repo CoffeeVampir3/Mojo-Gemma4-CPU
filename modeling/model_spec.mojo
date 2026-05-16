@@ -94,16 +94,6 @@ comptime DISTRIBUTED = -1
 
 
 @fieldwise_init
-struct StaticView[E: Encoding, S: ShapeLike]:
-    comptime DTYPE = Self.E.DTYPE
-    var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
-
-    @always_inline
-    def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](self.ptr)
-
-
-@fieldwise_init
 struct WeightDesc(Copyable):
     var name: String
     var arena_offset: Int

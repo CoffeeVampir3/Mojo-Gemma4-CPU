@@ -5,7 +5,7 @@ from simd_math import sincos_simd
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, NumaPointerArray,
+    OutputPartitionedKernel, DispatchBuffer, Binding,
     tile_dispatch, recommended_workers, join_all,
 )
 
@@ -131,13 +131,13 @@ def dispatch_rope_cache_write[
     kv_cache_stride: Int, slot_mask: Int,
     cache_degree: Int, tp: Int,
 ](
-    q: NumaPointerArray[DType.bfloat16, tp],
-    k_src: NumaPointerArray[DType.bfloat16, tp],
-    v_src: NumaPointerArray[DType.bfloat16, tp],
-    k_cache: NumaPointerArray[DType.bfloat16, tp],
-    v_cache: NumaPointerArray[DType.bfloat16, tp],
-    cos_table: NumaPointerArray[DType.float32, tp],
-    sin_table: NumaPointerArray[DType.float32, tp],
+    q: Binding[Scalar[DType.bfloat16], tp],
+    k_src: Binding[Scalar[DType.bfloat16], tp],
+    v_src: Binding[Scalar[DType.bfloat16], tp],
+    k_cache: Binding[Scalar[DType.bfloat16], tp],
+    v_cache: Binding[Scalar[DType.bfloat16], tp],
+    cos_table: Binding[Scalar[DType.float32], tp],
+    sin_table: Binding[Scalar[DType.float32], tp],
     base_pos: Int, seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):

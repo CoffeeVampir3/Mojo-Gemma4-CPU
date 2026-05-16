@@ -9,7 +9,7 @@ from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.helpers import DispatchBuffer, tile_dispatch, NumaPointerArray
+from kernels.helpers import DispatchBuffer, tile_dispatch, Binding, ArenaBases
 from kernels.gemv import (
     dot_row, gemv_range, dispatch_gemv, dispatch_gemv_chained_qkv,
     GemvKernel,

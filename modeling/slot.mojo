@@ -1,10 +1,9 @@
-from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.reflection import reflect
 
-from kernels.helpers import NumaPointerArray
+from kernels.helpers import ArenaBases, Binding
 from modeling.model_spec import (
-    Encoding, ShapeLike, StaticView, WeightDesc,
+    Encoding, ShapeLike, WeightDesc,
     DISTRIBUTED, align_up,
 )
 from modeling.utilities import FieldwiseDefault
@@ -30,9 +29,9 @@ trait SlotGroup(FieldwiseDefault):
 @fieldwise_init
 struct BindContext[degree: Int](Copyable, ImplicitlyCopyable):
     """Per-call binding context. `layer_base` is the current layer's absolute
-    arena offset for weight-slot resolution; for state slots whose offsets are
-    absolute, callers pass `arena_bases[0]` as the base explicitly."""
-    var arena_bases: InlineArray[Int, Self.degree]
+    arena offset for weight-slot resolution; state slots produce bindings
+    anchored at `arena_bases[0]` via `state_binding`."""
+    var arena_bases: ArenaBases[Self.degree]
     var layer_base: Int
 
     @always_inline
@@ -40,6 +39,12 @@ struct BindContext[degree: Int](Copyable, ImplicitlyCopyable):
         var c = self
         c.layer_base = lb
         return c
+
+    @always_inline
+    def bind[T: AnyType](
+        self, ptr: UnsafePointer[T, MutAnyOrigin],
+    ) -> Binding[T, Self.degree]:
+        return self.arena_bases.bind(ptr)
 
 
 struct Slot[
@@ -69,31 +74,27 @@ struct Slot[
         return self.offset
 
     @always_inline
-    def bound(self, base: Int) -> StaticView[Self.ENCODING, Self.SHAPE]:
-        return StaticView[Self.ENCODING, Self.SHAPE](
-            UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin](
-                unsafe_from_address=base + self.offset))
+    def at(self, base: Int) -> UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin]:
+        return UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin](
+            unsafe_from_address=base + self.offset)
 
     @always_inline
-    def ranks[degree: Int](
-        self, base: Int, bases: InlineArray[Int, degree],
-    ) -> NumaPointerArray[Self.ENCODING.DTYPE, degree]:
-        return NumaPointerArray[Self.ENCODING.DTYPE, degree](
-            UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin](
-                unsafe_from_address=base + self.offset),
-            bases)
+    def binding[degree: Int](
+        self, base: Int, bases: ArenaBases[degree],
+    ) -> Binding[Scalar[Self.ENCODING.DTYPE], degree]:
+        return bases.bind(self.at(base))
 
     @always_inline
-    def ranks[degree: Int](
+    def binding[degree: Int](
         self, ctx: BindContext[degree],
-    ) -> NumaPointerArray[Self.ENCODING.DTYPE, degree]:
-        return self.ranks(ctx.layer_base, ctx.arena_bases)
+    ) -> Binding[Scalar[Self.ENCODING.DTYPE], degree]:
+        return self.binding(ctx.layer_base, ctx.arena_bases)
 
     @always_inline
-    def state_ranks[degree: Int](
+    def state_binding[degree: Int](
         self, ctx: BindContext[degree],
-    ) -> NumaPointerArray[Self.ENCODING.DTYPE, degree]:
-        return self.ranks(ctx.arena_bases[0], ctx.arena_bases)
+    ) -> Binding[Scalar[Self.ENCODING.DTYPE], degree]:
+        return self.binding(ctx.arena_bases[0], ctx.arena_bases)
 
 
 def stamp_offsets[T: AnyType](mut t: T, off_in: Int = 0) -> Int:

@@ -7,7 +7,7 @@ from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
-    recommended_workers, join_all, NumaPointerArray,
+    recommended_workers, join_all, Binding,
 )
 
 
@@ -123,8 +123,8 @@ struct FinalizeKernel[head_dim: Int, num_q: Int](OutputPartitionedKernel):
 
 @fieldwise_init
 struct ContextFlashMergeConfig[tp: Int]:
-    var output: NumaPointerArray[DType.bfloat16, Self.tp]
-    var partials: NumaPointerArray[DType.float32, Self.tp]
+    var output: Binding[Scalar[DType.bfloat16], Self.tp]
+    var partials: Binding[Scalar[DType.float32], Self.tp]
     var num_sources: InlineArray[Int, Self.tp]
     var partial_stride: Int
 
@@ -247,8 +247,8 @@ def dispatch_merge_flash_partials[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, tp: Int,
 ](
-    output: NumaPointerArray[DType.bfloat16, tp],
-    partials_buf: NumaPointerArray[DType.float32, tp],
+    output: Binding[Scalar[DType.bfloat16], tp],
+    partials_buf: Binding[Scalar[DType.float32], tp],
     partial_stride: Int,
     num_sources: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],
@@ -279,8 +279,8 @@ def dispatch_merge_context_flash_partials[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
 ](
-    output: NumaPointerArray[DType.bfloat16, tp],
-    partials_buf: NumaPointerArray[DType.float32, tp],
+    output: Binding[Scalar[DType.bfloat16], tp],
+    partials_buf: Binding[Scalar[DType.float32], tp],
     partial_stride: Int,
     num_sources: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],

@@ -7,8 +7,8 @@ from threading.threading_traits import BurstThreadPool
 from simd_math import pick_port_unroll, tree_reduce_accs, fast_exp_softmax_biased
 from simd_math.ops import sqrt
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, NumaPointerArray,
-    NumaTypedPointerArray, recommended_workers, worker_range, join_all,
+    OutputPartitionedKernel, DispatchBuffer, Binding,
+    recommended_workers, worker_range, join_all,
 )
 
 
@@ -129,11 +129,11 @@ def dispatch_router_sharded[
     hidden: Int, experts_per_rank: Int, top_k: Int, tp: Int,
     rms_eps: Scalar[DType.float32],
 ](
-    x: NumaPointerArray[DType.bfloat16, tp],
-    router_proj: NumaPointerArray[DType.bfloat16, tp],
-    router_scale: NumaPointerArray[DType.bfloat16, tp],
-    scaled_scratch: NumaPointerArray[DType.float32, tp],
-    cands_out: NumaTypedPointerArray[RouterCandidate, tp],
+    x: Binding[Scalar[DType.bfloat16], tp],
+    router_proj: Binding[Scalar[DType.bfloat16], tp],
+    router_scale: Binding[Scalar[DType.bfloat16], tp],
+    scaled_scratch: Binding[Scalar[DType.float32], tp],
+    cands_out: Binding[RouterCandidate, tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
@@ -174,10 +174,10 @@ def dispatch_router_sharded[
 
 
 def merge_router_candidates[tp: Int, top_k: Int](
-    cands_per_rank: NumaTypedPointerArray[RouterCandidate, tp],
+    cands_per_rank: Binding[RouterCandidate, tp],
     per_expert_scale: BF16Ptr,
-    route_idx_per_rank: NumaPointerArray[DType.int32, tp],
-    route_w_per_rank: NumaPointerArray[DType.float32, tp],
+    route_idx_per_rank: Binding[Scalar[DType.int32], tp],
+    route_w_per_rank: Binding[Scalar[DType.float32], tp],
     seq_len: Int,
 ):
     comptime sentinel = Float32(-1.0e30)
@@ -211,10 +211,10 @@ def merge_router_candidates[tp: Int, top_k: Int](
 
 
 def build_expert_schedules[tp: Int, experts_per_rank: Int, top_k: Int](
-    route_idx: NumaPointerArray[DType.int32, tp],
-    route_w: NumaPointerArray[DType.float32, tp],
-    expert_offset: NumaPointerArray[DType.int32, tp],
-    routes: NumaTypedPointerArray[SparseRoute, tp],
+    route_idx: Binding[Scalar[DType.int32], tp],
+    route_w: Binding[Scalar[DType.float32], tp],
+    expert_offset: Binding[Scalar[DType.int32], tp],
+    routes: Binding[SparseRoute, tp],
     seq_len: Int,
 ):
     for r in range(tp):

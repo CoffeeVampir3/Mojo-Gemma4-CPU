@@ -6,7 +6,7 @@ from kernels.rmsnorm import (
     rms_norm_row, dispatch_rms_norm,
     norm_residual_add_row, fused_norm_residual_add,
 )
-from kernels.helpers import NumaPointerArray
+from kernels.helpers import Binding, ArenaBases
 from simd_math.ops import sqrt
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
@@ -17,7 +17,7 @@ comptime SQRT_N = sqrt[DType.float32, 1](HIDDEN)
 comptime N_EPS = HIDDEN * 1e-6
 
 comptime BF16ExtPtr = UnsafePointer[Scalar[DType.bfloat16], MutExternalOrigin]
-comptime BASES = InlineArray[Int, 1](fill=0)
+comptime BASES = ArenaBases[1].fill(0)
 
 
 @fieldwise_init
@@ -101,9 +101,9 @@ def check_rms_norm_seq(count: Int):
     var pools = HeapMoveArray[TestPool](1)
     pools.push(TestPool(4, 0))
     dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=1](
-        NumaPointerArray[DType.bfloat16, 1](src_any, BASES),
-        NumaPointerArray[DType.bfloat16, 1](got_any, BASES),
-        NumaPointerArray[DType.bfloat16, 1](weight_any, BASES),
+        Binding[Scalar[DType.bfloat16], 1](src_any, BASES),
+        Binding[Scalar[DType.bfloat16], 1](got_any, BASES),
+        Binding[Scalar[DType.bfloat16], 1](weight_any, BASES),
         count, pools)
     assert_same(got, expected, total, "rms dispatch output")
 
@@ -143,10 +143,10 @@ def check_fused_norm_residual_add_seq(count: Int):
     fused_norm_residual_add[
         hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=1,
     ](
-        NumaPointerArray[DType.bfloat16, 1](src_any, BASES),
-        NumaPointerArray[DType.bfloat16, 1](got_any, BASES),
-        NumaPointerArray[DType.bfloat16, 1](got_any, BASES),
-        NumaPointerArray[DType.bfloat16, 1](weight_any, BASES),
+        Binding[Scalar[DType.bfloat16], 1](src_any, BASES),
+        Binding[Scalar[DType.bfloat16], 1](got_any, BASES),
+        Binding[Scalar[DType.bfloat16], 1](got_any, BASES),
+        Binding[Scalar[DType.bfloat16], 1](weight_any, BASES),
         count, pools)
 
     assert_same(got, expected, total, "fused norm residual add output")

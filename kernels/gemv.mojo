@@ -9,7 +9,7 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     Chain, OutputPartitionedKernel, DispatchBuffer,
     tile_dispatch, recommended_workers, join_all,
-    NumaPointerArray,
+    Binding,
 )
 
 
@@ -95,9 +95,9 @@ def dispatch_gemv[
     P: BurstThreadPool, //,
     rows: Int, cols: Int, tp: Int,
 ](
-    x: NumaPointerArray[DType.bfloat16, tp],
-    weight: NumaPointerArray[DType.bfloat16, tp],
-    output: NumaPointerArray[DType.bfloat16, tp],
+    x: Binding[Scalar[DType.bfloat16], tp],
+    weight: Binding[Scalar[DType.bfloat16], tp],
+    output: Binding[Scalar[DType.bfloat16], tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime data_bytes = rows * cols * 2
@@ -138,9 +138,9 @@ def dispatch_gemv_softcap[
     P: BurstThreadPool, //,
     rows: Int, cols: Int, tp: Int, cap: Float64,
 ](
-    x: NumaPointerArray[DType.bfloat16, tp],
-    weight: NumaPointerArray[DType.bfloat16, tp],
-    output: NumaPointerArray[DType.bfloat16, tp],
+    x: Binding[Scalar[DType.bfloat16], tp],
+    weight: Binding[Scalar[DType.bfloat16], tp],
+    output: Binding[Scalar[DType.bfloat16], tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime data_bytes = rows * cols * 2
@@ -182,13 +182,13 @@ def dispatch_gemv_chained_qkv[
     P: BurstThreadPool, //,
     q_rows: Int, kv_rows: Int, cols: Int, tp: Int,
 ](
-    x: NumaPointerArray[DType.bfloat16, tp],
-    q_weight: NumaPointerArray[DType.bfloat16, tp],
-    k_weight: NumaPointerArray[DType.bfloat16, tp],
-    v_weight: NumaPointerArray[DType.bfloat16, tp],
-    q_out: NumaPointerArray[DType.bfloat16, tp],
-    k_out: NumaPointerArray[DType.bfloat16, tp],
-    v_out: NumaPointerArray[DType.bfloat16, tp],
+    x: Binding[Scalar[DType.bfloat16], tp],
+    q_weight: Binding[Scalar[DType.bfloat16], tp],
+    k_weight: Binding[Scalar[DType.bfloat16], tp],
+    v_weight: Binding[Scalar[DType.bfloat16], tp],
+    q_out: Binding[Scalar[DType.bfloat16], tp],
+    k_out: Binding[Scalar[DType.bfloat16], tp],
+    v_out: Binding[Scalar[DType.bfloat16], tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime total_rows = q_rows + kv_rows + kv_rows

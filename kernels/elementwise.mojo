@@ -6,7 +6,7 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, NumaPointerArray,
+    OutputPartitionedKernel, DispatchBuffer, Binding,
     tile_dispatch, recommended_workers, join_all,
 )
 
@@ -52,9 +52,9 @@ comptime GELU_GATE_UP_INLINE_TOKENS = 16
 def dispatch_gelu_gate_up[
     P: BurstThreadPool, //, intermediate: Int, tp: Int,
 ](
-    gate: NumaPointerArray[DType.bfloat16, tp],
-    up: NumaPointerArray[DType.bfloat16, tp],
-    dst: NumaPointerArray[DType.bfloat16, tp],
+    gate: Binding[Scalar[DType.bfloat16], tp],
+    up: Binding[Scalar[DType.bfloat16], tp],
+    dst: Binding[Scalar[DType.bfloat16], tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
@@ -113,8 +113,8 @@ comptime SCALAR_MUL_INLINE_TOKENS = 16
 def dispatch_scalar_mul[
     P: BurstThreadPool, //, hidden: Int, tp: Int,
 ](
-    src: NumaPointerArray[DType.bfloat16, tp],
-    dst: NumaPointerArray[DType.bfloat16, tp],
+    src: Binding[Scalar[DType.bfloat16], tp],
+    dst: Binding[Scalar[DType.bfloat16], tp],
     scalar: Scalar[DType.float32],
     seq_len: Int,
     mut pools: HeapMoveArray[P],

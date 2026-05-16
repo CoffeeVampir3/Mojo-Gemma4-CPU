@@ -7,7 +7,7 @@ from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     OutputPartitionedKernel, DispatchBuffer,
-    recommended_workers, worker_range, join_all, NumaPointerArray,
+    recommended_workers, worker_range, join_all, Binding,
 )
 from .attention_ops import score_position, accumulate_v, scale_acc
 
@@ -101,10 +101,10 @@ def dispatch_sliding_attention[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int, tp: Int,
 ](
-    q: NumaPointerArray[DType.bfloat16, tp],
-    k_base: NumaPointerArray[DType.bfloat16, tp],
-    v_base: NumaPointerArray[DType.bfloat16, tp],
-    partials_buf: NumaPointerArray[DType.float32, tp],
+    q: Binding[Scalar[DType.bfloat16], tp],
+    k_base: Binding[Scalar[DType.bfloat16], tp],
+    v_base: Binding[Scalar[DType.bfloat16], tp],
+    partials_buf: Binding[Scalar[DType.float32], tp],
     pos: Int, valid_len: Int,
     mut pools: HeapMoveArray[P],
 ) -> InlineArray[Int, tp]:

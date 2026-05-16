@@ -5,7 +5,7 @@ from std.sys.info import simd_width_of
 
 from kernels.full_attention import dispatch_full_attention, PARTIAL_STRIDE
 from kernels.logsum_merge import dispatch_merge_context_flash_partials
-from kernels.helpers import NumaPointerArray
+from kernels.helpers import Binding, ArenaBases
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
@@ -53,8 +53,8 @@ def check(ok: Bool, msg: String):
         abort("FAIL: " + msg)
 
 
-def rank_bases(stride_bytes: Int) -> InlineArray[Int, TP]:
-    var bases = InlineArray[Int, TP](uninitialized=True)
+def rank_bases(stride_bytes: Int) -> ArenaBases[TP]:
+    var bases = ArenaBases[TP].uninitialized()
     for r in range(TP):
         bases[r] = r * stride_bytes
     return bases
@@ -82,22 +82,22 @@ def run_case[
         head_dim=HEAD_DIM, num_q=GLOBAL_Q,
         gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=TP,
     ](
-        NumaPointerArray[DType.bfloat16, TP](
+        Binding[Scalar[DType.bfloat16], TP](
             q.as_any_origin(), rank_bases(GLOBAL_Q * HEAD_DIM * 2)),
-        NumaPointerArray[DType.bfloat16, TP](
+        Binding[Scalar[DType.bfloat16], TP](
             k.as_any_origin(), rank_bases(KV_STRIDE * 2)),
-        NumaPointerArray[DType.bfloat16, TP](
+        Binding[Scalar[DType.bfloat16], TP](
             v.as_any_origin(), rank_bases(KV_STRIDE * 2)),
-        NumaPointerArray[DType.float32, TP](
+        Binding[Scalar[DType.float32], TP](
             partials.as_any_origin(), rank_bases(PSTRIDE * 4)),
         valid, pools)
 
     dispatch_merge_context_flash_partials[
         head_dim=HEAD_DIM, num_q=GLOBAL_Q, local_num_q=LOCAL_Q, tp=TP,
     ](
-        NumaPointerArray[DType.bfloat16, TP](
+        Binding[Scalar[DType.bfloat16], TP](
             output.as_any_origin(), rank_bases(LOCAL_Q * HEAD_DIM * 2)),
-        NumaPointerArray[DType.float32, TP](
+        Binding[Scalar[DType.float32], TP](
             partials.as_any_origin(), rank_bases(PSTRIDE * 4)),
         PSTRIDE, nws, pools)
 

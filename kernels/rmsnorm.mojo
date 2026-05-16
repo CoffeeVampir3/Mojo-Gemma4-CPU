@@ -10,7 +10,7 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     Chain, OutputPartitionedKernel, DispatchBuffer,
     tile_dispatch, recommended_workers, join_all,
-    NumaPointerArray,
+    Binding,
 )
 
 
@@ -131,9 +131,9 @@ def dispatch_rms_norm[
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
     tp: Int, scaled: Bool = True,
 ](
-    src: NumaPointerArray[DType.bfloat16, tp],
-    dst: NumaPointerArray[DType.bfloat16, tp],
-    weight: NumaPointerArray[DType.bfloat16, tp],
+    src: Binding[Scalar[DType.bfloat16], tp],
+    dst: Binding[Scalar[DType.bfloat16], tp],
+    weight: Binding[Scalar[DType.bfloat16], tp],
     count: Int,
     mut pools: HeapMoveArray[P],
 ):
@@ -184,14 +184,14 @@ def dispatch_rms_norm_qkv_heads[
     head_dim: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
     num_q: Int, num_kv: Int, tp: Int,
 ](
-    q_src: NumaPointerArray[DType.bfloat16, tp],
-    q_dst: NumaPointerArray[DType.bfloat16, tp],
-    k_src: NumaPointerArray[DType.bfloat16, tp],
-    k_dst: NumaPointerArray[DType.bfloat16, tp],
-    v_src: NumaPointerArray[DType.bfloat16, tp],
-    v_dst: NumaPointerArray[DType.bfloat16, tp],
-    q_weight: NumaPointerArray[DType.bfloat16, tp],
-    k_weight: NumaPointerArray[DType.bfloat16, tp],
+    q_src: Binding[Scalar[DType.bfloat16], tp],
+    q_dst: Binding[Scalar[DType.bfloat16], tp],
+    k_src: Binding[Scalar[DType.bfloat16], tp],
+    k_dst: Binding[Scalar[DType.bfloat16], tp],
+    v_src: Binding[Scalar[DType.bfloat16], tp],
+    v_dst: Binding[Scalar[DType.bfloat16], tp],
+    q_weight: Binding[Scalar[DType.bfloat16], tp],
+    k_weight: Binding[Scalar[DType.bfloat16], tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime total = num_q + num_kv + num_kv
@@ -235,10 +235,10 @@ def fused_norm_residual_add[
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
     tp: Int,
 ](
-    src: NumaPointerArray[DType.bfloat16, tp],
-    residual: NumaPointerArray[DType.bfloat16, tp],
-    dst: NumaPointerArray[DType.bfloat16, tp],
-    weight: NumaPointerArray[DType.bfloat16, tp],
+    src: Binding[Scalar[DType.bfloat16], tp],
+    residual: Binding[Scalar[DType.bfloat16], tp],
+    dst: Binding[Scalar[DType.bfloat16], tp],
+    weight: Binding[Scalar[DType.bfloat16], tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):

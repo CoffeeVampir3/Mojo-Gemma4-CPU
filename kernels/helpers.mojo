@@ -97,25 +97,45 @@ def recommended_workers(data_bytes: Int, capacity: Int) -> Int:
 
 
 @fieldwise_init
-struct NumaPointerArray[dtype: DType, tp: Int](Copyable, ImplicitlyCopyable):
-    var ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
-    var bases: InlineArray[Int, Self.tp]
+struct ArenaBases[tp: Int](Copyable, ImplicitlyCopyable):
+    var addrs: InlineArray[Int, Self.tp]
+
+    @staticmethod
+    def uninitialized() -> Self:
+        return Self(addrs=InlineArray[Int, Self.tp](uninitialized=True))
+
+    @staticmethod
+    def fill(addr: Int) -> Self:
+        return Self(addrs=InlineArray[Int, Self.tp](fill=addr))
 
     @always_inline
-    def __getitem__(self, rank: Int) -> UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]:
-        return UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=Int(self.ptr) + self.bases[rank] - self.bases[0])
+    def __getitem__(self, rank: Int) -> Int:
+        return self.addrs[rank]
+
+    @always_inline
+    def __setitem__(mut self, rank: Int, addr: Int):
+        self.addrs[rank] = addr
+
+    @always_inline
+    def bind[T: AnyType](
+        self, ptr: UnsafePointer[T, MutAnyOrigin],
+    ) -> Binding[T, Self.tp]:
+        return Binding[T, Self.tp](ptr, self)
 
 
 @fieldwise_init
-struct NumaTypedPointerArray[T: AnyType, tp: Int](Copyable, ImplicitlyCopyable):
+struct Binding[T: AnyType, tp: Int](Copyable, ImplicitlyCopyable):
     var ptr: UnsafePointer[Self.T, MutAnyOrigin]
-    var bases: InlineArray[Int, Self.tp]
+    var bases: ArenaBases[Self.tp]
 
     @always_inline
     def __getitem__(self, rank: Int) -> UnsafePointer[Self.T, MutAnyOrigin]:
         return UnsafePointer[Self.T, MutAnyOrigin](
             unsafe_from_address=Int(self.ptr) + self.bases[rank] - self.bases[0])
+
+    @always_inline
+    def shifted(self, n: Int) -> Self:
+        return Self(self.ptr + n, self.bases)
 
 
 def tile_dispatch[
