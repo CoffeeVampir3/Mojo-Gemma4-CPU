@@ -1,0 +1,211 @@
+from std.builtin.rebind import downcast
+from std.collections import InlineArray
+from std.memory import UnsafePointer
+from std.reflection import reflect
+from std.sys.info import size_of
+
+
+comptime SCRATCH_ALIGNMENT = 64
+comptime MAX_SCRATCH_SLOTS = 64
+
+
+@always_inline
+def aligned_scratch_bytes[nbytes: Int]() -> Int:
+    return ((nbytes + SCRATCH_ALIGNMENT - 1) // SCRATCH_ALIGNMENT) * SCRATCH_ALIGNMENT
+
+
+trait ScratchBufferLike:
+    comptime Element: AnyType
+    comptime SIZE: Int
+
+
+@fieldwise_init
+struct ScratchBuffer[T: AnyType, count: Int](
+    ScratchBufferLike, Copyable, ImplicitlyCopyable
+):
+    comptime Element = Self.T
+    comptime SIZE = aligned_scratch_bytes[Self.count * size_of[Self.T]()]()
+
+
+trait ScratchPhaseRange:
+    comptime FIRST: Int
+    comptime LAST: Int
+
+
+@fieldwise_init
+struct ScratchPhase[first: Int, last: Int](
+    ScratchPhaseRange, Copyable, ImplicitlyCopyable
+):
+    comptime FIRST = Self.first
+    comptime LAST = Self.last
+
+
+@fieldwise_init
+struct ScratchPlan(Copyable, ImplicitlyCopyable):
+    var offsets: InlineArray[Int, MAX_SCRATCH_SLOTS]
+    var peak: Int
+    var count: Int
+
+
+def derive_scratch_plan[T: AnyType]() -> ScratchPlan:
+    var sizes = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    var firsts = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    var lasts = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    var n = 0
+    var cur_first = -1
+    var cur_last = -1
+
+    comptime for i in range(reflect[T].field_count()):
+        comptime FT = reflect[T].field_types()[i]
+        comptime if conforms_to(FT, ScratchPhaseRange):
+            cur_first = FT.FIRST
+            cur_last = FT.LAST
+        comptime if conforms_to(FT, ScratchBufferLike):
+            if cur_first < 0 or cur_last < cur_first:
+                print("scratch buffer declared without a valid phase")
+            sizes[n] = FT.SIZE
+            firsts[n] = cur_first
+            lasts[n] = cur_last
+            n += 1
+
+    var order = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    for k in range(n):
+        order[k] = k
+    for i in range(n):
+        var best = i
+        for j in range(i + 1, n):
+            if sizes[order[j]] > sizes[order[best]]:
+                best = j
+        var tmp = order[i]
+        order[i] = order[best]
+        order[best] = tmp
+
+    var offsets = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    var placed = InlineArray[Bool, MAX_SCRATCH_SLOTS](fill=False)
+    var peak = 0
+    for k in range(n):
+        var idx = order[k]
+        var x = 0
+        var stable = False
+        while not stable:
+            stable = True
+            for j in range(n):
+                if not placed[j]:
+                    continue
+                if firsts[idx] > lasts[j] or lasts[idx] < firsts[j]:
+                    continue
+                var jl = offsets[j]
+                var jh = offsets[j] + sizes[j]
+                if x < jh and jl < x + sizes[idx]:
+                    x = jh
+                    stable = False
+                    break
+        offsets[idx] = x
+        placed[idx] = True
+        if x + sizes[idx] > peak:
+            peak = x + sizes[idx]
+
+    return ScratchPlan(offsets=offsets, peak=peak, count=n)
+
+
+trait ScratchIsland:
+    comptime PLAN: ScratchPlan = derive_scratch_plan[Self]()
+
+
+def aggregate_scratch_peak[T: AnyType]() -> Int:
+    var m = 0
+    comptime for i in range(reflect[T].field_count()):
+        comptime FT = reflect[T].field_types()[i]
+        comptime if conforms_to(FT, ScratchIsland):
+            if FT.PLAN.peak > m:
+                m = FT.PLAN.peak
+    return m
+
+
+def scratch_slot_index[T: AnyType, name: StringLiteral]() -> Int:
+    comptime target = reflect[T].field_index[name]()
+    var n = 0
+    comptime for i in range(reflect[T].field_count()):
+        if i == target:
+            return n
+        comptime FT = reflect[T].field_types()[i]
+        comptime if conforms_to(FT, ScratchBufferLike):
+            n += 1
+    return -1
+
+
+struct TemporalScratchPool[size: Int](Movable):
+    var base: UnsafePointer[UInt8, MutAnyOrigin]
+
+    def __init__(out self, base: Int):
+        self.base = UnsafePointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=base)
+
+    @always_inline
+    def slot[
+        I: ScratchIsland, name: StringLiteral,
+    ](self) -> UnsafePointer[
+        downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
+        MutAnyOrigin,
+    ]:
+        comptime idx = scratch_slot_index[I, name]()
+        comptime off = I.PLAN.offsets[idx]
+        return UnsafePointer[
+            downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
+            MutAnyOrigin,
+        ](unsafe_from_address=Int(self.base) + off)
+
+
+@explicit_destroy
+struct TemporalLogitsView[
+    vocab: Int, degree: Int, dtype: DType = DType.bfloat16,
+](Movable):
+    comptime DTYPE = Self.dtype
+    comptime VOCAB = Self.vocab
+    comptime VOCAB_PER_RANK = Self.vocab // Self.degree
+
+    var ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+    var bases: InlineArray[Int, Self.degree]
+
+    def __init__(
+        out self,
+        ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
+        bases: InlineArray[Int, Self.degree],
+    ):
+        self.ptr = ptr
+        self.bases = bases
+
+    @always_inline
+    def local_ptr(self, offset: Int) -> UnsafePointer[
+        Scalar[Self.dtype], MutAnyOrigin,
+    ]:
+        var rank = offset // Self.VOCAB_PER_RANK
+        var local = offset - rank * Self.VOCAB_PER_RANK
+        return UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
+            unsafe_from_address=Int(self.ptr) + self.bases[rank]
+                - self.bases[0]) + local
+
+    @always_inline
+    def load_f32[width: Int](self, offset: Int) -> SIMD[DType.float32, width]:
+        debug_assert(
+            offset % Self.VOCAB_PER_RANK + width <= Self.VOCAB_PER_RANK,
+            "TemporalLogitsView load crosses a rank shard",
+        )
+        return self.local_ptr(offset).load[width=width]().cast[DType.float32]()
+
+    def argmax(self) -> Tuple[Int, Float32]:
+        var best_val = Float32(-1.0e30)
+        var best_idx = 0
+        for r in range(Self.degree):
+            var rank_ptr = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
+                unsafe_from_address=Int(self.ptr) + self.bases[r]
+                    - self.bases[0])
+            for v in range(Self.VOCAB_PER_RANK):
+                var val = rank_ptr[v].cast[DType.float32]()
+                if val > best_val:
+                    best_val = val
+                    best_idx = r * Self.VOCAB_PER_RANK + v
+        return (best_idx, best_val)
+
+    def release(deinit self):
+        pass

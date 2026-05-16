@@ -30,16 +30,16 @@ from kernels.moe_experts import (
     PHASE1_TILE_J, PHASE1_MR,
 )
 from kernels.elementwise import dispatch_gelu_gate_up, dispatch_scalar_mul
-from modeling.linear_borrow_pool import ScratchPool
-from modeling.linear_borrow_pool import scratch_block_bytes
+from modeling.temporal_scratch import (
+    ScratchBuffer, ScratchIsland, ScratchPhase,
+    TemporalLogitsView, TemporalScratchPool, aggregate_scratch_peak,
+)
 from modeling.kv_cache import Gemma4KV, Gemma4KVSliding, Gemma4KVGlobal
 
 from modeling.model_spec import (
     BF16, F32,
     Shape, WeightDesc,
     DistributionDegree,
-    TensorParallelRows, TensorParallelColumns,
-    ContextParallelRows, ExpertParallelRows, VocabularyParallelRows,
     Replicated,
     TensorRowSharded, TensorColumnSharded,
     ContextRowSharded, ExpertRowBlockSharded, VocabularyRowSharded,
@@ -50,8 +50,10 @@ from modeling.gemma4_common import (
     Gemma4BaseConfig, is_full_layer,
 )
 from modeling.modeling_common import (
-    TensorRef, Repeated, SectionBuilder,
-    LayerBuilder, ArenaLayout,
+    Repeated, ArenaLayout, BF16Ptr,
+)
+from modeling.slot import (
+    Slot, SlotGroup, stamp_offsets, emit_descs,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
 
@@ -130,162 +132,82 @@ struct Gemma4TailShapes[degree: Int]:
     comptime Embed = VocabularyRowSharded[C.VOCAB_SIZE, C.HIDDEN, Self.D]
 
 
-comptime SlidingAttentionShapeContract[degree: Int]: Bool = (
-    SlidingAttentionContract[degree]
-    and Gemma4Shapes[degree].SlidingQ.DATA_N
-        == TensorParallelRows[C.Q_DIM_SLIDING, Gemma4Shapes[degree].D]
-    and Gemma4Shapes[degree].SlidingKV.DATA_N
-        == TensorParallelRows[C.KV_DIM_SLIDING, Gemma4Shapes[degree].D]
-    and Gemma4Shapes[degree].SlidingO.DATA_M
-        == TensorParallelColumns[C.Q_DIM_SLIDING, Gemma4Shapes[degree].D]
-    and Gemma4StateShapes[degree].SlidingKV.DATA_N == C.SLIDING_WINDOW
-    and Gemma4StateShapes[degree].SlidingKV.DATA_M
-        == TensorParallelColumns[C.KV_DIM_SLIDING, Gemma4StateShapes[degree].D]
-)
-
-
-comptime FullAttentionShapeContract[degree: Int]: Bool = (
-    FullAttentionContract[degree]
-    and Gemma4Shapes[degree].FullQ.DATA_N == C.Q_DIM_FULL
-    and Gemma4Shapes[degree].FullQ.DATA_M == C.HIDDEN
-    and Gemma4Shapes[degree].FullK.DATA_N == C.KV_DIM_FULL
-    and Gemma4Shapes[degree].FullK.DATA_M == C.HIDDEN
-    and Gemma4Shapes[degree].FullO.DATA_M
-        == TensorParallelColumns[C.Q_DIM_FULL, Gemma4Shapes[degree].D]
-    and Gemma4StateShapes[degree].FullKV.DATA_N
-        == ContextParallelRows[C.MAX_SEQ_LEN, Gemma4StateShapes[degree].D]
-    and Gemma4StateShapes[degree].FullKV.DATA_M == C.KV_DIM_FULL
-    and Gemma4StateShapes[degree].FullRope.DATA_N
-        == ContextParallelRows[C.MAX_SEQ_LEN, Gemma4StateShapes[degree].D]
-    and Gemma4StateShapes[degree].FullRope.DATA_M == C.ROPE_HALF_FULL
-)
-
-
-comptime DenseMlpShapeContract[degree: Int]: Bool = (
-    DenseMlpContract[degree]
-    and Gemma4Shapes[degree].GateUp.DATA_N
-        == TensorParallelRows[C.INTERMEDIATE, Gemma4Shapes[degree].D]
-    and Gemma4Shapes[degree].Down.DATA_M
-        == TensorParallelColumns[C.INTERMEDIATE, Gemma4Shapes[degree].D]
-)
-
-
-comptime MoeShapeContract[degree: Int]: Bool = (
-    MoeContract[degree]
-    and Gemma4Shapes[degree].RouterProj.DATA_N
-        == ExpertParallelRows[
-            C.NUM_EXPERTS, 1, Gemma4Shapes[degree].D,
-        ]
-    and Gemma4Shapes[degree].RouterProj.DATA_M == C.HIDDEN
-    and Gemma4Shapes[degree].ExpertsGateUp.DATA_N
-        == ExpertParallelRows[
-            C.NUM_EXPERTS, C.MOE_GATE_UP_FUSED, Gemma4Shapes[degree].D,
-        ]
-    and Gemma4Shapes[degree].ExpertsGateUp.DATA_M == C.HIDDEN
-    and Gemma4Shapes[degree].ExpertsDown.DATA_N
-        == ExpertParallelRows[
-            C.NUM_EXPERTS, C.HIDDEN, Gemma4Shapes[degree].D,
-        ]
-    and Gemma4Shapes[degree].ExpertsDown.DATA_M == C.MOE_INTERMEDIATE
-)
-
-
-comptime LmHeadShapeContract[degree: Int]: Bool = (
-    LmHeadContract[degree]
-    and Gemma4TailShapes[degree].FinalNorm.DATA_N == C.HIDDEN
-    and Gemma4TailShapes[degree].FinalNorm.DATA_M == 1
-    and Gemma4TailShapes[degree].Embed.DATA_N
-        == VocabularyParallelRows[C.VOCAB_SIZE, Gemma4TailShapes[degree].D]
-    and Gemma4TailShapes[degree].Embed.DATA_M == C.HIDDEN
-)
-
-
-@fieldwise_init
-struct SlidingAttnRefs[degree: Int](Copyable, ImplicitlyCopyable):
+struct SlidingAttnRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
-    var q_proj: TensorRef[BF16, Self.S.SlidingQ]
-    var k_proj: TensorRef[BF16, Self.S.SlidingKV]
-    var v_proj: TensorRef[BF16, Self.S.SlidingKV]
-    var o_proj: TensorRef[BF16, Self.S.SlidingO]
-    var q_norm: TensorRef[BF16, Shape[C.HEAD_DIM_SLIDING, 1]]
-    var k_norm: TensorRef[BF16, Shape[C.HEAD_DIM_SLIDING, 1]]
+    var q_proj: Slot[BF16, Self.S.SlidingQ,  "self_attn.q_proj.weight"]
+    var k_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.k_proj.weight"]
+    var v_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.v_proj.weight"]
+    var o_proj: Slot[BF16, Self.S.SlidingO,  "self_attn.o_proj.weight"]
+    var q_norm: Slot[BF16, Shape[C.HEAD_DIM_SLIDING, 1], "self_attn.q_norm.weight"]
+    var k_norm: Slot[BF16, Shape[C.HEAD_DIM_SLIDING, 1], "self_attn.k_norm.weight"]
 
 
-@fieldwise_init
-struct FullAttnRefs[degree: Int](Copyable, ImplicitlyCopyable):
+struct FullAttnRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
-    var q_proj: TensorRef[BF16, Self.S.FullQ]
-    var k_proj: TensorRef[BF16, Self.S.FullK]
-    var o_proj: TensorRef[BF16, Self.S.FullO]
-    var q_norm: TensorRef[BF16, Shape[C.HEAD_DIM_FULL, 1]]
-    var k_norm: TensorRef[BF16, Shape[C.HEAD_DIM_FULL, 1]]
+    var q_proj: Slot[BF16, Self.S.FullQ, "self_attn.q_proj.weight"]
+    var k_proj: Slot[BF16, Self.S.FullK, "self_attn.k_proj.weight"]
+    var o_proj: Slot[BF16, Self.S.FullO, "self_attn.o_proj.weight"]
+    var q_norm: Slot[BF16, Shape[C.HEAD_DIM_FULL, 1], "self_attn.q_norm.weight"]
+    var k_norm: Slot[BF16, Shape[C.HEAD_DIM_FULL, 1], "self_attn.k_norm.weight"]
 
 
-@fieldwise_init
-struct BodyRefs[degree: Int](Copyable, ImplicitlyCopyable):
+struct BodyRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
-    var input_norm:      TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var post_attn_norm:  TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var pre_ffn_norm:    TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var pre_ffn_norm_2:  TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var post_ffn_norm_1: TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var post_ffn_norm_2: TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var post_ffn_norm:   TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var gate_proj:       TensorRef[BF16, Self.S.GateUp]
-    var up_proj:         TensorRef[BF16, Self.S.GateUp]
-    var down_proj:       TensorRef[BF16, Self.S.Down]
-    var router_proj:     TensorRef[BF16, Self.S.RouterProj]
-    var router_scale:    TensorRef[BF16, Shape[C.HIDDEN, 1]]
-    var router_pes:      TensorRef[BF16, Shape[C.NUM_EXPERTS, 1]]
-    var experts_gate_up: TensorRef[BF16, Self.S.ExpertsGateUp]
-    var experts_down:    TensorRef[BF16, Self.S.ExpertsDown]
-    var layer_scalar:    TensorRef[BF16, Shape[1, 1]]
+    var input_norm:      Slot[BF16, Shape[C.HIDDEN, 1],         "input_layernorm.weight"]
+    var post_attn_norm:  Slot[BF16, Shape[C.HIDDEN, 1],         "post_attention_layernorm.weight"]
+    var pre_ffn_norm:    Slot[BF16, Shape[C.HIDDEN, 1],         "pre_feedforward_layernorm.weight"]
+    var pre_ffn_norm_2:  Slot[BF16, Shape[C.HIDDEN, 1],         "pre_feedforward_layernorm_2.weight"]
+    var post_ffn_norm_1: Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm_1.weight"]
+    var post_ffn_norm_2: Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm_2.weight"]
+    var post_ffn_norm:   Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm.weight"]
+    var gate_proj:       Slot[BF16, Self.S.GateUp,              "mlp.gate_proj.weight"]
+    var up_proj:         Slot[BF16, Self.S.GateUp,              "mlp.up_proj.weight"]
+    var down_proj:       Slot[BF16, Self.S.Down,                "mlp.down_proj.weight"]
+    var router_proj:     Slot[BF16, Self.S.RouterProj,          "router.proj.weight"]
+    var router_scale:    Slot[BF16, Shape[C.HIDDEN, 1],         "router.scale"]
+    var router_pes:      Slot[BF16, Shape[C.NUM_EXPERTS, 1],    "router.per_expert_scale"]
+    var experts_gate_up: Slot[BF16, Self.S.ExpertsGateUp,       "experts.gate_up_proj"]
+    var experts_down:    Slot[BF16, Self.S.ExpertsDown,         "experts.down_proj"]
+    var layer_scalar:    Slot[BF16, Shape[1, 1],                "layer_scalar"]
 
 
-@fieldwise_init
-struct SlidingLayerRefs[degree: Int](Copyable, ImplicitlyCopyable):
+struct SlidingLayerRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     var attn: SlidingAttnRefs[Self.degree]
     var body: BodyRefs[Self.degree]
 
 
-@fieldwise_init
-struct FullLayerRefs[degree: Int](Copyable, ImplicitlyCopyable):
+struct FullLayerRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     var attn: FullAttnRefs[Self.degree]
     var body: BodyRefs[Self.degree]
 
 
-@fieldwise_init
-struct SlidingKVSlots[degree: Int](Copyable, ImplicitlyCopyable):
+struct SlidingKVSlots[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4StateShapes[Self.degree]
-    var k: TensorRef[BF16, Self.S.SlidingKV]
-    var v: TensorRef[BF16, Self.S.SlidingKV]
+    var k: Slot[BF16, Self.S.SlidingKV]
+    var v: Slot[BF16, Self.S.SlidingKV]
 
 
-@fieldwise_init
-struct FullKVSlots[degree: Int](Copyable, ImplicitlyCopyable):
+struct FullKVSlots[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4StateShapes[Self.degree]
-    var k: TensorRef[BF16, Self.S.FullKV]
-    var v: TensorRef[BF16, Self.S.FullKV]
+    var k: Slot[BF16, Self.S.FullKV]
+    var v: Slot[BF16, Self.S.FullKV]
 
 
-@fieldwise_init
-struct RopeSlots[half: Int, degree: Int = 1](Copyable, ImplicitlyCopyable):
+struct RopeSlots[half: Int, degree: Int = 1](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime D = DistributionDegree[Self.degree]
-    var cos: TensorRef[F32, ContextRowSharded[C.MAX_SEQ_LEN, Self.half, Self.D]]
-    var sin: TensorRef[F32, ContextRowSharded[C.MAX_SEQ_LEN, Self.half, Self.D]]
+    var cos: Slot[F32, ContextRowSharded[C.MAX_SEQ_LEN, Self.half, Self.D]]
+    var sin: Slot[F32, ContextRowSharded[C.MAX_SEQ_LEN, Self.half, Self.D]]
 
 
-@fieldwise_init
-struct ActivationSlots(Copyable, ImplicitlyCopyable):
-    var x_main:     TensorRef[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
-    var x_residual: TensorRef[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
+struct ActivationSlots(Copyable, ImplicitlyCopyable, SlotGroup):
+    var x_main:     Slot[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
+    var x_residual: Slot[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
 
 
-@fieldwise_init
-struct TailRefs[degree: Int](Copyable, ImplicitlyCopyable):
+struct TailRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4TailShapes[Self.degree]
-    var final_norm: TensorRef[BF16, Self.S.FinalNorm]
-    var embed:      TensorRef[BF16, Self.S.Embed]
+    var final_norm: Slot[BF16, Self.S.FinalNorm, "model.language_model.norm.weight"]
+    var embed:      Slot[BF16, Self.S.Embed, "model.language_model.embed_tokens.weight"]
 
 
 @fieldwise_init
@@ -300,7 +222,7 @@ struct Gemma4Topology[degree: Int](Copyable, ImplicitlyCopyable):
     var sliding_rope: RopeSlots[C.ROPE_HALF_SLIDING]
     var full_rope: RopeSlots[C.ROPE_HALF_FULL, Self.degree]
 
-    var tail: TailRefs[Self.degree]
+    var tail: Repeated[TailRefs[Self.degree]]
 
     @always_inline
     def bind(self, base: Int) -> Self:
@@ -309,138 +231,223 @@ struct Gemma4Topology[degree: Int](Copyable, ImplicitlyCopyable):
         return t
 
 
-def emit_body[degree: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[degree]:
-    comptime S = Gemma4Shapes[degree]
-    comptime H = C.HIDDEN
-    comptime NE = C.NUM_EXPERTS
-    return BodyRefs[degree](
-        input_norm      = b.bfs[Shape[H, 1]](e, "input_layernorm.weight"),
-        post_attn_norm  = b.bfs[Shape[H, 1]](e, "post_attention_layernorm.weight"),
-        pre_ffn_norm    = b.bfs[Shape[H, 1]](e, "pre_feedforward_layernorm.weight"),
-        pre_ffn_norm_2  = b.bfs[Shape[H, 1]](e, "pre_feedforward_layernorm_2.weight"),
-        post_ffn_norm_1 = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm_1.weight"),
-        post_ffn_norm_2 = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm_2.weight"),
-        post_ffn_norm   = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm.weight"),
-        gate_proj       = b.bfs[S.GateUp](e, "mlp.gate_proj.weight"),
-        up_proj         = b.bfs[S.GateUp](e, "mlp.up_proj.weight"),
-        down_proj       = b.bfs[S.Down](e, "mlp.down_proj.weight"),
-        router_proj     = b.bfs[S.RouterProj](e, "router.proj.weight"),
-        router_scale    = b.bfs[Shape[H, 1]](e, "router.scale"),
-        router_pes      = b.bfs[Shape[NE, 1]](e, "router.per_expert_scale"),
-        experts_gate_up = b.bfs[S.ExpertsGateUp](e, "experts.gate_up_proj"),
-        experts_down    = b.bfs[S.ExpertsDown](e, "experts.down_proj"),
-        layer_scalar    = b.bfs[Shape[1, 1]](e, "layer_scalar"),
-    )
-
-
-def emit_sliding[degree: Int](
-    prefix: String, layer_base: Int, mut e: List[WeightDesc],
-) -> Tuple[SlidingLayerRefs[degree], Int]:
-    var b = LayerBuilder(prefix, layer_base)
-    comptime S = Gemma4Shapes[degree]
-    var attn = SlidingAttnRefs[degree](
-        q_proj = b.bfs[S.SlidingQ](e, "self_attn.q_proj.weight"),
-        k_proj = b.bfs[S.SlidingKV](e, "self_attn.k_proj.weight"),
-        v_proj = b.bfs[S.SlidingKV](e, "self_attn.v_proj.weight"),
-        o_proj = b.bfs[S.SlidingO](e, "self_attn.o_proj.weight"),
-        q_norm = b.bfs[Shape[C.HEAD_DIM_SLIDING, 1]](e, "self_attn.q_norm.weight"),
-        k_norm = b.bfs[Shape[C.HEAD_DIM_SLIDING, 1]](e, "self_attn.k_norm.weight"),
-    )
-    return (SlidingLayerRefs[degree](attn=attn, body=emit_body[degree](b, e)), b.cursor)
-
-
-def emit_full[degree: Int](
-    prefix: String, layer_base: Int, mut e: List[WeightDesc],
-) -> Tuple[FullLayerRefs[degree], Int]:
-    var b = LayerBuilder(prefix, layer_base)
-    comptime S = Gemma4Shapes[degree]
-    var attn = FullAttnRefs[degree](
-        q_proj = b.bfs[S.FullQ](e, "self_attn.q_proj.weight"),
-        k_proj = b.bfs[S.FullK](e, "self_attn.k_proj.weight"),
-        o_proj = b.bfs[S.FullO](e, "self_attn.o_proj.weight"),
-        q_norm = b.bfs[Shape[C.HEAD_DIM_FULL, 1]](e, "self_attn.q_norm.weight"),
-        k_norm = b.bfs[Shape[C.HEAD_DIM_FULL, 1]](e, "self_attn.k_norm.weight"),
-    )
-    return (FullLayerRefs[degree](attn=attn, body=emit_body[degree](b, e)), b.cursor)
-
-
-def calculate_peak_scratch[degree: Int]() -> Int:
-    comptime bf16 = BF16.ELEMENT_BYTES
-    comptime f32 = F32.ELEMENT_BYTES
-    comptime i32 = 4
-    comptime cand_bytes = 8
-    comptime route_bytes = 8
-    comptime seq = C.MAX_SEQ_LEN
-    comptime S = Gemma4Shapes[degree]
-    comptime experts_per_rank = C.NUM_EXPERTS // degree
-
-    comptime full_q = scratch_block_bytes[seq * S.FullQ.N * bf16]()
-    comptime full_kv = scratch_block_bytes[seq * S.FullK.N * bf16]()
-    comptime full_attn = max(full_q + 2 * full_kv, 2 * full_q)
-
-    comptime sliding_q = scratch_block_bytes[seq * S.SlidingQ.N * bf16]()
-    comptime sliding_kv = scratch_block_bytes[seq * S.SlidingKV.N * bf16]()
-    comptime sliding_attn = max(sliding_q + 2 * sliding_kv, 2 * sliding_q)
-
-    comptime ffn_gate = scratch_block_bytes[seq * S.GateUp.N * bf16]()
-    comptime ffn_up = scratch_block_bytes[seq * S.GateUp.N * bf16]()
-    comptime ffn_dense_out = scratch_block_bytes[seq * C.HIDDEN * bf16]()
-    comptime ffn_outer = ffn_gate + ffn_up + ffn_dense_out
-
-    comptime moe_x_normed = scratch_block_bytes[seq * C.HIDDEN * bf16]()
-    comptime moe_hidden_bucket = scratch_block_bytes[
-        seq * C.TOP_K * C.MOE_INTERMEDIATE * bf16]()
-    comptime moe_accum = scratch_block_bytes[seq * C.HIDDEN * f32]()
-    comptime moe_route_idx = scratch_block_bytes[seq * C.TOP_K * i32]()
-    comptime moe_route_w = scratch_block_bytes[seq * C.TOP_K * f32]()
-    comptime moe_cands = scratch_block_bytes[seq * C.TOP_K * cand_bytes]()
-    comptime moe_routes = scratch_block_bytes[seq * C.TOP_K * route_bytes]()
-    comptime moe_expert_offset = scratch_block_bytes[
-        (experts_per_rank + 1) * i32]()
-    comptime moe_gate_scratch = scratch_block_bytes[
-        MAX_WORKERS * PHASE1_MR * 2 * PHASE1_TILE_J * f32]()
-    comptime moe_router_scaled = scratch_block_bytes[
-        MAX_WORKERS * C.HIDDEN * f32]()
-    comptime ffn_moe_inner = (
-        moe_x_normed + moe_hidden_bucket + moe_accum
-        + moe_route_idx + moe_route_w + moe_cands + moe_routes
-        + moe_expert_offset + moe_gate_scratch + moe_router_scaled
-    )
-
-    comptime ffn_peak = ffn_outer + ffn_moe_inner
-
-    comptime vocab_per_rank = C.VOCAB_SIZE // degree
-    comptime lm_head_logits = scratch_block_bytes[vocab_per_rank * bf16]()
-
-    return max(
-        max(ffn_peak, max(full_attn, sliding_attn)),
-        lm_head_logits,
-    )
 
 
 @fieldwise_init
-struct Gemma4LoadPlan[degree: Int](Movable):
-    var topology: Gemma4Topology[Self.degree]
-    var descs: List[WeightDesc]
+struct Gemma4SlidingScratch[degree: Int](
+    ScratchIsland, Copyable, ImplicitlyCopyable
+):
+    comptime S = Gemma4Shapes[Self.degree]
+    comptime q_rows = Self.S.SlidingQ.DATA_N
+    comptime kv_rows = Self.S.SlidingKV.DATA_N
+    comptime head_dim = C.HEAD_DIM_SLIDING
+    comptime num_q_heads = Self.q_rows // Self.head_dim
+    comptime flash_stride = FLASH_PARTIAL_STRIDE[
+        Self.num_q_heads, Self.head_dim,
+    ]
+
+    comptime gemv_qkv = 1
+    comptime rms_norm_qkv = 2
+    comptime rope_cache_write = 3
+    comptime flash = 4
+    comptime merge_partials = 5
+    comptime o_proj = 6
+
+    var q_band: ScratchPhase[Self.gemv_qkv, Self.o_proj]
+    var q: ScratchBuffer[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.q_rows,
+    ]
+
+    var kv_band: ScratchPhase[Self.gemv_qkv, Self.rope_cache_write]
+    var kv: ScratchBuffer[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.kv_rows * 2,
+    ]
+
+    var partials_band: ScratchPhase[Self.flash, Self.merge_partials]
+    var partials: ScratchBuffer[
+        Scalar[DType.float32], 128 * Self.flash_stride,
+    ]
 
 
-def build_gemma4_plan[degree: Int]() -> Gemma4LoadPlan[degree]:
-    comptime assert SlidingAttentionShapeContract[degree], "sliding attention distribution contract failed"
-    comptime assert FullAttentionShapeContract[degree], "full attention distribution contract failed"
-    comptime assert DenseMlpShapeContract[degree], "dense MLP distribution contract failed"
-    comptime assert MoeShapeContract[degree], "MoE distribution contract failed"
-    comptime assert LmHeadShapeContract[degree], "LM head distribution contract failed"
-    comptime StateS = Gemma4StateShapes[degree]
-    comptime TailS = Gemma4TailShapes[degree]
-    var descs = List[WeightDesc]()
+@fieldwise_init
+struct Gemma4FullScratch[degree: Int](
+    ScratchIsland, Copyable, ImplicitlyCopyable
+):
+    comptime S = Gemma4Shapes[Self.degree]
+    comptime q_rows = Self.S.FullQ.DATA_N
+    comptime k_rows = Self.S.FullK.DATA_N
+    comptime local_q_rows = Self.S.FullO.DATA_M
+    comptime head_dim = C.HEAD_DIM_FULL
+    comptime num_q_heads = Self.q_rows // Self.head_dim
+    comptime partial_stride = PARTIAL_STRIDE[
+        Self.num_q_heads, Self.head_dim,
+    ]
 
-    var probe = List[WeightDesc]()
-    var sl_r = emit_sliding[degree]("", 0, probe)
-    var fl_r = emit_full[degree]("", 0, probe)
-    var sl_proto = sl_r[0]
-    var sl_stride = sl_r[1]
-    var fl_proto = fl_r[0]
-    var fl_stride = fl_r[1]
+    comptime gemv_q = 1
+    comptime gemv_kv = 2
+    comptime rms_norm_qkv = 3
+    comptime rope_cache_write = 4
+    comptime flash = 5
+    comptime merge_partials = 6
+    comptime o_proj = 7
+
+    var q_band: ScratchPhase[Self.gemv_q, Self.flash]
+    var q: ScratchBuffer[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.q_rows,
+    ]
+
+    var kv_band: ScratchPhase[Self.gemv_kv, Self.rope_cache_write]
+    var kv: ScratchBuffer[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.k_rows * 2,
+    ]
+
+    var partials_band: ScratchPhase[Self.flash, Self.merge_partials]
+    var partials: ScratchBuffer[
+        Scalar[DType.float32], 128 * Self.partial_stride,
+    ]
+
+    var q_local_band: ScratchPhase[Self.merge_partials, Self.o_proj]
+    var q_local: ScratchBuffer[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.local_q_rows,
+    ]
+
+
+@fieldwise_init
+struct Gemma4FfnMoeScratch[degree: Int](
+    ScratchIsland, Copyable, ImplicitlyCopyable
+):
+    comptime S = Gemma4Shapes[Self.degree]
+    comptime intermediate_per_rank = Self.S.GateUp.DATA_N
+    comptime experts_per_rank = C.NUM_EXPERTS // Self.degree
+
+    comptime ffn_rms_norm = 1
+    comptime gemv_gate = 2
+    comptime gemv_up = 3
+    comptime gelu_gate_up = 4
+    comptime router_sharded = 5
+    comptime merge_cands = 6
+    comptime moe_rms_norm = 7
+    comptime build_schedules = 8
+    comptime phase1_gate_up = 9
+    comptime phase2_down = 10
+    comptime moe_allreduce = 11
+    comptime gemv_dense = 12
+    comptime allreduce_dense = 13
+    comptime post_norm_1 = 14
+    comptime post_norm_2 = 15
+    comptime post_norm_3 = 16
+
+    var ffn_gate_band: ScratchPhase[Self.gemv_gate, Self.gemv_dense]
+    var ffn_gate: ScratchBuffer[
+        Scalar[DType.bfloat16],
+        C.MAX_SEQ_LEN * Self.intermediate_per_rank,
+    ]
+
+    var ffn_up_band: ScratchPhase[Self.gemv_up, Self.gelu_gate_up]
+    var ffn_up: ScratchBuffer[
+        Scalar[DType.bfloat16],
+        C.MAX_SEQ_LEN * Self.intermediate_per_rank,
+    ]
+
+    var router_workspace: ScratchPhase[
+        Self.router_sharded, Self.router_sharded,
+    ]
+    var moe_router_scaled: ScratchBuffer[
+        Scalar[DType.float32], MAX_WORKERS * C.HIDDEN,
+    ]
+
+    var router_cands: ScratchPhase[Self.router_sharded, Self.merge_cands]
+    var moe_cands: ScratchBuffer[RouterCandidate, C.MAX_SEQ_LEN * C.TOP_K]
+
+    var router_products: ScratchPhase[Self.merge_cands, Self.build_schedules]
+    var moe_route_idx: ScratchBuffer[
+        Scalar[DType.int32], C.MAX_SEQ_LEN * C.TOP_K,
+    ]
+    var moe_route_w: ScratchBuffer[
+        Scalar[DType.float32], C.MAX_SEQ_LEN * C.TOP_K,
+    ]
+
+    var expert_input: ScratchPhase[Self.moe_rms_norm, Self.phase1_gate_up]
+    var moe_x_normed: ScratchBuffer[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN,
+    ]
+
+    var schedule_products: ScratchPhase[
+        Self.build_schedules, Self.phase2_down,
+    ]
+    var moe_expert_offset: ScratchBuffer[
+        Scalar[DType.int32], Self.experts_per_rank + 1,
+    ]
+    var moe_routes: ScratchBuffer[SparseRoute, C.MAX_SEQ_LEN * C.TOP_K]
+
+    var hidden_bucket: ScratchPhase[Self.phase1_gate_up, Self.phase2_down]
+    var moe_hidden_bucket: ScratchBuffer[
+        Scalar[DType.bfloat16],
+        C.MAX_SEQ_LEN * C.TOP_K * C.MOE_INTERMEDIATE,
+    ]
+
+    var phase1_workspace: ScratchPhase[
+        Self.phase1_gate_up, Self.phase1_gate_up,
+    ]
+    var moe_gate_scratch: ScratchBuffer[
+        Scalar[DType.float32],
+        MAX_WORKERS * PHASE1_MR * 2 * PHASE1_TILE_J,
+    ]
+
+    var phase2_accum: ScratchPhase[Self.phase2_down, Self.phase2_down]
+    var moe_accum: ScratchBuffer[
+        Scalar[DType.float32], C.MAX_SEQ_LEN * C.HIDDEN,
+    ]
+
+    var dense_band: ScratchPhase[Self.gemv_dense, Self.post_norm_3]
+    var ffn_dense_out: ScratchBuffer[
+        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN,
+    ]
+
+
+@fieldwise_init
+struct Gemma4HeadScratch[degree: Int](
+    ScratchIsland, Copyable, ImplicitlyCopyable
+):
+    comptime final_norm = 1
+    comptime gemv_logits = 2
+    comptime returned_to_caller = 3
+    comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
+
+    var logits_band: ScratchPhase[Self.gemv_logits, Self.returned_to_caller]
+    var logits: ScratchBuffer[
+        Scalar[DType.bfloat16], Self.vocab_per_rank,
+    ]
+
+
+@fieldwise_init
+struct Gemma4ForwardScratch[degree: Int](Copyable, ImplicitlyCopyable):
+    var sliding: Gemma4SlidingScratch[Self.degree]
+    var full: Gemma4FullScratch[Self.degree]
+    var ffn: Gemma4FfnMoeScratch[Self.degree]
+    var head: Gemma4HeadScratch[Self.degree]
+
+
+def calculate_peak_scratch[degree: Int]() -> Int:
+    return aggregate_scratch_peak[Gemma4ForwardScratch[degree]]()
+
+
+comptime Gemma4ScratchPool[degree: Int] = TemporalScratchPool[
+    calculate_peak_scratch[degree](),
+]
+
+
+def build_gemma4_plan[degree: Int](mut descs: List[WeightDesc]) -> Gemma4Topology[degree]:
+    comptime assert SlidingAttentionContract[degree], "sliding attention distribution contract failed"
+    comptime assert FullAttentionContract[degree], "full attention distribution contract failed"
+    comptime assert DenseMlpContract[degree], "dense MLP distribution contract failed"
+    comptime assert MoeContract[degree], "MoE distribution contract failed"
+    comptime assert LmHeadContract[degree], "LM head distribution contract failed"
+
+    var sl_proto = SlidingLayerRefs[degree]()
+    var sl_stride = stamp_offsets(sl_proto)
+    var fl_proto = FullLayerRefs[degree]()
+    var fl_stride = stamp_offsets(fl_proto)
 
     var sl_off = 0
     var fl_off = sl_off + C.NUM_SLIDING_LAYERS * sl_stride
@@ -451,59 +458,55 @@ def build_gemma4_plan[degree: Int]() -> Gemma4LoadPlan[degree]:
     for i in range(C.NUM_LAYERS):
         var prefix = "model.language_model.layers." + String(i) + "."
         if is_full_layer(i):
-            _ = emit_full[degree](prefix, fl_off + fi * fl_stride, descs)
+            _ = emit_descs[FullLayerRefs[degree]](
+                prefix, fl_off + fi * fl_stride, descs)
             fi += 1
         else:
-            _ = emit_sliding[degree](prefix, sl_off + si * sl_stride, descs)
+            _ = emit_descs[SlidingLayerRefs[degree]](
+                prefix, sl_off + si * sl_stride, descs)
             si += 1
 
-    var tb = LayerBuilder("", 0, start_at=distributed)
-    var tail = TailRefs[degree](
-        final_norm=tb.bfs[TailS.FinalNorm](descs, "model.language_model.norm.weight"),
-        embed=tb.bfs[TailS.Embed](descs, "model.language_model.embed_tokens.weight"))
-    distributed = tb.cursor
+    var tail_proto = TailRefs[degree]()
+    var tail_bytes = stamp_offsets(tail_proto)
+    _ = emit_descs[TailRefs[degree]]("", distributed, descs)
+    var tail = Repeated[TailRefs[degree]](tail_proto, distributed, tail_bytes, 1)
+    distributed += tail_bytes
 
-    var state = SectionBuilder()
-    state.cursor = distributed
+    var state_cursor = distributed
 
-    var skv_sb = SectionBuilder()
-    var skv_proto = SlidingKVSlots[degree](
-        k=skv_sb.reserve[BF16, StateS.SlidingKV](),
-        v=skv_sb.reserve[BF16, StateS.SlidingKV]())
+    var skv_proto = SlidingKVSlots[degree]()
+    var skv_stride = stamp_offsets(skv_proto)
     var sliding_kv = Repeated[SlidingKVSlots[degree]](
-        skv_proto, state.cursor, skv_sb.bytes(), C.NUM_SLIDING_LAYERS)
-    state.advance_bytes(C.NUM_SLIDING_LAYERS * skv_sb.bytes())
+        skv_proto, state_cursor, skv_stride, C.NUM_SLIDING_LAYERS)
+    state_cursor = align_up(state_cursor + C.NUM_SLIDING_LAYERS * skv_stride)
 
-    var fkv_sb = SectionBuilder()
-    var fkv_proto = FullKVSlots[degree](
-        k=fkv_sb.reserve[BF16, StateS.FullKV](),
-        v=fkv_sb.reserve[BF16, StateS.FullKV]())
+    var fkv_proto = FullKVSlots[degree]()
+    var fkv_stride = stamp_offsets(fkv_proto)
     var full_kv = Repeated[FullKVSlots[degree]](
-        fkv_proto, state.cursor, fkv_sb.bytes(), C.NUM_FULL_LAYERS)
-    state.advance_bytes(C.NUM_FULL_LAYERS * fkv_sb.bytes())
+        fkv_proto, state_cursor, fkv_stride, C.NUM_FULL_LAYERS)
+    state_cursor = align_up(state_cursor + C.NUM_FULL_LAYERS * fkv_stride)
 
-    var activations = ActivationSlots(
-        x_main=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](),
-        x_residual=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]())
+    var activations = ActivationSlots()
+    state_cursor = stamp_offsets(activations, state_cursor)
 
     var scratch_cap = calculate_peak_scratch[degree]()
-    var scratch_off = state.reserve_bytes(scratch_cap)
+    state_cursor = align_up(state_cursor)
+    var scratch_off = state_cursor
+    state_cursor = align_up(state_cursor + scratch_cap)
 
-    var sliding_rope = RopeSlots[C.ROPE_HALF_SLIDING](
-        cos=state.reserve[F32, StateS.SlidingRope](),
-        sin=state.reserve[F32, StateS.SlidingRope]())
-    var full_rope = RopeSlots[C.ROPE_HALF_FULL, degree](
-        cos=state.reserve[F32, StateS.FullRope](),
-        sin=state.reserve[F32, StateS.FullRope]())
+    var sliding_rope = RopeSlots[C.ROPE_HALF_SLIDING]()
+    state_cursor = stamp_offsets(sliding_rope, state_cursor)
+    var full_rope = RopeSlots[C.ROPE_HALF_FULL, degree]()
+    state_cursor = stamp_offsets(full_rope, state_cursor)
 
     var arena = ArenaLayout(
         base=0,
         distributed_bytes=distributed,
-        state_bytes=state.bytes() - distributed,
-        host_bytes=align_up(state.bytes()),
+        state_bytes=state_cursor - distributed,
+        host_bytes=align_up(state_cursor),
         scratch_off=scratch_off,
     )
-    var topo = Gemma4Topology[degree](
+    return Gemma4Topology[degree](
         arena=arena,
         sliding=Repeated[SlidingLayerRefs[degree]](sl_proto, sl_off, sl_stride, C.NUM_SLIDING_LAYERS),
         full=Repeated[FullLayerRefs[degree]](fl_proto, fl_off, fl_stride, C.NUM_FULL_LAYERS),
@@ -511,10 +514,6 @@ def build_gemma4_plan[degree: Int]() -> Gemma4LoadPlan[degree]:
         activations=activations,
         sliding_rope=sliding_rope, full_rope=full_rope,
         tail=tail)
-    return Gemma4LoadPlan[degree](topo, descs^)
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 
 
 def dispatch_sliding_attention_qkv[
@@ -525,7 +524,7 @@ def dispatch_sliding_attention_qkv[
     pos: Int,
     layer_idx: Int,
     ref kv: Gemma4KV[degree],
-    mut scratch: ScratchPool,
+    mut scratch: Gemma4ScratchPool[degree],
     mut pools: HeapMoveArray[P],
 ):
     comptime S = Gemma4Shapes[degree]
@@ -544,11 +543,9 @@ def dispatch_sliding_attention_qkv[
     var attn = topo.sliding.proto.attn
     var x = topo.activations.x_residual.bound(arena_bases[0]).as_ptr()
 
-    var q_lease = scratch.borrow[Scalar[DType.bfloat16], q_rows]()
-    var kv_lease = scratch.borrow[Scalar[DType.bfloat16], 2 * kv_rows]()
-    var q_out = q_lease.as_ptr[Scalar[DType.bfloat16]]()
-    var k_out = kv_lease.as_ptr[Scalar[DType.bfloat16]]()
-    var v_out = kv_lease.as_ptr[Scalar[DType.bfloat16]](element_offset=kv_rows)
+    var q_out = scratch.slot[Gemma4SlidingScratch[degree], "q"]()
+    var k_out = scratch.slot[Gemma4SlidingScratch[degree], "kv"]()
+    var v_out = k_out + kv_rows
 
     var q_outs = NumaPointerArray[DType.bfloat16, degree](q_out, arena_bases)
     var k_outs = NumaPointerArray[DType.bfloat16, degree](k_out, arena_bases)
@@ -585,10 +582,9 @@ def dispatch_sliding_attention_qkv[
           topo.sliding_rope.sin.bound(arena_bases[0]).as_ptr(), arena_bases),
       pos, 1, pools)
 
-    kv_lease^.release()
-
-    var p_lease = scratch.borrow[Scalar[DType.float32], 128 * flash_stride]()
-    var partials_ptr = p_lease.as_ptr[Scalar[DType.float32]]()
+    var partials_ptr = scratch.slot[
+        Gemma4SlidingScratch[degree], "partials",
+    ]()
 
     var valid_len = Gemma4KVSliding[degree].valid_len(pos)
 
@@ -606,14 +602,10 @@ def dispatch_sliding_attention_qkv[
         q_outs, NumaPointerArray[DType.float32, degree](partials_ptr, arena_bases),
         flash_stride, nws, pools)
 
-    p_lease^.release()
-
     dispatch_gemv[rows=C.HIDDEN, cols=q_rows, tp=degree](
         q_outs,
         NumaPointerArray[DType.bfloat16, degree](attn.o_proj.bound(lb).as_ptr(), arena_bases),
         xs, pools)
-
-    q_lease^.release()
 
 
 def dispatch_full_attention_qkv[
@@ -624,7 +616,7 @@ def dispatch_full_attention_qkv[
     pos: Int,
     layer_idx: Int,
     ref kv: Gemma4KV[degree],
-    mut scratch: ScratchPool,
+    mut scratch: Gemma4ScratchPool[degree],
     mut pools: HeapMoveArray[P],
 ):
     comptime S = Gemma4Shapes[degree]
@@ -646,11 +638,9 @@ def dispatch_full_attention_qkv[
     var attn = topo.full.proto.attn
     var x = topo.activations.x_residual.bound(arena_bases[0]).as_ptr()
 
-    var q_lease = scratch.borrow[Scalar[DType.bfloat16], q_rows]()
-    var kv_lease = scratch.borrow[Scalar[DType.bfloat16], 2 * k_rows]()
-    var q_out = q_lease.as_ptr[Scalar[DType.bfloat16]]()
-    var k_out = kv_lease.as_ptr[Scalar[DType.bfloat16]]()
-    var v_out = kv_lease.as_ptr[Scalar[DType.bfloat16]](element_offset=k_rows)
+    var q_out = scratch.slot[Gemma4FullScratch[degree], "q"]()
+    var k_out = scratch.slot[Gemma4FullScratch[degree], "kv"]()
+    var v_out = k_out + k_rows
 
     var q_outs = NumaPointerArray[DType.bfloat16, degree](q_out, arena_bases)
     var k_outs = NumaPointerArray[DType.bfloat16, degree](k_out, arena_bases)
@@ -689,14 +679,10 @@ def dispatch_full_attention_qkv[
           topo.full_rope.sin.bound(owner_bases[0]).as_ptr(), owner_bases),
       pos, 1, pools)
 
-    kv_lease^.release()
-
-    var q_local_lease = scratch.borrow[Scalar[DType.bfloat16], local_q_rows]()
-    var q_local = q_local_lease.as_ptr[Scalar[DType.bfloat16]]()
+    var q_local = scratch.slot[Gemma4FullScratch[degree], "q_local"]()
     var q_local_outs = NumaPointerArray[DType.bfloat16, degree](q_local, arena_bases)
 
-    var p_lease = scratch.borrow[Scalar[DType.float32], 128 * partial_stride]()
-    var partials_ptr = p_lease.as_ptr[Scalar[DType.float32]]()
+    var partials_ptr = scratch.slot[Gemma4FullScratch[degree], "partials"]()
     var partials_ptrs = NumaPointerArray[DType.float32, degree](partials_ptr, arena_bases)
 
     var valid_lens = InlineArray[Int, degree](uninitialized=True)
@@ -717,15 +703,10 @@ def dispatch_full_attention_qkv[
     ](
         q_local_outs, partials_ptrs, partial_stride, nws, pools)
 
-    p_lease^.release()
-
     dispatch_gemv[rows=C.HIDDEN, cols=local_q_rows, tp=degree](
         q_local_outs,
         NumaPointerArray[DType.bfloat16, degree](attn.o_proj.bound(lb).as_ptr(), arena_bases),
         xs, pools)
-
-    q_local_lease^.release()
-    q_lease^.release()
 
 
 def dispatch_moe[
@@ -737,7 +718,7 @@ def dispatch_moe[
     x_input: BF16Ptr,
     moe_out: BF16Ptr,
     seq_len: Int,
-    mut scratch: ScratchPool,
+    mut scratch: Gemma4ScratchPool[degree],
     mut pools: HeapMoveArray[P],
 ):
     comptime experts_per_rank = C.NUM_EXPERTS // degree
@@ -753,28 +734,24 @@ def dispatch_moe[
     var experts_gate_up_ptr = body.experts_gate_up.bound(layer_base).as_ptr()
     var experts_down_ptr = body.experts_down.bound(layer_base).as_ptr()
 
-    var x_normed_lease = scratch.borrow[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
-    var cands_lease = scratch.borrow[
-        RouterCandidate, C.MAX_SEQ_LEN * C.TOP_K]()
-    var router_scaled_lease = scratch.borrow[
-        Scalar[DType.float32], MAX_WORKERS * C.HIDDEN]()
-    var route_idx_lease = scratch.borrow[
-        Scalar[DType.int32], C.MAX_SEQ_LEN * C.TOP_K]()
-    var route_w_lease = scratch.borrow[
-        Scalar[DType.float32], C.MAX_SEQ_LEN * C.TOP_K]()
-    var expert_offset_lease = scratch.borrow[
-        Scalar[DType.int32], experts_per_rank + 1]()
-    var routes_lease = scratch.borrow[
-        SparseRoute, C.MAX_SEQ_LEN * C.TOP_K]()
-    var hidden_bucket_lease = scratch.borrow[
-        Scalar[DType.bfloat16],
-        C.MAX_SEQ_LEN * C.TOP_K * C.MOE_INTERMEDIATE]()
-    var moe_accum_lease = scratch.borrow[
-        Scalar[DType.float32], C.MAX_SEQ_LEN * C.HIDDEN]()
-    var gate_scratch_lease = scratch.borrow[
-        Scalar[DType.float32],
-        MAX_WORKERS * PHASE1_MR * 2 * PHASE1_TILE_J]()
+    var x_normed = scratch.slot[Gemma4FfnMoeScratch[degree], "moe_x_normed"]()
+    var cands = scratch.slot[Gemma4FfnMoeScratch[degree], "moe_cands"]()
+    var router_scaled = scratch.slot[
+        Gemma4FfnMoeScratch[degree], "moe_router_scaled",
+    ]()
+    var route_idx = scratch.slot[Gemma4FfnMoeScratch[degree], "moe_route_idx"]()
+    var route_w = scratch.slot[Gemma4FfnMoeScratch[degree], "moe_route_w"]()
+    var expert_offset = scratch.slot[
+        Gemma4FfnMoeScratch[degree], "moe_expert_offset",
+    ]()
+    var routes = scratch.slot[Gemma4FfnMoeScratch[degree], "moe_routes"]()
+    var hidden_bucket = scratch.slot[
+        Gemma4FfnMoeScratch[degree], "moe_hidden_bucket",
+    ]()
+    var moe_accum = scratch.slot[Gemma4FfnMoeScratch[degree], "moe_accum"]()
+    var gate_scratch = scratch.slot[
+        Gemma4FfnMoeScratch[degree], "moe_gate_scratch",
+    ]()
 
     var x_input_ranks = NumaPointerArray[DType.bfloat16, degree](
         x_input, arena_bases)
@@ -792,25 +769,25 @@ def dispatch_moe[
         experts_down_ptr, arena_bases)
 
     var x_normed_ranks = NumaPointerArray[DType.bfloat16, degree](
-        x_normed_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+        x_normed, arena_bases)
     var cands_ranks = NumaTypedPointerArray[RouterCandidate, degree](
-        cands_lease.as_ptr[RouterCandidate](), arena_bases)
+        cands, arena_bases)
     var router_scaled_ranks = NumaPointerArray[DType.float32, degree](
-        router_scaled_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+        router_scaled, arena_bases)
     var route_idx_ranks = NumaPointerArray[DType.int32, degree](
-        route_idx_lease.as_ptr[Scalar[DType.int32]](), arena_bases)
+        route_idx, arena_bases)
     var route_w_ranks = NumaPointerArray[DType.float32, degree](
-        route_w_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+        route_w, arena_bases)
     var expert_offset_ranks = NumaPointerArray[DType.int32, degree](
-        expert_offset_lease.as_ptr[Scalar[DType.int32]](), arena_bases)
+        expert_offset, arena_bases)
     var routes_ranks = NumaTypedPointerArray[SparseRoute, degree](
-        routes_lease.as_ptr[SparseRoute](), arena_bases)
+        routes, arena_bases)
     var hidden_bucket_ranks = NumaPointerArray[DType.bfloat16, degree](
-        hidden_bucket_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+        hidden_bucket, arena_bases)
     var moe_accum_ranks = NumaPointerArray[DType.float32, degree](
-        moe_accum_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+        moe_accum, arena_bases)
     var gate_scratch_ranks = NumaPointerArray[DType.float32, degree](
-        gate_scratch_lease.as_ptr[Scalar[DType.float32]](), arena_bases)
+        gate_scratch, arena_bases)
 
     dispatch_router_sharded[
         hidden=C.HIDDEN, experts_per_rank=experts_per_rank,
@@ -852,17 +829,6 @@ def dispatch_moe[
         ar_dst.ptrs[r] = moe_out_ranks[r]
     dispatch_allreduce[BF16, degree](ar_src, ar_dst, pools)
 
-    gate_scratch_lease^.release()
-    moe_accum_lease^.release()
-    hidden_bucket_lease^.release()
-    routes_lease^.release()
-    expert_offset_lease^.release()
-    route_w_lease^.release()
-    route_idx_lease^.release()
-    router_scaled_lease^.release()
-    cands_lease^.release()
-    x_normed_lease^.release()
-
 
 def dispatch_ffn[
     P: BurstThreadPool, //, degree: Int,
@@ -873,7 +839,7 @@ def dispatch_ffn[
     x_main: BF16Ptr,
     x_residual: BF16Ptr,
     seq_len: Int,
-    mut scratch: ScratchPool,
+    mut scratch: Gemma4ScratchPool[degree],
     mut pools: HeapMoveArray[P],
 ):
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
@@ -890,19 +856,18 @@ def dispatch_ffn[
     var post_ffn_norm_ptr = body.post_ffn_norm.bound(layer_base).as_ptr()
     var layer_scalar_ptr = body.layer_scalar.bound(layer_base).as_ptr()
 
-    var gate_lease = scratch.borrow[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * intermediate_per_rank]()
-    var up_lease = scratch.borrow[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * intermediate_per_rank]()
-    var dense_out_lease = scratch.borrow[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
+    var gate = scratch.slot[Gemma4FfnMoeScratch[degree], "ffn_gate"]()
+    var up = scratch.slot[Gemma4FfnMoeScratch[degree], "ffn_up"]()
+    var dense_out = scratch.slot[
+        Gemma4FfnMoeScratch[degree], "ffn_dense_out",
+    ]()
 
     var gate_ranks = NumaPointerArray[DType.bfloat16, degree](
-        gate_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+        gate, arena_bases)
     var up_ranks = NumaPointerArray[DType.bfloat16, degree](
-        up_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+        up, arena_bases)
     var dense_out_ranks = NumaPointerArray[DType.bfloat16, degree](
-        dense_out_lease.as_ptr[Scalar[DType.bfloat16]](), arena_bases)
+        dense_out, arena_bases)
     var x_main_ranks = NumaPointerArray[DType.bfloat16, degree](
         x_main, arena_bases)
     var x_res_ranks = NumaPointerArray[DType.bfloat16, degree](
@@ -938,6 +903,10 @@ def dispatch_ffn[
         intermediate=intermediate_per_rank, tp=degree,
     ](gate_ranks, up_ranks, gate_ranks, seq_len, pools)
 
+    dispatch_moe[degree=degree](
+        body, layer_base, arena_bases,
+        x_main, x_residual, seq_len, scratch, pools)
+
     dispatch_gemv[
         rows=C.HIDDEN, cols=intermediate_per_rank, tp=degree,
     ](gate_ranks, down_proj_ranks, dense_out_ranks, pools)
@@ -950,10 +919,6 @@ def dispatch_ffn[
         dense_ar_src.ptrs[r] = dense_out_ranks[r].as_immutable()
         dense_ar_dst.ptrs[r] = dense_out_ranks[r]
     dispatch_allreduce[BF16, degree](dense_ar_src, dense_ar_dst, pools)
-
-    dispatch_moe[degree=degree](
-        body, layer_base, arena_bases,
-        x_main, x_residual, seq_len, scratch, pools)
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
@@ -974,16 +939,12 @@ def dispatch_ffn[
         hidden=C.HIDDEN, tp=degree,
     ](x_main_ranks, x_main_ranks, ls_value, seq_len, pools)
 
-    dense_out_lease^.release()
-    up_lease^.release()
-    gate_lease^.release()
-
 
 struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[Self.Pool]
     var topology: Gemma4Topology[Self.degree]
-    var scratch: ScratchPool
+    var scratch: Gemma4ScratchPool[Self.degree]
     var arena_bases: InlineArray[Int, Self.degree]
 
     def __init__(out self,
@@ -997,9 +958,8 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         self.topology = topology.bind(self.arena_bases[0])
         self.arenas = arenas^
         self.pools = pools^
-        self.scratch = ScratchPool(
-            self.topology.arena.scratch_base(),
-            calculate_peak_scratch[Self.degree]())
+        self.scratch = Gemma4ScratchPool[Self.degree](
+            self.topology.arena.scratch_base())
 
     def model_init(mut self):
         ref topo = self.topology
@@ -1056,7 +1016,9 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 topo.full_kv.proto.v.bound(lb).as_ptr())
         return kv^
 
-    def forward(mut self, token_id: Int, pos: Int, mut kv: Gemma4KV[Self.degree]) -> Int:
+    def forward(
+        mut self, token_id: Int, pos: Int, mut kv: Gemma4KV[Self.degree],
+    ) -> TemporalLogitsView[C.VOCAB_SIZE, Self.degree]:
         # Forward (one step). `pos` = absolute sequence position of the token being processed.
         #
         # Embed:
@@ -1132,7 +1094,8 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         comptime immut = ImmutOrigin(MutAnyOrigin)
         var src = RankBuffers[DType.bfloat16, Self.degree, immut](count=C.HIDDEN)
         var dst = RankBuffers[DType.bfloat16, Self.degree, MutAnyOrigin](count=C.HIDDEN)
-        var embed_row = topo.tail.embed.bound(self.arena_bases[owner]).as_ptr()
+        var tail_base_owner = topo.tail.base(self.arena_bases[owner], 0)
+        var embed_row = topo.tail.proto.embed.bound(tail_base_owner).as_ptr()
             + local_row * C.HIDDEN
         for r in range(Self.degree):
             src.ptrs[r] = embed_row.as_immutable()
@@ -1205,7 +1168,8 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             else:
                 si += 1
 
-        var final_norm_w = topo.tail.final_norm.bound(self.arena_bases[0]).as_ptr()
+        var tail_base = topo.tail.base(self.arena_bases[0], 0)
+        var final_norm_w = topo.tail.proto.final_norm.bound(tail_base).as_ptr()
         dispatch_rms_norm[
             hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
         ](x_main_ranks, x_main_ranks,
@@ -1213,11 +1177,12 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
           1, self.pools)
 
         comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
-        var logits_lease = self.scratch.borrow[Scalar[DType.bfloat16], vocab_per_rank]()
-        var logits_p = logits_lease.as_ptr[Scalar[DType.bfloat16]]()
+        var logits_p = self.scratch.slot[
+            Gemma4HeadScratch[Self.degree], "logits",
+        ]()
         var logits_ranks = NumaPointerArray[DType.bfloat16, Self.degree](
             logits_p, self.arena_bases)
-        var embed_ptr = topo.tail.embed.bound(self.arena_bases[0]).as_ptr()
+        var embed_ptr = topo.tail.proto.embed.bound(tail_base).as_ptr()
         dispatch_gemv[
             rows=vocab_per_rank, cols=C.HIDDEN, tp=Self.degree,
         ](
@@ -1226,18 +1191,8 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             logits_ranks, self.pools,
         )
 
-        var best_val = Float32(-1.0e30)
-        var best_idx = 0
-        for r in range(Self.degree):
-            var rank_logits = logits_ranks[r]
-            for v in range(vocab_per_rank):
-                var val = rank_logits[v].cast[DType.float32]()
-                if val > best_val:
-                    best_val = val
-                    best_idx = r * vocab_per_rank + v
-
-        logits_lease^.release()
-        return best_idx
+        return TemporalLogitsView[C.VOCAB_SIZE, Self.degree](
+            logits_p, self.arena_bases)
 
     @staticmethod
     def load(
@@ -1252,8 +1207,8 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             return None
         print("found", len(shards), "shard(s)")
 
-        var plan = build_gemma4_plan[Self.degree]()
-        var topo = plan.topology
+        var descs = List[WeightDesc]()
+        var topo = build_gemma4_plan[Self.degree](descs)
 
         var size = topo.arena.host_arena_bytes()
         print("allocating", size // (1024 * 1024), "MB x " + String(Self.degree) + " rank(s) (" +
@@ -1269,7 +1224,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 return None
             arena_bases.append(Int(arenas[rank].base.value()))
 
-        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases, numa, numa_topo)
+        var load_result = load_weights_from_descs(descs, shards, arena_bases, numa, numa_topo)
         if not load_result:
             print("weight loading failed")
             return None
@@ -1285,7 +1240,3 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
     def arena_base(self, rank: Int = 0) -> Int:
         return Int(self.arenas[rank].base.value())
-
-    def token_buffer(self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
-        return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-            unsafe_from_address=self.arena_base() + self.topology.arena.scratch_off)

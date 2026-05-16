@@ -2,9 +2,9 @@ from std.collections import InlineArray
 from std.memory import UnsafePointer
 
 from modeling.gemma4_common import Gemma4BaseConfig
+from modeling.modeling_common import BF16Ptr
 
 comptime C = Gemma4BaseConfig
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 
 
 struct Gemma4KVSliding[degree: Int](Movable):

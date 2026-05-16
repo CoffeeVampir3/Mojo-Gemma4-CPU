@@ -8,18 +8,22 @@ from threading.threading_traits import BurstThreadPool
 from threading.burst_threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 
+from notstdcollections import HeapMoveArray
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
-from modeling.gemma_4_moe import Gemma4Config, Gemma4
-from modeling.model_spec import LogitsView
+from modeling.gemma4_common import Gemma4BaseConfig
+from modeling.gemma_4_moe import Gemma4
+from modeling.temporal_scratch import TemporalLogitsView
 
 
 comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B"
-comptime VOCAB = Gemma4Config.VOCAB_SIZE
+comptime VOCAB = Gemma4BaseConfig.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 128
 
 
-def greedy_argmax(read view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
+def greedy_argmax[degree: Int](
+    read view: TemporalLogitsView[VOCAB, degree],
+) -> Tuple[Int, Float32]:
     comptime width = simd_width_of[DType.float32]()
     var best_val = Float32(-1e30)
     var best_idx = 0
@@ -44,25 +48,25 @@ def load_and_run[
     read token_ids: List[Int],
 ):
     var t0 = perf_counter_ns()
-    var model_opt = Gemma4[1, P].load(Path(MODEL_DIR), numa, numa_topo, pool^)
+    var pools = HeapMoveArray[P](1)
+    pools.push(pool^)
+    var model_opt = Gemma4[1, P].load(Path(MODEL_DIR), numa, numa_topo, pools^)
     if not model_opt:
         return
     var model = model_opt.take()
+    var kv = model.new_kv_cache()
     var load_ms = (perf_counter_ns() - t0) / 1_000_000
     print("model loaded in", load_ms, "ms")
     print()
 
-    var tp_ptr = model.token_buffer()
     var prompt_len = len(token_ids)
 
     var t1 = perf_counter_ns()
     for i in range(prompt_len - 1):
-        tp_ptr[0] = Scalar[DType.int32](token_ids[i])
-        var logits = model.forward(Int(tp_ptr), 1, i)
+        var logits = model.forward(token_ids[i], i, kv)
         logits^.release()
 
-    tp_ptr[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
-    var logits = model.forward(Int(tp_ptr), 1, prompt_len - 1)
+    var logits = model.forward(token_ids[prompt_len - 1], prompt_len - 1, kv)
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     var top_vals = InlineArray[Float32, 5](fill=Float32(-1e30))
@@ -82,7 +86,7 @@ def load_and_run[
         id_list.append(top_ids[i])
         print(" ", i, "id=", top_ids[i], "val=", top_vals[i], "tok=", repr(tok.decode(id_list)))
 
-    var result = greedy_argmax(logits)
+    var result = greedy_argmax[1](logits)
     var next_id = result[0]
     logits^.release()
 
@@ -99,14 +103,11 @@ def load_and_run[
     var pos = prompt_len
     var decode_start = perf_counter_ns()
 
-    for step in range(1, MAX_NEW_TOKENS):
-        tp_ptr[0] = Scalar[DType.int32](next_id)
-
-        logits = model.forward(Int(tp_ptr), 1, pos)
-
-        result = greedy_argmax(logits)
+    while len(generated) < MAX_NEW_TOKENS:
+        var step_logits = model.forward(next_id, pos, kv)
+        result = greedy_argmax[1](step_logits)
         next_id = result[0]
-        logits^.release()
+        step_logits^.release()
         generated.append(next_id)
         pos += 1
 

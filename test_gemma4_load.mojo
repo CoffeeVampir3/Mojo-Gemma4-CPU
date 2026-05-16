@@ -41,7 +41,10 @@ def run_generation[
     var prompt_len = len(tokens)
     var prefill_start = perf_counter_ns()
     for i in range(len(tokens)):
-        next_token = model.forward(tokens[i], i, kv)
+        var logits = model.forward(tokens[i], i, kv)
+        var result = logits.argmax()
+        next_token = result[0]
+        logits^.release()
     var prefill_ms = (perf_counter_ns() - prefill_start) / 1_000_000
     var prefill_tps = Float64(prompt_len) / (Float64(prefill_ms) / 1000.0)
     print(
@@ -56,7 +59,10 @@ def run_generation[
         generated.append(next_token)
         tokens.append(next_token)
         if i + 1 < 30:
-            next_token = model.forward(next_token, len(tokens) - 1, kv)
+            var logits = model.forward(next_token, len(tokens) - 1, kv)
+            var result = logits.argmax()
+            next_token = result[0]
+            logits^.release()
     var decode_elapsed_ms = (perf_counter_ns() - decode_start) / 1_000_000
     var decode_tokens = len(generated) - 1
     var decode_tps = Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0)

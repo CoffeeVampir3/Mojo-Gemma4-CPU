@@ -8,6 +8,9 @@ from modeling.model_spec import (
 )
 
 
+comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+
+
 @fieldwise_init
 struct ArenaLayout(Copyable, ImplicitlyCopyable):
     """Common arena metadata shared by every model topology.
