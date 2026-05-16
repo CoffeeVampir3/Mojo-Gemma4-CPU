@@ -101,7 +101,6 @@ comptime VocabularyRowSharded[n: Int, m: Int, D: DistributionDegreeLike] = Shape
 
 
 comptime DISTRIBUTED = -1
-comptime HOST_RANK = 0
 
 
 @fieldwise_init

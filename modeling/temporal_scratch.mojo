@@ -27,17 +27,31 @@ struct ScratchBuffer[T: AnyType, count: Int](
     comptime SIZE = aligned_scratch_bytes[Self.count * size_of[Self.T]()]()
 
 
+trait ScratchPhaseOrderLike:
+    @staticmethod
+    def index[name: StaticString]() -> Int: ...
+
+
+struct ScratchPhaseOrder[*names: StaticString](ScratchPhaseOrderLike):
+    @staticmethod
+    def index[name: StaticString]() -> Int:
+        comptime for i in range(len(Self.names)):
+            comptime if String(Self.names[i]) == String(name):
+                return i
+        return -1
+
+
 trait ScratchPhaseRange:
-    comptime FIRST: Int
-    comptime LAST: Int
+    comptime FIRST_NAME: StaticString
+    comptime LAST_NAME: StaticString
 
 
 @fieldwise_init
-struct ScratchPhase[first: Int, last: Int](
+struct ScratchPhase[first: StaticString, last: StaticString](
     ScratchPhaseRange, Copyable, ImplicitlyCopyable
 ):
-    comptime FIRST = Self.first
-    comptime LAST = Self.last
+    comptime FIRST_NAME = Self.first
+    comptime LAST_NAME = Self.last
 
 
 @fieldwise_init
@@ -47,7 +61,15 @@ struct ScratchPlan(Copyable, ImplicitlyCopyable):
     var count: Int
 
 
-def derive_scratch_plan[T: AnyType]() -> ScratchPlan:
+trait ScratchPhaseSchema:
+    comptime PHASES: ScratchPhaseOrderLike
+
+    @staticmethod
+    def phase_index[name: StaticString]() -> Int:
+        return Self.PHASES.index[name]()
+
+
+def derive_scratch_plan[T: ScratchPhaseSchema]() -> ScratchPlan:
     var sizes = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
     var firsts = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
     var lasts = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
@@ -58,8 +80,13 @@ def derive_scratch_plan[T: AnyType]() -> ScratchPlan:
     comptime for i in range(reflect[T].field_count()):
         comptime FT = reflect[T].field_types()[i]
         comptime if conforms_to(FT, ScratchPhaseRange):
-            cur_first = FT.FIRST
-            cur_last = FT.LAST
+            comptime first = T.phase_index[FT.FIRST_NAME]()
+            comptime last = T.phase_index[FT.LAST_NAME]()
+            comptime assert first >= 0, "scratch phase start is not declared in PHASES"
+            comptime assert last >= 0, "scratch phase end is not declared in PHASES"
+            comptime assert last >= first, "scratch phase end precedes start"
+            cur_first = first
+            cur_last = last
         comptime if conforms_to(FT, ScratchBufferLike):
             if cur_first < 0 or cur_last < cur_first:
                 print("scratch buffer declared without a valid phase")
@@ -108,7 +135,7 @@ def derive_scratch_plan[T: AnyType]() -> ScratchPlan:
     return ScratchPlan(offsets=offsets, peak=peak, count=n)
 
 
-trait ScratchIsland:
+trait ScratchIsland(ScratchPhaseSchema):
     comptime PLAN: ScratchPlan = derive_scratch_plan[Self]()
 
 

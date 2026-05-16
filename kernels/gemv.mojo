@@ -3,6 +3,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
 from simd_math import pick_port_unroll, tree_reduce_accs
+from simd_math.ops import tanh_f32
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
@@ -41,6 +42,34 @@ def gemv_range[rows: Int, cols: Int](
             accs[p] = SIMD[DType.float32, W](0)
         dot_row[cols, PU](x, weight + row * cols, accs)
         (output + row)[] = tree_reduce_accs(accs).cast[DType.bfloat16]()
+
+
+@always_inline
+def softcap_value[
+    cap: Float64,
+](
+    x: SIMD[DType.float32, 1],
+) -> SIMD[DType.float32, 1]:
+    comptime assert cap > 0.0, "softcap cap must be positive"
+    comptime c = SIMD[DType.float32, 1](cap)
+    return tanh_f32[1](x / c) * c
+
+
+@always_inline
+def gemv_softcap_range[
+    rows: Int, cols: Int, cap: Float64,
+](
+    x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
+    start: Int, end: Int,
+):
+    comptime PU = pick_port_unroll[W, cols]()
+    var accs = InlineArray[SIMD[DType.float32, W], PU](uninitialized=True)
+    for row in range(start, end):
+        comptime for p in range(PU):
+            accs[p] = SIMD[DType.float32, W](0)
+        dot_row[cols, PU](x, weight + row * cols, accs)
+        var capped = softcap_value[cap](tree_reduce_accs(accs))
+        (output + row)[] = capped.cast[DType.bfloat16]()
 
 
 @fieldwise_init
@@ -83,6 +112,50 @@ def dispatch_gemv[
         var nw = recommended_workers(data_bytes, pools[r].get_capacity())
         tile_dispatch(buf,
             GemvKernel[rows, cols](x[r], weight[r], output[r], 0, 0),
+            pools[r], rows, num_workers=nw)
+    join_all[tp](pools)
+
+
+@fieldwise_init
+struct GemvSoftcapKernel[
+    rows: Int, cols: Int, cap: Float64,
+](OutputPartitionedKernel):
+    var x: BF16Ptr
+    var weight: BF16Ptr
+    var output: BF16Ptr
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        gemv_softcap_range[Self.rows, Self.cols, Self.cap](
+            self.x, self.weight, self.output, self.start, self.end)
+
+    def over_range(self, start: Int, end: Int) -> Self:
+        return Self(self.x, self.weight, self.output, start, end)
+
+
+def dispatch_gemv_softcap[
+    P: BurstThreadPool, //,
+    rows: Int, cols: Int, tp: Int, cap: Float64,
+](
+    x: NumaPointerArray[DType.bfloat16, tp],
+    weight: NumaPointerArray[DType.bfloat16, tp],
+    output: NumaPointerArray[DType.bfloat16, tp],
+    mut pools: HeapMoveArray[P],
+):
+    comptime data_bytes = rows * cols * 2
+
+    if rows <= GEMV_INLINE_ROWS:
+        for r in range(tp):
+            gemv_softcap_range[rows, cols, cap](
+                x[r], weight[r], output[r], 0, rows)
+        return
+
+    var buf = DispatchBuffer[GemvSoftcapKernel[rows, cols, cap]]()
+    for r in range(tp):
+        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        tile_dispatch(buf,
+            GemvSoftcapKernel[rows, cols, cap](x[r], weight[r], output[r], 0, 0),
             pools[r], rows, num_workers=nw)
     join_all[tp](pools)
 

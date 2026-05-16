@@ -54,7 +54,6 @@ def load_and_run[
     if not model_opt:
         return
     var model = model_opt.take()
-    var kv = model.new_kv_cache()
     var load_ms = (perf_counter_ns() - t0) / 1_000_000
     print("model loaded in", load_ms, "ms")
     print()
@@ -63,10 +62,10 @@ def load_and_run[
 
     var t1 = perf_counter_ns()
     for i in range(prompt_len - 1):
-        var logits = model.forward(token_ids[i], i, kv)
+        var logits = model.forward(token_ids[i], i)
         logits^.release()
 
-    var logits = model.forward(token_ids[prompt_len - 1], prompt_len - 1, kv)
+    var logits = model.forward(token_ids[prompt_len - 1], prompt_len - 1)
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     var top_vals = InlineArray[Float32, 5](fill=Float32(-1e30))
@@ -104,7 +103,7 @@ def load_and_run[
     var decode_start = perf_counter_ns()
 
     while len(generated) < MAX_NEW_TOKENS:
-        var step_logits = model.forward(next_id, pos, kv)
+        var step_logits = model.forward(next_id, pos)
         result = greedy_argmax[1](step_logits)
         next_id = result[0]
         step_logits^.release()

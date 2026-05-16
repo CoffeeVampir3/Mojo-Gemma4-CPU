@@ -1,6 +1,8 @@
+from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.reflection import reflect
 
+from kernels.helpers import NumaPointerArray
 from modeling.model_spec import (
     Encoding, BF16, ShapeLike, StaticView, WeightDesc,
     DEFAULT_ALIGNMENT, DISTRIBUTED, align_up,
@@ -23,6 +25,25 @@ trait SlotLike:
 
 trait SlotGroup(FieldwiseDefault):
     pass
+
+
+@fieldwise_init
+struct BindContext[degree: Int](Copyable, ImplicitlyCopyable):
+    """Per-call binding context. `layer_base` is the current layer's absolute
+    arena offset for weight-slot resolution; for state slots whose offsets are
+    absolute, callers pass `arena_bases[0]` as the base explicitly."""
+    var arena_bases: InlineArray[Int, Self.degree]
+    var layer_base: Int
+
+    @always_inline
+    def with_layer(self, lb: Int) -> Self:
+        var c = self
+        c.layer_base = lb
+        return c
+
+    @always_inline
+    def arena_base(self, rank: Int = 0) -> Int:
+        return self.arena_bases[rank]
 
 
 struct Slot[
@@ -56,6 +77,27 @@ struct Slot[
         return StaticView[Self.E_, Self.S_](
             UnsafePointer[Scalar[Self.E_.DTYPE], MutAnyOrigin](
                 unsafe_from_address=base + self.offset))
+
+    @always_inline
+    def ranks[degree: Int](
+        self, base: Int, bases: InlineArray[Int, degree],
+    ) -> NumaPointerArray[Self.E_.DTYPE, degree]:
+        return NumaPointerArray[Self.E_.DTYPE, degree](
+            UnsafePointer[Scalar[Self.E_.DTYPE], MutAnyOrigin](
+                unsafe_from_address=base + self.offset),
+            bases)
+
+    @always_inline
+    def ranks[degree: Int](
+        self, ctx: BindContext[degree],
+    ) -> NumaPointerArray[Self.E_.DTYPE, degree]:
+        return self.ranks(ctx.layer_base, ctx.arena_bases)
+
+    @always_inline
+    def state_ranks[degree: Int](
+        self, ctx: BindContext[degree],
+    ) -> NumaPointerArray[Self.E_.DTYPE, degree]:
+        return self.ranks(ctx.arena_bases[0], ctx.arena_bases)
 
 
 def stamp_offsets[T: AnyType](mut t: T, off_in: Int = 0) -> Int:
@@ -107,14 +149,3 @@ def emit_descs[T: AnyType](
     return off
 
 
-def slot_layout_bytes[T: AnyType]() -> Int:
-    """Pure comptime layout sizing (no instance, no descs). Useful for
-    SectionBuilder-style stride calculation."""
-    var off = 0
-    comptime for i in range(reflect[T].field_count()):
-        comptime FT = reflect[T].field_types()[i]
-        comptime if conforms_to(FT, SlotLike):
-            off = align_up(off + FT.S.bytes[FT.E]())
-        comptime if conforms_to(FT, SlotGroup):
-            off = align_up(off + slot_layout_bytes[FT]())
-    return off
