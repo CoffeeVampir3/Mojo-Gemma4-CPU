@@ -3,10 +3,9 @@ from std.sys.info import simd_width_of
 from std.pathlib import Path
 from std.time import perf_counter_ns
 
-from numa import NumaInfo, NumaTopology
+from numa import NumaTopology
 from threading.threading_traits import BurstThreadPool
-from threading.burst_threading import BurstPool
-from threading.isolated_burst_pool import IsolatedBurstPool
+from threading.topological_dispatch import with_topological_rank_dispatch
 
 from notstdcollections import HeapMoveArray
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
@@ -39,18 +38,16 @@ def greedy_argmax[degree: Int](
 
 
 def load_and_run[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, //, degree: Int,
 ](
-    numa: NumaInfo,
-    numa_topo: NumaTopology,
-    var pool: P,
+    topo: NumaTopology,
+    var pools: HeapMoveArray[P],
     read tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read token_ids: List[Int],
 ):
     var t0 = perf_counter_ns()
-    var pools = HeapMoveArray[P](1)
-    pools.push(pool^)
-    var model_opt = Gemma4[1, P].load(Path(MODEL_DIR), numa, numa_topo, pools^)
+    var model_opt = Gemma4[degree, P].load(
+        Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         return
     var model = model_opt.take()
@@ -85,7 +82,7 @@ def load_and_run[
         id_list.append(top_ids[i])
         print(" ", i, "id=", top_ids[i], "val=", top_vals[i], "tok=", repr(tok.decode(id_list)))
 
-    var result = greedy_argmax[1](logits)
+    var result = greedy_argmax[degree](logits)
     var next_id = result[0]
     logits^.release()
 
@@ -104,7 +101,7 @@ def load_and_run[
 
     while len(generated) < MAX_NEW_TOKENS:
         var step_logits = model.forward(next_id, pos)
-        result = greedy_argmax[1](step_logits)
+        result = greedy_argmax[degree](step_logits)
         next_id = result[0]
         step_logits^.release()
         generated.append(next_id)
@@ -153,17 +150,19 @@ def main():
         print("", token_ids[i], end="")
     print()
 
-    var numa = NumaInfo()
-    var numa_topo = numa.plan_topology(1)
+    var topo = NumaTopology()
 
-    print(String(numa.num_nodes) + " NUMA nodes, "
-        + String(len(numa.isolated_cpus)) + " isolated cpus")
+    print(String(topo.num_nodes()) + " NUMA nodes, "
+        + String(len(topo.isolated_cpus)) + " isolated cpus")
 
-    if numa.has_isolation():
-        print("mode: isolated (spin-only)")
-        var pool = IsolatedBurstPool[].for_topology(numa, numa_topo[0])
-        load_and_run(numa, numa_topo, pool^, tok, token_ids)
-    else:
-        print("mode: cold (spin-backoff)")
-        var pool = BurstPool[].for_topology(numa, numa_topo[0])
-        load_and_run(numa, numa_topo, pool^, tok, token_ids)
+    @parameter
+    def dispatch_gemma4_tp[
+        P: BurstThreadPool, //, degree: Int,
+    ](var selected_pools: HeapMoveArray[P]):
+        load_and_run[degree=degree](topo, selected_pools^, tok, token_ids)
+
+    with_topological_rank_dispatch[
+        power_of_two_unrolling=3,
+        dispatch=dispatch_gemma4_tp,
+    ](
+        topo, "mode: isolated (spin-only)", "mode: cold (spin-backoff)")

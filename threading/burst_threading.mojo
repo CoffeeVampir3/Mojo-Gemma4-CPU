@@ -4,7 +4,7 @@ from std.os import abort
 from std.time import perf_counter_ns
 import linux.sys as linux
 from std.atomic import Ordering, fence
-from numa import NumaInfo, CpuMask
+from numa import NumaTopology, CpuMask
 from notstdcollections import HeapMoveArray
 from .threading_traits import BurstKernel, BurstThreadPool
 from .threading_shared import (
@@ -277,14 +277,11 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         self.spawn_workers()
 
     # ----------------------------------------------------------------
-    # Bool / len
+    # Bool
     # ----------------------------------------------------------------
 
     def __bool__(self) -> Bool:
         return self.worker_arena != 0 and self.join_arena != 0
-
-    def __len__(self) -> Int:
-        return self.capacity
 
     # ----------------------------------------------------------------
     # Dispatch — two-pass write + Dekker wake check
@@ -465,69 +462,28 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
                 abort("BurstPool.spawn_workers: clone3 failed")
         self.workers_alive = True
 
-    # ----------------------------------------------------------------
-    # Factory methods
-    # ----------------------------------------------------------------
-
     @staticmethod
-    def for_numa_node(numa: NumaInfo, node: Int, headroom: Int = 0,
-                      stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
-        """Create pool for a NUMA node. headroom reserves cores for OS/caller."""
-        var mask = numa.get_node_mask[Self.mask_size](node)
-        var total = numa.cpus_on_node(node)
-        var cap = max(1, total - headroom)
-        if headroom > 0:
-            var removed = 0
-            var bit = CpuMask[Self.mask_size].bit_capacity() - 1
-            while removed < headroom and bit >= 0:
-                if mask.test(bit):
-                    mask.clear(bit)
-                    removed += 1
-                bit -= 1
-        return Self(cap, mask, node, stack_size)
-
-    @staticmethod
-    def for_topology(numa: NumaInfo, node: Int,
-                     stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
-        """Create pool from topology discovery.
+    def for_rank(topo: NumaTopology, rank: Int,
+                 stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
+        """Create pool for the given rank's NUMA node.
 
         With isolation: pin workers to isolated physical cores on the node.
         Without isolation: capacity = physical core count, affinity = whole
         NUMA node (all logical cores including HT siblings).
         """
-        if numa.has_isolation():
-            var mask = numa.get_worker_mask[Self.mask_size](node)
+        var node = topo.node(rank)
+        if topo.has_isolation():
+            var mask = topo.worker_mask[Self.mask_size](rank)
             var cap = mask.count()
             if cap == 0:
                 cap = 1
-                mask = numa.get_node_mask[Self.mask_size](node)
+                mask = topo.mask[Self.mask_size](rank)
             return Self(cap, mask, node, stack_size)
-        var cap = numa.cpus_on_node(node)
+        var cap = topo.cpus_on(rank)
         if cap == 0:
             cap = 1
-        var mask = numa.get_node_mask[Self.mask_size](node)
+        var mask = topo.mask[Self.mask_size](rank)
         return Self(cap, mask, node, stack_size)
-
-    @staticmethod
-    def for_numa_node_excluding(numa: NumaInfo, node: Int, exclude_cpu: Int,
-                                stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
-        var mask = numa.get_node_mask[Self.mask_size](node)
-        var cap = numa.cpus_on_node(node)
-        if mask.test(exclude_cpu):
-            mask.clear(exclude_cpu)
-            cap -= 1
-        return Self(cap, mask, node, stack_size)
-
-
-def make_node_pools[mask_size: Int = 128](
-    numa: NumaInfo,
-    stack_size: Int = SlotLayout.DEFAULT_STACK,
-) -> HeapMoveArray[BurstPool[mask_size]]:
-    """Create one BurstPool per NUMA node, sized from isolation topology."""
-    var pools = HeapMoveArray[BurstPool[mask_size]](numa.num_nodes)
-    for i in range(numa.num_nodes):
-        pools.push(BurstPool[mask_size].for_topology(numa, numa.nodes[i].id, stack_size))
-    return pools^
 
 
 # ============================================================================

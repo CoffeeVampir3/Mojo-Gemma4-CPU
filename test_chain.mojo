@@ -6,7 +6,7 @@ from std.memory import Span, UnsafePointer, alloc
 from std.time import perf_counter_ns
 from std.benchmark import keep
 from std.sys.info import size_of
-from numa import NumaInfo
+from numa import NumaTopology
 from notstdcollections import HeapMoveArray
 
 
@@ -194,18 +194,17 @@ def test_bench[P: BurstThreadPool](mut pool: P):
 
 
 def main():
-    var numa = NumaInfo()
-    var topo = numa.plan_topology(numa.num_nodes)
+    var topo = NumaTopology()
 
-    print(String(numa.num_nodes) + " NUMA nodes, "
-        + String(len(numa.isolated_cpus)) + " isolated cpus\n")
+    print(String(topo.num_nodes()) + " NUMA nodes, "
+        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
 
-    if numa.has_isolation():
+    if topo.has_isolation():
         print("mode: isolated (spin-only)")
-        var pools = HeapMoveArray[IsolatedBurstPool[]](numa.num_nodes)
-        for i in range(numa.num_nodes):
-            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
-            print("  node " + String(topo[i]) + ": "
+        var pools = HeapMoveArray[IsolatedBurstPool[]](len(topo))
+        for i in range(len(topo)):
+            pools.push(IsolatedBurstPool[].for_rank(topo, i))
+            print("  node " + String(topo.node(i)) + ": "
                 + String(pools[i].get_capacity()) + " workers")
         print("\nsizes:")
         test_sizes()
@@ -217,10 +216,10 @@ def main():
         test_bench(pools[0])
     else:
         print("mode: cold (spin-backoff)")
-        var pools = HeapMoveArray[BurstPool[]](numa.num_nodes)
-        for i in range(numa.num_nodes):
-            pools.push(BurstPool[].for_topology(numa, topo[i]))
-            print("  node " + String(topo[i]) + ": "
+        var pools = HeapMoveArray[BurstPool[]](len(topo))
+        for i in range(len(topo)):
+            pools.push(BurstPool[].for_rank(topo, i))
+            print("  node " + String(topo.node(i)) + ": "
                 + String(pools[i].get_capacity()) + " workers")
         print("\nsizes:")
         test_sizes()

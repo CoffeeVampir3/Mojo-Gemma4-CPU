@@ -220,19 +220,5 @@ struct TemporalLogitsView[
         )
         return self.local_ptr(offset).load[width=width]().cast[DType.float32]()
 
-    def argmax(self) -> Tuple[Int, Float32]:
-        var best_val = Float32(-1.0e30)
-        var best_idx = 0
-        for r in range(Self.degree):
-            var rank_ptr = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-                unsafe_from_address=Int(self.ptr) + self.bases[r]
-                    - self.bases[0])
-            for v in range(Self.VOCAB_PER_RANK):
-                var val = rank_ptr[v].cast[DType.float32]()
-                if val > best_val:
-                    best_val = val
-                    best_idx = r * Self.VOCAB_PER_RANK + v
-        return (best_idx, best_val)
-
     def release(deinit self):
         pass

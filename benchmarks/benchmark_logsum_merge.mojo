@@ -3,7 +3,7 @@ from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
 
-from numa import NumaArena, NumaInfo
+from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
@@ -232,13 +232,12 @@ def run_config[
 
 
 def main():
-    var numa = NumaInfo()
-    var topo = numa.plan_topology(numa.num_nodes)
-    var tp = numa.num_nodes
+    var topo = NumaTopology()
+    var tp = len(topo)
 
     print("logsum_merge worker count sweep")
-    print(String(numa.num_nodes) + " NUMA node(s), "
-        + String(len(numa.isolated_cpus)) + " isolated cpus")
+    print(String(tp) + " NUMA node(s), "
+        + String(len(topo.isolated_cpus)) + " isolated cpus")
 
     comptime ARENA_BYTES = 128 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
@@ -248,11 +247,11 @@ def main():
             print("arena alloc failed on node", topo[i])
             return
 
-    if numa.has_isolation():
+    if topo.has_isolation():
         print("mode: isolated")
         var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
         for i in range(tp):
-            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+            pools.push(IsolatedBurstPool[].for_rank(topo, i))
         if tp == 1:
             run_config[head_dim=256, num_q=8, tp=1](arenas, pools)
             run_config[head_dim=512, num_q=16, tp=1](arenas, pools)
@@ -268,7 +267,7 @@ def main():
         print("mode: spin-backoff")
         var pools = HeapMoveArray[BurstPool[]](tp)
         for i in range(tp):
-            pools.push(BurstPool[].for_topology(numa, topo[i]))
+            pools.push(BurstPool[].for_rank(topo, i))
         if tp == 1:
             run_config[head_dim=256, num_q=8, tp=1](arenas, pools)
             run_config[head_dim=512, num_q=16, tp=1](arenas, pools)

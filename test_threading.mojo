@@ -4,7 +4,7 @@ from threading.isolated_burst_pool import IsolatedBurstPool
 from std.memory import Span, UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
-from numa import NumaInfo
+from numa import NumaTopology
 from notstdcollections import HeapMoveArray
 import linux.sys as linux
 
@@ -109,26 +109,25 @@ def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
 
 
 def main():
-    var numa = NumaInfo()
-    var topo = numa.plan_topology(numa.num_nodes)
-    var num_nodes = numa.num_nodes
+    var topo = NumaTopology()
+    var num_nodes = topo.num_nodes()
 
     print(String(num_nodes) + " NUMA nodes, "
-        + String(len(numa.isolated_cpus)) + " isolated cpus")
+        + String(len(topo.isolated_cpus)) + " isolated cpus")
 
-    if numa.has_isolation():
+    if topo.has_isolation():
         print("mode: isolated (spin-only)")
         var pools = HeapMoveArray[IsolatedBurstPool[]](num_nodes)
         for i in range(num_nodes):
-            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
-            print("  node " + String(topo[i]) + ": "
+            pools.push(IsolatedBurstPool[].for_rank(topo, i))
+            print("  node " + String(topo.node(i)) + ": "
                 + String(pools[i].get_capacity()) + " workers")
         run_bench(pools, num_nodes)
     else:
         print("mode: cold (spin-backoff)")
         var pools = HeapMoveArray[BurstPool[]](num_nodes)
         for i in range(num_nodes):
-            pools.push(BurstPool[].for_topology(numa, topo[i]))
-            print("  node " + String(topo[i]) + ": "
+            pools.push(BurstPool[].for_rank(topo, i))
+            print("  node " + String(topo.node(i)) + ": "
                 + String(pools[i].get_capacity()) + " workers")
         run_bench(pools, num_nodes)

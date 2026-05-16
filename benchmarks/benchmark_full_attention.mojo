@@ -4,7 +4,7 @@ from std.time import perf_counter_ns
 from std.benchmark import keep
 from std.sys.info import simd_width_of
 
-from numa import NumaArena, NumaInfo, NumaTopology
+from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
@@ -245,13 +245,12 @@ def run_all[P: BurstThreadPool, //, tp: Int](
 
 
 def main():
-    var numa = NumaInfo()
-    var topo = numa.plan_topology(numa.num_nodes)
-    var tp = numa.num_nodes
+    var topo = NumaTopology()
+    var tp = len(topo)
 
     print("Full attention benchmark (replicated Q + context-local attention + merge)")
     print(String(tp) + " NUMA node(s), "
-        + String(len(numa.isolated_cpus)) + " isolated cpus\n")
+        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
@@ -261,11 +260,11 @@ def main():
             print("arena alloc failed on node", topo[i])
             return
 
-    if numa.has_isolation():
+    if topo.has_isolation():
         print("mode: isolated")
         var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
         for i in range(tp):
-            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+            pools.push(IsolatedBurstPool[].for_rank(topo, i))
             print("  node " + String(topo[i]) + ": "
                 + String(pools[i].get_capacity()) + " workers")
         print("")
@@ -281,7 +280,7 @@ def main():
         print("mode: spin-backoff")
         var pools = HeapMoveArray[BurstPool[]](tp)
         for i in range(tp):
-            pools.push(BurstPool[].for_topology(numa, topo[i]))
+            pools.push(BurstPool[].for_rank(topo, i))
             print("  node " + String(topo[i]) + ": "
                 + String(pools[i].get_capacity()) + " workers")
         print("")

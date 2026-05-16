@@ -6,7 +6,7 @@ from safetensors.parser import parse_safetensors_header, SafetensorsHeader, Tens
 from linux.io_uring import ReadOp, run_reads_multi
 from notstdcollections import HeapMoveArray
 from threading.burst_threading import BurstPool
-from numa import NumaInfo, NumaTopology
+from numa import NumaTopology
 
 
 comptime DEFAULT_IO_DEPTH = 2048
@@ -180,8 +180,7 @@ def load_weights_from_descs[
     descs: List[WeightDesc],
     paths: List[Path],
     arena_bases: List[Int],
-    numa: NumaInfo,
-    numa_topo: NumaTopology,
+    topo: NumaTopology,
 ) -> Optional[LoadResult]:
     """Runtime variant — takes a prebuilt List[WeightDesc]."""
     var headers = HeapMoveArray[SafetensorsHeader](len(paths))
@@ -219,7 +218,7 @@ def load_weights_from_descs[
         if not resolve_and_emit(w, headers, arena_bases, all_ranks, ops_per_rank):
             return None
 
-    return run_load[io_depth, mask_size](paths, numa, numa_topo, ops_per_rank^)
+    return run_load[io_depth, mask_size](paths, topo, ops_per_rank^)
 
 
 def run_load[
@@ -227,13 +226,12 @@ def run_load[
     mask_size: Int,
 ](
     paths: List[Path],
-    numa: NumaInfo,
-    numa_topo: NumaTopology,
+    topo: NumaTopology,
     var ops_per_rank: List[List[ReadOp[]]],
 ) -> Optional[LoadResult]:
-    """Build transient load pools (one 1-capacity pool per NUMA node in
-    numa_topo), run the multi-pool read dispatch, tally bytes/ops. The
-    load pools are destroyed on return; the inference-time pools are a
+    """Build transient load pools (one 1-capacity pool per rank's NUMA
+    node), run the multi-pool read dispatch, tally bytes/ops. The load
+    pools are destroyed on return; the inference-time pools are a
     separate concern of the caller."""
     var total_bytes = 0
     var total_ops = 0
@@ -245,9 +243,9 @@ def run_load[
     var tp = len(ops_per_rank)
     var load_pools = HeapMoveArray[BurstPool[mask_size]](tp)
     for r in range(tp):
-        var mask = numa.get_node_mask[mask_size](numa_topo[r])
+        var mask = topo.mask[mask_size](r)
         load_pools.push(BurstPool[mask_size](
-            capacity=1, cpu_mask=mask, numa_node=numa_topo[r]))
+            capacity=1, cpu_mask=mask, numa_node=topo.node(r)))
         if not load_pools[r]:
             print("load pool setup failed for rank", r)
             return None

@@ -121,30 +121,27 @@ struct NumaNode(Copyable, Writable):
         self.mem_total_kb = 0
         self.mem_free_kb = 0
 
-@fieldwise_init
-struct NumaTopology(Movable):
-    """Ring-ordered NUMA node placement for tensor parallelism.
-    Nodes are selected for minimum communication cost and ordered
-    by nearest-neighbor adjacency for ring allreduce."""
-    var node_ids: List[Int]
-    var tp: Int
 
-    def __len__(self) -> Int:
-        return self.tp
+struct NumaTopology(Movable, Sized):
+    """Unified NUMA description: discovery of the box's nodes plus the
+    ring-ordered placement plan.
 
-    def __getitem__(self, rank: Int) -> Int:
-        return self.node_ids[rank]
+    Constructed in one shot: __init__ reads sysfs and orders every node it
+    finds into a nearest-neighbor ring. tp is whatever the system has —
+    callers do not pick a subset.
 
-
-struct NumaInfo:
+    Rank-indexed accessors (node, mask, worker_mask, cpus_on, worker_count)
+    are the canonical interface for downstream consumers; system-level
+    accessors (distance, num_nodes, has_isolation) remain available for
+    inspection."""
     var nodes: List[NumaNode]
-    var num_nodes: Int
-    var isolated_cpus: List[Int]  # from /sys/devices/system/cpu/isolated
+    var isolated_cpus: List[Int]
+    var rank_to_node: List[Int]
 
     def __init__(out self):
-        self.num_nodes = 0
         self.nodes = List[NumaNode]()
         self.isolated_cpus = List[Int]()
+        self.rank_to_node = List[Int]()
         try:
             self.isolated_cpus = parse_cpulist(
                 read_sysfs("/sys/devices/system/cpu/isolated"))
@@ -162,17 +159,86 @@ struct NumaInfo:
                 node.mem_total_kb = parse_meminfo(base + "/meminfo", "MemTotal")
                 node.mem_free_kb = parse_meminfo(base + "/meminfo", "MemFree")
                 self.nodes.append(node^)
-                self.num_nodes += 1
         except:
-            print("NumaInfo failed to read system numa information or it was not present on the system.")
+            print("NumaTopology failed to read system numa information or it was not present on the system.")
+        self.plan()
 
-    def has_isolation(self) -> Bool:
-        """True if CPU isolation is configured (isolcpus boot param)."""
-        return len(self.isolated_cpus) > 0
+    def plan(mut self):
+        """Order every discovered node into a nearest-neighbor ring for
+        tensor-parallel placement. Seed with the most central node (min
+        total distance to all others), then walk the nearest unvisited
+        neighbour at each step."""
+        var n = len(self.nodes)
+        self.rank_to_node = List[Int]()
+        if n == 0:
+            return
+        if n == 1:
+            self.rank_to_node.append(self.nodes[0].id)
+            return
 
-    def get_worker_cpus(self, node_id: Int) -> List[Int]:
-        """Get worker CPUs for a node: node ∩ isolated, or all node if no isolation."""
-        var node_cpus = self.get_node_cpus(node_id)
+        var best_centrality = Int.MAX
+        var seed = 0
+        for i in range(n):
+            var total = 0
+            for j in range(n):
+                total += self.distance(self.nodes[i].id, self.nodes[j].id)
+            if total < best_centrality:
+                best_centrality = total
+                seed = i
+
+        var visited = List[Bool](length=n, fill=False)
+        visited[seed] = True
+        self.rank_to_node.append(self.nodes[seed].id)
+        var last_idx = seed
+
+        for _ in range(1, n):
+            var best_next = -1
+            var best_d = Int.MAX
+            for k in range(n):
+                if visited[k]:
+                    continue
+                var d = self.distance(self.nodes[last_idx].id, self.nodes[k].id)
+                if d < best_d:
+                    best_d = d
+                    best_next = k
+            if best_next < 0:
+                break
+            visited[best_next] = True
+            self.rank_to_node.append(self.nodes[best_next].id)
+            last_idx = best_next
+
+    def __len__(self) -> Int:
+        return len(self.rank_to_node)
+
+    def __getitem__(self, rank: Int) -> Int:
+        return self.rank_to_node[rank]
+
+    def node(self, rank: Int) -> Int:
+        return self.rank_to_node[rank]
+
+    def mask[mask_size: Int = 128](self, rank: Int) -> CpuMask[mask_size]:
+        """Full logical CPU mask for the rank's node (includes HT siblings)."""
+        var mask = CpuMask[mask_size]()
+        var node_idx = self.find_node_index(self.rank_to_node[rank])
+        if node_idx < 0:
+            return mask
+        for cpu in self.nodes[node_idx].logical_cpu_ids:
+            mask.set(cpu)
+        return mask
+
+    def worker_mask[mask_size: Int = 128](self, rank: Int) -> CpuMask[mask_size]:
+        """Worker CPU mask for the rank's node (isolated ∩ node, or all
+        physical primaries on the node when no isolation is configured)."""
+        var mask = CpuMask[mask_size]()
+        for cpu in self.worker_cpus(rank):
+            mask.set(cpu)
+        return mask
+
+    def worker_cpus(self, rank: Int) -> List[Int]:
+        var node_idx = self.find_node_index(self.rank_to_node[rank])
+        if node_idx < 0:
+            return List[Int]()
+        var node_cpus = self.nodes[node_idx].cpu_ids.copy()
         if not self.has_isolation():
             return node_cpus^
         var workers = List[Int]()
@@ -183,160 +249,50 @@ struct NumaInfo:
                     break
         return workers^
 
-    def get_worker_mask[mask_size: Int = 128](self, node_id: Int) -> CpuMask[mask_size]:
-        """CPU mask for worker cores on a node (isolated ∩ node, or all node)."""
-        var mask = CpuMask[mask_size]()
-        var cpus = self.get_worker_cpus(node_id)
-        for cpu in cpus:
-            mask.set(cpu)
-        return mask
+    def cpus_on(self, rank: Int) -> Int:
+        var node_idx = self.find_node_index(self.rank_to_node[rank])
+        if node_idx < 0:
+            return 0
+        return len(self.nodes[node_idx].cpu_ids)
 
-    def worker_count(self, node_id: Int) -> Int:
-        """Number of worker CPUs on a node (respects isolation)."""
-        return len(self.get_worker_cpus(node_id))
+    def worker_count(self, rank: Int) -> Int:
+        return len(self.worker_cpus(rank))
 
-    def get_node_cpus(self, node_id: Int) -> List[Int]:
-        """Get the list of CPU IDs belonging to the specified NUMA node."""
-        if node_id < 0 or node_id >= self.num_nodes:
-            return List[Int]()
-        return self.nodes[node_id].cpu_ids.copy()
+    def has_isolation(self) -> Bool:
+        return len(self.isolated_cpus) > 0
 
-    def get_node_mask[mask_size: Int = 128](self, node_id: Int) -> CpuMask[mask_size]:
-        """Full logical CPU mask for node-level affinity (includes HT siblings)."""
-        var mask = CpuMask[mask_size]()
-        if node_id < 0 or node_id >= self.num_nodes:
-            return mask
-        for cpu in self.nodes[node_id].logical_cpu_ids:
-            mask.set(cpu)
-        return mask
+    def num_nodes(self) -> Int:
+        return len(self.nodes)
+
+    def find_node_index(self, node_id: Int) -> Int:
+        for i in range(len(self.nodes)):
+            if self.nodes[i].id == node_id:
+                return i
+        return -1
 
     def distance(self, from_node: Int, to_node: Int) -> Int:
-        """Get the NUMA distance between two nodes."""
-        if from_node < 0 or from_node >= self.num_nodes:
+        var i = self.find_node_index(from_node)
+        if i < 0:
             return -1
-        if to_node < 0 or to_node >= len(self.nodes[from_node].distances):
+        var j = self.find_node_index(to_node)
+        if j < 0 or j >= len(self.nodes[i].distances):
             return -1
-        return self.nodes[from_node].distances[to_node]
-
-    def cpus_per_node(self) -> Int:
-        """Get the number of CPUs per node (assumes uniform topology)."""
-        if self.num_nodes == 0:
-            return 0
-        return len(self.nodes[0].cpu_ids)
-
-    def cpus_on_node(self, node: Int) -> Int:
-        """Get the number of CPUs on a specific node."""
-        if node < 0 or node >= self.num_nodes:
-            return 0
-        return len(self.nodes[node].cpu_ids)
-
-    def total_cpus(self) -> Int:
-        """Get the total number of CPUs across all nodes."""
-        var total = 0
-        for node in self.nodes:
-            total += len(node.cpu_ids)
-        return total
-
-    def plan_topology(self, tp: Int) -> NumaTopology:
-        """Select tp NUMA nodes with minimum communication cost, ordered as
-        a nearest-neighbor ring for optimal allreduce adjacency.
-
-        Two phases:
-        1. Greedy selection: seed with the most central node (minimum total
-           distance to all others), then greedily add the node closest to
-           the selected set. O(tp^2 * num_nodes).
-        2. Ring ordering: nearest-neighbor TSP starting from the seed,
-           producing the ring traversal order. O(tp^2).
-
-        Returns a NumaTopology with node IDs in ring order — rank 0 is the
-        seed (most central of the selected set), and each subsequent rank
-        is adjacent in the communication ring.
-        """
-        if self.num_nodes <= 1 or tp <= 1:
-            var ids = List[Int]()
-            var node_id = self.nodes[0].id if self.num_nodes > 0 else 0
-            for _ in range(tp):
-                ids.append(node_id)
-            return NumaTopology(ids^, tp)
-
-        # --- Phase 1: Greedy selection from topological center ---
-
-        # Find the most central node (minimum total distance to all others).
-        var best_centrality = Int.MAX
-        var seed = 0
-        for i in range(self.num_nodes):
-            var total = 0
-            for j in range(self.num_nodes):
-                total += self.distance(i, j)
-            if total < best_centrality:
-                best_centrality = total
-                seed = i
-
-        var selected = List[Bool](length=self.num_nodes, fill=False)
-        var chosen = List[Int]()
-        selected[seed] = True
-        chosen.append(seed)
-
-        # Greedily add the node with minimum distance to any already-selected node.
-        while len(chosen) < tp and len(chosen) < self.num_nodes:
-            var best_node = -1
-            var best_dist = Int.MAX
-            for candidate in range(self.num_nodes):
-                if selected[candidate]:
-                    continue
-                var min_dist = Int.MAX
-                for s in range(len(chosen)):
-                    var d = self.distance(candidate, chosen[s])
-                    if d < min_dist:
-                        min_dist = d
-                if min_dist < best_dist:
-                    best_dist = min_dist
-                    best_node = candidate
-            if best_node < 0:
-                break
-            selected[best_node] = True
-            chosen.append(best_node)
-
-        # --- Phase 2: Nearest-neighbor ring ordering ---
-
-        var ordered = List[Int]()
-        var visited = List[Bool](length=len(chosen), fill=False)
-
-        # Start from the seed (index 0 in chosen).
-        visited[0] = True
-        ordered.append(self.nodes[chosen[0]].id)
-
-        for step in range(1, len(chosen)):
-            var last = chosen[0]
-            # Find which chosen[] index corresponds to the last ordered node.
-            for k in range(len(chosen)):
-                if self.nodes[chosen[k]].id == ordered[step - 1]:
-                    last = chosen[k]
-                    break
-
-            var best_next = -1
-            var best_d = Int.MAX
-            for k in range(len(chosen)):
-                if visited[k]:
-                    continue
-                var d = self.distance(last, chosen[k])
-                if d < best_d:
-                    best_d = d
-                    best_next = k
-            if best_next >= 0:
-                visited[best_next] = True
-                ordered.append(self.nodes[chosen[best_next]].id)
-
-        return NumaTopology(ordered^, tp)
+        return self.nodes[i].distances[j]
 
     def print_debug(self):
-        print("NUMA Info:", self.num_nodes, "nodes,", self.cpus_per_node(), "cpus/node")
+        print("NUMA Topology:", self.num_nodes(), "nodes, tp =", len(self))
         print()
-        for i in range(self.num_nodes):
-            print("Node", i, ":", len(self.nodes[i].cpu_ids), "cpus,", self.nodes[i].mem_total_kb // 1024, "MB total,", self.nodes[i].mem_free_kb // 1024, "MB free")
+        for i in range(self.num_nodes()):
+            print("Node", self.nodes[i].id, ":", len(self.nodes[i].cpu_ids), "cpus,",
+                  self.nodes[i].mem_total_kb // 1024, "MB total,",
+                  self.nodes[i].mem_free_kb // 1024, "MB free")
+        print()
+        print("Ring order (rank -> node):")
+        for r in range(len(self)):
+            print("  rank", r, "-> node", self.rank_to_node[r])
         print()
         print("Distance matrix:")
-        for i in range(self.num_nodes):
-            for j in range(self.num_nodes):
-                print(self.distance(i, j), end=" ")
+        for i in range(self.num_nodes()):
+            for j in range(self.num_nodes()):
+                print(self.distance(self.nodes[i].id, self.nodes[j].id), end=" ")
             print()

@@ -1,6 +1,5 @@
-from std.sys.info import size_of
 from std.memory import UnsafePointer
-from std.atomic import Atomic, Ordering
+from std.atomic import Atomic
 from .threading_traits import BurstKernel
 
 comptime AtomicInt32 = Atomic[DType.int32]

@@ -3,10 +3,10 @@ from std.memory import Span, UnsafePointer, memcpy
 from std.os import abort
 from std.time import perf_counter_ns
 import linux.sys as linux
-from std.atomic import Atomic, Ordering
-from numa import NumaInfo, CpuMask
+from std.atomic import Ordering
+from numa import NumaTopology, CpuMask
 from notstdcollections import HeapMoveArray
-from .threading_traits import BurstKernel, CheapSmallPhaseDispatchPool
+from .threading_traits import BurstKernel, BurstThreadPool
 from .threading_shared import (
     AtomicInt32, KernelFn, JoinFlag, SlotLayout,
     MAILBOX_DATA_SLOTS, MAILBOX_DATA_BYTES,
@@ -87,7 +87,7 @@ struct WorkerSlot(Movable):
 # IsolatedBurstPool
 # ============================================================================
 
-struct IsolatedBurstPool[mask_size: Int = 128](CheapSmallPhaseDispatchPool):
+struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool):
     """Dual-mailbox burst pool for isolated cores.
 
     Workers spin on local mailboxes. Join polls local flags.
@@ -382,19 +382,16 @@ struct IsolatedBurstPool[mask_size: Int = 128](CheapSmallPhaseDispatchPool):
         if self.join_arena != 0:
             _ = sys.sys_munmap(self.join_arena, self.join_arena_size)
 
-    # ----------------------------------------------------------------
-    # Factory methods
-    # ----------------------------------------------------------------
-
     @staticmethod
-    def for_topology(numa: NumaInfo, node: Int,
-                     stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
-        """Create pool from isolation-aware topology discovery."""
-        var mask = numa.get_worker_mask[Self.mask_size](node)
+    def for_rank(topo: NumaTopology, rank: Int,
+                 stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
+        """Create pool pinned to the given rank's isolated worker cores."""
+        var node = topo.node(rank)
+        var mask = topo.worker_mask[Self.mask_size](rank)
         var cap = mask.count()
         if cap == 0:
             cap = 1
-            mask = numa.get_node_mask[Self.mask_size](node)
+            mask = topo.mask[Self.mask_size](rank)
         return Self(cap, mask, node, stack_size)
 
 

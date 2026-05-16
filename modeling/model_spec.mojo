@@ -68,16 +68,6 @@ struct DistributionDegree[degree: Int](DistributionDegreeLike):
     comptime VOCAB = Self.degree
 
 
-comptime TensorParallelRows[n: Int, D: DistributionDegreeLike]: Int = n // D.TENSOR
-comptime TensorParallelColumns[m: Int, D: DistributionDegreeLike]: Int = m // D.TENSOR
-comptime ContextParallelRows[n: Int, D: DistributionDegreeLike]: Int = n // D.CONTEXT
-comptime ExpertsPerRank[experts: Int, D: DistributionDegreeLike]: Int = experts // D.EXPERT
-comptime ExpertParallelRows[
-    experts: Int, rows_per_expert: Int, D: DistributionDegreeLike,
-]: Int = ExpertsPerRank[experts, D] * rows_per_expert
-comptime VocabularyParallelRows[n: Int, D: DistributionDegreeLike]: Int = n // D.VOCAB
-
-
 comptime Replicated[n: Int, m: Int] = Shape[
     n, m, shard_n=False, shard_m=False, degree=1,
 ]

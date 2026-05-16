@@ -4,7 +4,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from simd_math.ops import sqrt
 
-from numa import NumaArena, NumaInfo, NumaTopology
+from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
@@ -212,7 +212,7 @@ struct TailRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
 
 
 @fieldwise_init
-struct Gemma4Topology[degree: Int](Copyable, ImplicitlyCopyable):
+struct Gemma4Layout[degree: Int](Copyable, ImplicitlyCopyable):
     var arena: ArenaLayout
     var sliding: Repeated[SlidingLayerRefs[Self.degree]]
     var full: Repeated[FullLayerRefs[Self.degree]]
@@ -424,7 +424,7 @@ comptime Gemma4ScratchPool[degree: Int] = TemporalScratchPool[
 ]
 
 
-def build_gemma4_plan[degree: Int](mut descs: List[WeightDesc]) -> Gemma4Topology[degree]:
+def build_gemma4_plan[degree: Int](mut descs: List[WeightDesc]) -> Gemma4Layout[degree]:
     comptime assert SlidingAttentionContract[degree], "sliding attention distribution contract failed"
     comptime assert FullAttentionContract[degree], "full attention distribution contract failed"
     comptime assert DenseMlpContract[degree], "dense MLP distribution contract failed"
@@ -493,7 +493,7 @@ def build_gemma4_plan[degree: Int](mut descs: List[WeightDesc]) -> Gemma4Topolog
         host_bytes=align_up(state_cursor),
         scratch_off=scratch_off,
     )
-    return Gemma4Topology[degree](
+    return Gemma4Layout[degree](
         arena=arena,
         sliding=Repeated[SlidingLayerRefs[degree]](sl_proto, sl_off, sl_stride, C.NUM_SLIDING_LAYERS),
         full=Repeated[FullLayerRefs[degree]](fl_proto, fl_off, fl_stride, C.NUM_FULL_LAYERS),
@@ -522,7 +522,7 @@ def full_valid_count(rank: Int, pos: Int, degree: Int) -> Int:
 def dispatch_sliding_attention_qkv[
     P: BurstThreadPool, //, degree: Int,
 ](
-    topo: Gemma4Topology[degree],
+    layout: Gemma4Layout[degree],
     ctx: BindContext[degree],
     pos: Int,
     layer_idx: Int,
@@ -541,8 +541,8 @@ def dispatch_sliding_attention_qkv[
     comptime kv_cols = kv_rows
     comptime flash_stride = FLASH_PARTIAL_STRIDE[num_q_heads, head_dim]
 
-    var attn_ctx = ctx.with_layer(topo.sliding.base(ctx.arena_bases[0], layer_idx))
-    var attn = topo.sliding.proto.attn
+    var attn_ctx = ctx.with_layer(layout.sliding.base(ctx.arena_bases[0], layer_idx))
+    var attn = layout.sliding.proto.attn
 
     var q_out = scratch.slot[Gemma4SlidingScratch[degree], "q"]()
     var k_out = scratch.slot[Gemma4SlidingScratch[degree], "kv"]()
@@ -551,7 +551,7 @@ def dispatch_sliding_attention_qkv[
     var q_outs = NumaPointerArray[DType.bfloat16, degree](q_out, ctx.arena_bases)
     var k_outs = NumaPointerArray[DType.bfloat16, degree](k_out, ctx.arena_bases)
     var v_outs = NumaPointerArray[DType.bfloat16, degree](v_out, ctx.arena_bases)
-    var xs = topo.activations.x_residual.state_ranks(ctx)
+    var xs = layout.activations.x_residual.state_ranks(ctx)
 
     dispatch_gemv_chained_qkv[
         q_rows=q_rows, kv_rows=kv_rows, cols=C.HIDDEN, tp=degree,
@@ -569,9 +569,9 @@ def dispatch_sliding_attention_qkv[
       attn.k_norm.ranks(attn_ctx),
       pools)
 
-    var kv_lb = topo.sliding_kv.base(ctx.arena_bases[0], layer_idx)
-    var k_kv = topo.sliding_kv.proto.k.ranks(kv_lb, ctx.arena_bases)
-    var v_kv = topo.sliding_kv.proto.v.ranks(kv_lb, ctx.arena_bases)
+    var kv_lb = layout.sliding_kv.base(ctx.arena_bases[0], layer_idx)
+    var k_kv = layout.sliding_kv.proto.k.ranks(kv_lb, ctx.arena_bases)
+    var v_kv = layout.sliding_kv.proto.v.ranks(kv_lb, ctx.arena_bases)
 
     dispatch_rope_cache_write[
         half=rope_half, pair_stride=head_dim // 2,
@@ -580,8 +580,8 @@ def dispatch_sliding_attention_qkv[
         slot_mask=C.SLIDING_WINDOW - 1, cache_degree=1, tp=degree,
     ](q_outs, k_outs, v_outs,
       k_kv, v_kv,
-      topo.sliding_rope.cos.state_ranks(ctx),
-      topo.sliding_rope.sin.state_ranks(ctx),
+      layout.sliding_rope.cos.state_ranks(ctx),
+      layout.sliding_rope.sin.state_ranks(ctx),
       pos, 1, pools)
 
     var partials_ptr = scratch.slot[
@@ -610,7 +610,7 @@ def dispatch_sliding_attention_qkv[
 def dispatch_full_attention_qkv[
     P: BurstThreadPool, //, degree: Int,
 ](
-    topo: Gemma4Topology[degree],
+    layout: Gemma4Layout[degree],
     ctx: BindContext[degree],
     pos: Int,
     layer_idx: Int,
@@ -632,8 +632,8 @@ def dispatch_full_attention_qkv[
     comptime kv_cols = k_rows
     comptime partial_stride = PARTIAL_STRIDE[num_q_heads, head_dim]
 
-    var attn_ctx = ctx.with_layer(topo.full.base(ctx.arena_bases[0], layer_idx))
-    var attn = topo.full.proto.attn
+    var attn_ctx = ctx.with_layer(layout.full.base(ctx.arena_bases[0], layer_idx))
+    var attn = layout.full.proto.attn
 
     var q_out = scratch.slot[Gemma4FullScratch[degree], "q"]()
     var k_out = scratch.slot[Gemma4FullScratch[degree], "kv"]()
@@ -642,7 +642,7 @@ def dispatch_full_attention_qkv[
     var q_outs = NumaPointerArray[DType.bfloat16, degree](q_out, ctx.arena_bases)
     var k_outs = NumaPointerArray[DType.bfloat16, degree](k_out, ctx.arena_bases)
     var v_outs = NumaPointerArray[DType.bfloat16, degree](v_out, ctx.arena_bases)
-    var xs = topo.activations.x_residual.state_ranks(ctx)
+    var xs = layout.activations.x_residual.state_ranks(ctx)
 
     dispatch_gemv[rows=q_rows, cols=C.HIDDEN, tp=degree](
         xs, attn.q_proj.ranks(attn_ctx), q_outs, pools)
@@ -661,9 +661,9 @@ def dispatch_full_attention_qkv[
     var rope_owner_ctx = BindContext[degree](
         arena_bases=owner_bases, layer_base=owner_bases[0])
 
-    var kv_lb = topo.full_kv.base(ctx.arena_bases[0], layer_idx)
-    var k_kv = topo.full_kv.proto.k.ranks(kv_lb, ctx.arena_bases)
-    var v_kv = topo.full_kv.proto.v.ranks(kv_lb, ctx.arena_bases)
+    var kv_lb = layout.full_kv.base(ctx.arena_bases[0], layer_idx)
+    var k_kv = layout.full_kv.proto.k.ranks(kv_lb, ctx.arena_bases)
+    var v_kv = layout.full_kv.proto.v.ranks(kv_lb, ctx.arena_bases)
 
     dispatch_rope_cache_write[
         half=rope_half, pair_stride=pair_stride,
@@ -672,8 +672,8 @@ def dispatch_full_attention_qkv[
         slot_mask=-1, cache_degree=degree, tp=degree,
     ](q_outs, k_outs, v_outs,
       k_kv, v_kv,
-      topo.full_rope.cos.state_ranks(rope_owner_ctx),
-      topo.full_rope.sin.state_ranks(rope_owner_ctx),
+      layout.full_rope.cos.state_ranks(rope_owner_ctx),
+      layout.full_rope.sin.state_ranks(rope_owner_ctx),
       pos, 1, pools)
 
     var q_local = scratch.slot[Gemma4FullScratch[degree], "q_local"]()
@@ -907,42 +907,42 @@ def dispatch_ffn[
 struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[Self.Pool]
-    var topology: Gemma4Topology[Self.degree]
+    var layout: Gemma4Layout[Self.degree]
     var scratch: Gemma4ScratchPool[Self.degree]
     var arena_bases: InlineArray[Int, Self.degree]
 
     def __init__(out self,
         var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
         var pools: HeapMoveArray[Self.Pool],
-        topology: Gemma4Topology[Self.degree],
+        layout: Gemma4Layout[Self.degree],
     ):
         self.arena_bases = InlineArray[Int, Self.degree](uninitialized=True)
         for r in range(Self.degree):
             self.arena_bases[r] = Int(arenas[r].base.value())
-        self.topology = topology.bind(self.arena_bases[0])
+        self.layout = layout.bind(self.arena_bases[0])
         self.arenas = arenas^
         self.pools = pools^
         self.scratch = Gemma4ScratchPool[Self.degree](
-            self.topology.arena.scratch_base())
+            self.layout.arena.scratch_base())
 
     def model_init(mut self):
-        ref topo = self.topology
+        ref layout = self.layout
         comptime width = simd_width_of[DType.float32]()
 
         comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
         for rank in range(Self.degree):
-            var arena_base = self.arena_base(rank)
+            var arena_base = self.arena_bases[rank]
             var si = 0
             var fi = 0
             for i in range(C.NUM_LAYERS):
                 var p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
                 if is_full_layer(i):
-                    var lb = topo.full.base(arena_base, fi)
-                    p = topo.full.proto.body.router_scale.bound(lb).as_ptr()
+                    var lb = layout.full.base(arena_base, fi)
+                    p = layout.full.proto.body.router_scale.bound(lb).as_ptr()
                     fi += 1
                 else:
-                    var lb = topo.sliding.base(arena_base, si)
-                    p = topo.sliding.proto.body.router_scale.bound(lb).as_ptr()
+                    var lb = layout.sliding.base(arena_base, si)
+                    p = layout.sliding.proto.body.router_scale.bound(lb).as_ptr()
                     si += 1
                 for j in range(0, C.HIDDEN, width):
                     var lane = p + j
@@ -953,12 +953,12 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         from kernels.rope import init_rope_table, init_rope_table_partial_strided
         for rank in range(Self.degree):
             var base = self.arena_bases[rank]
-            var sl_cos = topo.sliding_rope.cos.bound(base).as_ptr()
-            var sl_sin = topo.sliding_rope.sin.bound(base).as_ptr()
+            var sl_cos = layout.sliding_rope.cos.bound(base).as_ptr()
+            var sl_sin = layout.sliding_rope.sin.bound(base).as_ptr()
             init_rope_table[C.ROPE_HALF_SLIDING, C.MAX_SEQ_LEN](
                 sl_cos, sl_sin, 10000.0)
-            var fl_cos = topo.full_rope.cos.bound(base).as_ptr()
-            var fl_sin = topo.full_rope.sin.bound(base).as_ptr()
+            var fl_cos = layout.full_rope.cos.bound(base).as_ptr()
+            var fl_sin = layout.full_rope.sin.bound(base).as_ptr()
             init_rope_table_partial_strided[
                 C.ROPE_HALF_FULL, C.MAX_SEQ_LEN // Self.degree,
             ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, rank, Self.degree)
@@ -967,7 +967,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     def forward(
         mut self, token_id: Int, pos: Int,
     ) -> TemporalLogitsView[C.VOCAB_SIZE, Self.degree]:
-        ref topo = self.topology
+        ref layout = self.layout
         comptime shard_rows = Gemma4TailShapes[Self.degree].Embed.DATA_N
         comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
         comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
@@ -981,17 +981,17 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         comptime immut = ImmutOrigin(MutAnyOrigin)
         var src = RankBuffers[DType.bfloat16, Self.degree, immut](count=C.HIDDEN)
         var dst = RankBuffers[DType.bfloat16, Self.degree, MutAnyOrigin](count=C.HIDDEN)
-        var tail_base_owner = topo.tail.base(self.arena_bases[owner], 0)
-        var embed_row = topo.tail.proto.embed.bound(tail_base_owner).as_ptr()
+        var tail_base_owner = layout.tail.base(self.arena_bases[owner], 0)
+        var embed_row = layout.tail.proto.embed.bound(tail_base_owner).as_ptr()
             + local_row * C.HIDDEN
         for r in range(Self.degree):
             src.ptrs[r] = embed_row.as_immutable()
-            dst.ptrs[r] = topo.activations.x_main.bound(self.arena_bases[r]).as_ptr()
+            dst.ptrs[r] = layout.activations.x_main.bound(self.arena_bases[r]).as_ptr()
 
         dispatch_broadcast[BF16, Self.degree](src, dst, self.pools, src_rank=owner)
 
-        var x_main_ranks = topo.activations.x_main.state_ranks(ctx)
-        var x_res_ranks = topo.activations.x_residual.state_ranks(ctx)
+        var x_main_ranks = layout.activations.x_main.state_ranks(ctx)
+        var x_res_ranks = layout.activations.x_residual.state_ranks(ctx)
         var x_main = x_main_ranks[0]
         var x_residual = x_res_ranks[0]
 
@@ -1013,11 +1013,11 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             var body: BodyRefs[Self.degree]
             var layer_ctx: BindContext[Self.degree]
             if is_full_layer(i):
-                layer_ctx = ctx.with_layer(topo.full.base(self.arena_bases[0], fi))
-                body = topo.full.proto.body
+                layer_ctx = ctx.with_layer(layout.full.base(self.arena_bases[0], fi))
+                body = layout.full.proto.body
             else:
-                layer_ctx = ctx.with_layer(topo.sliding.base(self.arena_bases[0], si))
-                body = topo.sliding.proto.body
+                layer_ctx = ctx.with_layer(layout.sliding.base(self.arena_bases[0], si))
+                body = layout.sliding.proto.body
 
             dispatch_rms_norm[
                 hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
@@ -1027,10 +1027,10 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
             if is_full_layer(i):
                 dispatch_full_attention_qkv[degree=Self.degree](
-                    topo, ctx, pos, fi, self.scratch, self.pools)
+                    layout, ctx, pos, fi, self.scratch, self.pools)
             else:
                 dispatch_sliding_attention_qkv[degree=Self.degree](
-                    topo, ctx, pos, si, self.scratch, self.pools)
+                    layout, ctx, pos, si, self.scratch, self.pools)
 
             dispatch_allreduce[BF16, Self.degree](ar_src, ar_dst, self.pools)
 
@@ -1049,11 +1049,11 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             else:
                 si += 1
 
-        var tail_ctx = ctx.with_layer(topo.tail.base(self.arena_bases[0], 0))
+        var tail_ctx = ctx.with_layer(layout.tail.base(self.arena_bases[0], 0))
         dispatch_rms_norm[
             hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
         ](x_main_ranks, x_main_ranks,
-          topo.tail.proto.final_norm.ranks(tail_ctx),
+          layout.tail.proto.final_norm.ranks(tail_ctx),
           1, self.pools)
 
         comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
@@ -1067,7 +1067,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             cap=C.LOGIT_SOFTCAP,
         ](
             x_main_ranks,
-            topo.tail.proto.embed.ranks(tail_ctx),
+            layout.tail.proto.embed.ranks(tail_ctx),
             logits_ranks, self.pools,
         )
 
@@ -1077,8 +1077,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     @staticmethod
     def load(
         dir_path: Path,
-        numa: NumaInfo,
-        numa_topo: NumaTopology,
+        topo: NumaTopology,
         var pools: HeapMoveArray[Self.Pool],
     ) -> Optional[Self]:
         var shards = discover_shards(dir_path)
@@ -1088,23 +1087,23 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         print("found", len(shards), "shard(s)")
 
         var descs = List[WeightDesc]()
-        var topo = build_gemma4_plan[Self.degree](descs)
+        var layout = build_gemma4_plan[Self.degree](descs)
 
-        var size = topo.arena.host_arena_bytes()
+        var size = layout.arena.host_arena_bytes()
         print("allocating", size // (1024 * 1024), "MB x " + String(Self.degree) + " rank(s) (" +
-              String(topo.arena.distributed_bytes // (1024 * 1024)) + " MB weights + " +
-              String(topo.arena.state_bytes // (1024 * 1024)) + " MB state each)")
+              String(layout.arena.distributed_bytes // (1024 * 1024)) + " MB weights + " +
+              String(layout.arena.state_bytes // (1024 * 1024)) + " MB state each)")
 
         var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.degree)
         var arena_bases = List[Int]()
         for rank in range(Self.degree):
-            arenas.push(NumaArena[alignment=DEFAULT_ALIGNMENT](numa_topo[rank], size))
+            arenas.push(NumaArena[alignment=DEFAULT_ALIGNMENT](topo.node(rank), size))
             if not arenas[rank]:
-                print("arena allocation failed on node", numa_topo[rank])
+                print("arena allocation failed on node", topo.node(rank))
                 return None
             arena_bases.append(Int(arenas[rank].base.value()))
 
-        var load_result = load_weights_from_descs(descs, shards, arena_bases, numa, numa_topo)
+        var load_result = load_weights_from_descs(descs, shards, arena_bases, topo)
         if not load_result:
             print("weight loading failed")
             return None
@@ -1112,11 +1111,8 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         print("loaded", loaded.bytes_loaded // (1024 * 1024), "MB in", loaded.num_ops, "ops")
 
         for rank in range(Self.degree):
-            _ = arenas[rank].prefault(topo.arena.distributed_bytes, topo.arena.state_bytes)
+            _ = arenas[rank].prefault(layout.arena.distributed_bytes, layout.arena.state_bytes)
 
-        var model = Self(arenas^, pools^, topo)
+        var model = Self(arenas^, pools^, layout)
         model.model_init()
         return model^
-
-    def arena_base(self, rank: Int = 0) -> Int:
-        return Int(self.arenas[rank].base.value())
