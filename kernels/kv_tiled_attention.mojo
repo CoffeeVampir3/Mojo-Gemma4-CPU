@@ -99,7 +99,7 @@ struct FlashDecodeKernel[
 def dispatch_sliding_attention[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, tp: Int,
+    kv_stride: Int, window: Int, tp: Int, max_worker_count: Int = 128,
 ](
     q: Binding[Scalar[DType.bfloat16], tp],
     k_base: Binding[Scalar[DType.bfloat16], tp],
@@ -115,10 +115,14 @@ def dispatch_sliding_attention[
     var start_pos = pos - valid_len + 1
     comptime stride = FLASH_PARTIAL_STRIDE[num_q, head_dim]
     var buf = DispatchBuffer[
-        FlashDecodeKernel[head_dim, num_q, gqa_ratio, kv_stride, window]]()
+        FlashDecodeKernel[head_dim, num_q, gqa_ratio, kv_stride, window],
+        max_worker_count,
+    ]()
     for r in range(tp):
         var nw = recommended_workers(
-            valid_len * kv_stride * 2, pools[r].get_capacity())
+            valid_len * kv_stride * 2,
+            min(max_worker_count, pools[r].get_capacity()),
+        )
         for w_idx in range(nw):
             var wr = worker_range(valid_len, nw, w_idx)
             buf.slot()[] = FlashDecodeKernel[

@@ -245,7 +245,7 @@ def merge_workers[num_q: Int](data_bytes: Int, capacity: Int) -> Int:
 
 def dispatch_merge_flash_partials[
     P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, tp: Int,
+    head_dim: Int, num_q: Int, tp: Int, max_worker_count: Int = 128,
 ](
     output: Binding[Scalar[DType.bfloat16], tp],
     partials_buf: Binding[Scalar[DType.float32], tp],
@@ -254,7 +254,9 @@ def dispatch_merge_flash_partials[
     mut pools: HeapMoveArray[P],
     inline_max_bytes: Int = INLINE_MAX_BYTES,
 ):
-    var buf = DispatchBuffer[FinalizeKernel[head_dim, num_q]]()
+    var buf = DispatchBuffer[
+        FinalizeKernel[head_dim, num_q], max_worker_count,
+    ]()
     for r in range(tp):
         if num_sources[r] <= 0:
             memset_zero(output[r], num_q * head_dim)
@@ -266,7 +268,8 @@ def dispatch_merge_flash_partials[
                     output[r], partials_buf[r], partial_stride,
                     num_sources[r], h)
             continue
-        var nw = merge_workers[num_q](data_bytes, pools[r].get_capacity())
+        var nw = merge_workers[num_q](
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             FinalizeKernel[head_dim, num_q](
                 output[r], partials_buf[r], partial_stride,
@@ -278,6 +281,7 @@ def dispatch_merge_flash_partials[
 def dispatch_merge_context_flash_partials[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
+    max_worker_count: Int = 128,
 ](
     output: Binding[Scalar[DType.bfloat16], tp],
     partials_buf: Binding[Scalar[DType.float32], tp],
@@ -300,11 +304,13 @@ def dispatch_merge_context_flash_partials[
         return
 
     var buf = DispatchBuffer[
-        ContextFinalizeKernel[head_dim, num_q, local_num_q, tp, cfg_ro]]()
+        ContextFinalizeKernel[head_dim, num_q, local_num_q, tp, cfg_ro],
+        max_worker_count,
+    ]()
     for q_rank in range(tp):
         var data_bytes = total_sources * (head_dim + 2) * 4 * local_num_q
         var nw = merge_workers[local_num_q](
-            data_bytes, pools[q_rank].get_capacity())
+            data_bytes, min(max_worker_count, pools[q_rank].get_capacity()))
         tile_dispatch(buf,
             ContextFinalizeKernel[
                 head_dim, num_q, local_num_q, tp, cfg_ro

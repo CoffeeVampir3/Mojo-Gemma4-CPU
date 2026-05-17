@@ -46,7 +46,7 @@ def load_and_run[
     read token_ids: List[Int],
 ):
     var t0 = perf_counter_ns()
-    var model_opt = Gemma4[degree, P].load(
+    var model_opt = Gemma4[degree=degree, Pool=P].load(
         Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         return

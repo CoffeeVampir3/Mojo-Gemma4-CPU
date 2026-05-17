@@ -94,7 +94,7 @@ struct FullAttentionKernel[
 def dispatch_full_attention[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, tp: Int,
+    kv_stride: Int, tp: Int, max_worker_count: Int = 128,
 ](
     q: Binding[Scalar[DType.bfloat16], tp],
     k_base: Binding[Scalar[DType.bfloat16], tp],
@@ -107,12 +107,16 @@ def dispatch_full_attention[
     var result = InlineArray[Int, tp](fill=0)
 
     var buf = DispatchBuffer[
-        FullAttentionKernel[head_dim, num_q, gqa_ratio, kv_stride]]()
+        FullAttentionKernel[head_dim, num_q, gqa_ratio, kv_stride],
+        max_worker_count,
+    ]()
     for r in range(tp):
         if valid_len[r] <= 0:
             continue
         var nw = recommended_workers(
-            valid_len[r] * kv_stride * 2, pools[r].get_capacity())
+            valid_len[r] * kv_stride * 2,
+            min(max_worker_count, pools[r].get_capacity()),
+        )
         for w in range(nw):
             var wr = worker_range(valid_len[r], nw, w)
             buf.slot()[] = FullAttentionKernel[

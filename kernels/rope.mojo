@@ -129,7 +129,7 @@ def dispatch_rope_cache_write[
     half: Int, pair_stride: Int,
     num_q: Int, num_kv: Int, head_dim: Int,
     kv_cache_stride: Int, slot_mask: Int,
-    cache_degree: Int, tp: Int,
+    cache_degree: Int, tp: Int, max_worker_count: Int = 128,
 ](
     q: Binding[Scalar[DType.bfloat16], tp],
     k_src: Binding[Scalar[DType.bfloat16], tp],
@@ -155,9 +155,10 @@ def dispatch_rope_cache_write[
         return
 
     var data_bytes = seq_len * (num_q + 2 * num_kv) * head_dim * 2
-    var buf = DispatchBuffer[Kern]()
+    var buf = DispatchBuffer[Kern, max_worker_count]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             Kern(q[r], k_src[r], v_src[r],
                  k_cache[r], v_cache[r],

@@ -155,6 +155,7 @@ def make_reduce_config[
 def dispatch_allreduce[
     P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
     E: Encoding, tp: Int, Accum: DType = DType.float32,
+    max_worker_count: Int = 128,
 ](
     src: RankBuffers[E.DTYPE, tp, src_origin],
     output: RankBuffers[E.DTYPE, tp, dst_origin],
@@ -176,19 +177,28 @@ def dispatch_allreduce[
         return
 
     var data_bytes = src.count * E.ELEMENT_BYTES
-    var reduce_buf = DispatchBuffer[ReduceStoreKernel[E, tp, src_origin, cfg_ro, Accum]]()
+    var reduce_buf = DispatchBuffer[
+        ReduceStoreKernel[E, tp, src_origin, cfg_ro, Accum],
+        max_worker_count,
+    ]()
     for r in range(tp):
         var rank_start = cfg.chunk * r
         var rank_count = rank_chunk_count[tp](cfg.chunk, cfg.rem, r)
-        var nw = recommended_workers(rank_count * E.ELEMENT_BYTES, pools[r].get_capacity())
+        var nw = recommended_workers(
+            rank_count * E.ELEMENT_BYTES,
+            min(max_worker_count, pools[r].get_capacity()),
+        )
         tile_dispatch(reduce_buf,
             ReduceStoreKernel[E, tp, src_origin, cfg_ro, Accum](config, r, 0, 0),
             pools[r], rank_count, rank_start, nw)
     join_all[tp](pools)
 
-    var gather_buf = DispatchBuffer[GatherKernel[E, tp, src_origin, cfg_ro]]()
+    var gather_buf = DispatchBuffer[
+        GatherKernel[E, tp, src_origin, cfg_ro], max_worker_count,
+    ]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(gather_buf,
             GatherKernel[E, tp, src_origin, cfg_ro](config, r, 0, 0),
             pools[r], src.count, num_workers=nw)
@@ -196,7 +206,7 @@ def dispatch_allreduce[
 
 def dispatch_broadcast[
     P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
-    E: Encoding, tp: Int,
+    E: Encoding, tp: Int, max_worker_count: Int = 128,
 ](
     src: RankBuffers[E.DTYPE, tp, src_origin],
     dst: RankBuffers[E.DTYPE, tp, dst_origin],
@@ -221,10 +231,13 @@ def dispatch_broadcast[
         return
 
     var data_bytes = src.count * E.ELEMENT_BYTES
-    var buf = DispatchBuffer[CopyKernel[E.DTYPE, src_origin]]()
+    var buf = DispatchBuffer[
+        CopyKernel[E.DTYPE, src_origin], max_worker_count,
+    ]()
     for r in range(tp):
         if r != src_rank:
-            var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+            var nw = recommended_workers(
+                data_bytes, min(max_worker_count, pools[r].get_capacity()))
             tile_dispatch(buf,
                 CopyKernel[E.DTYPE, src_origin](
                     dst[r].as_any_origin(), src[src_rank], 0, 0),

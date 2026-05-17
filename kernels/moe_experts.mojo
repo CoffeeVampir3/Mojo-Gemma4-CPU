@@ -209,7 +209,7 @@ struct Phase1GateUpKernel[
 def dispatch_phase1_gate_up[
     P: BurstThreadPool, //,
     hidden: Int, gate_up_fused: Int, intermediate: Int,
-    experts_per_rank: Int, tp: Int,
+    experts_per_rank: Int, tp: Int, max_worker_count: Int = 128,
 ](
     x_normed: Binding[Scalar[DType.bfloat16], tp],
     expert_offset: Binding[Scalar[DType.int32], tp],
@@ -223,10 +223,13 @@ def dispatch_phase1_gate_up[
     comptime total_units = experts_per_rank * n_tiles
 
     var buf = DispatchBuffer[
-        Phase1GateUpKernel[hidden, gate_up_fused, intermediate, experts_per_rank]
+        Phase1GateUpKernel[
+            hidden, gate_up_fused, intermediate, experts_per_rank,
+        ],
+        max_worker_count,
     ]()
     for r in range(tp):
-        var cap = pools[r].get_capacity()
+        var cap = min(max_worker_count, pools[r].get_capacity())
         var nw = min(cap, total_units)
         for w in range(nw):
             var wr = worker_range(total_units, nw, w)
@@ -370,6 +373,7 @@ struct Phase2DownKernel[
 def dispatch_phase2_down[
     P: BurstThreadPool, //,
     hidden: Int, intermediate: Int, experts_per_rank: Int, tp: Int,
+    max_worker_count: Int = 128,
 ](
     expert_offset: Binding[Scalar[DType.int32], tp],
     routes: Binding[SparseRoute, tp],
@@ -383,10 +387,11 @@ def dispatch_phase2_down[
     comptime hidden_strides = hidden // W
 
     var buf = DispatchBuffer[
-        Phase2DownKernel[hidden, intermediate, experts_per_rank]
+        Phase2DownKernel[hidden, intermediate, experts_per_rank],
+        max_worker_count,
     ]()
     for r in range(tp):
-        var cap = pools[r].get_capacity()
+        var cap = min(max_worker_count, pools[r].get_capacity())
         var nw = min(cap, hidden_strides)
         for w in range(nw):
             var sr = worker_range(hidden_strides, nw, w)

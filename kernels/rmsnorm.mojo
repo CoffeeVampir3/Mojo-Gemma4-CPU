@@ -129,7 +129,7 @@ comptime NORM_INLINE_TOKENS = 16
 def dispatch_rms_norm[
     P: BurstThreadPool, //,
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
-    tp: Int, scaled: Bool = True,
+    tp: Int, scaled: Bool = True, max_worker_count: Int = 128,
 ](
     src: Binding[Scalar[DType.bfloat16], tp],
     dst: Binding[Scalar[DType.bfloat16], tp],
@@ -145,9 +145,13 @@ def dispatch_rms_norm[
         return
 
     var data_bytes = count * hidden * 2
-    var buf = DispatchBuffer[RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled]]()
+    var buf = DispatchBuffer[
+        RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled],
+        max_worker_count,
+    ]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled](
                 src[r], dst[r], weight[r], 0, 0),
@@ -182,7 +186,7 @@ struct ScaledNormKernel[
 def dispatch_rms_norm_qkv_heads[
     P: BurstThreadPool, //,
     head_dim: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
-    num_q: Int, num_kv: Int, tp: Int,
+    num_q: Int, num_kv: Int, tp: Int, max_worker_count: Int = 128,
 ](
     q_src: Binding[Scalar[DType.bfloat16], tp],
     q_dst: Binding[Scalar[DType.bfloat16], tp],
@@ -215,9 +219,9 @@ def dispatch_rms_norm_qkv_heads[
     comptime VQChain = Chain[VK, QK]
     comptime VQKChain = Chain[VQChain, KK]
 
-    var buf = DispatchBuffer[VQKChain]()
+    var buf = DispatchBuffer[VQKChain, max_worker_count]()
     for r in range(tp):
-        var nw = pools[r].get_capacity()
+        var nw = min(max_worker_count, pools[r].get_capacity())
         tile_dispatch(buf,
             VQKChain(
                 VQChain(
@@ -233,7 +237,7 @@ def dispatch_rms_norm_qkv_heads[
 def fused_norm_residual_add[
     P: BurstThreadPool, //,
     hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
-    tp: Int,
+    tp: Int, max_worker_count: Int = 128,
 ](
     src: Binding[Scalar[DType.bfloat16], tp],
     residual: Binding[Scalar[DType.bfloat16], tp],
@@ -251,9 +255,13 @@ def fused_norm_residual_add[
         return
 
     var data_bytes = seq_len * hidden * 4
-    var buf = DispatchBuffer[NormResidualAddTokenKernel[hidden, sqrt_n, n_eps]]()
+    var buf = DispatchBuffer[
+        NormResidualAddTokenKernel[hidden, sqrt_n, n_eps],
+        max_worker_count,
+    ]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             NormResidualAddTokenKernel[hidden, sqrt_n, n_eps](
                 src[r], residual[r], dst[r], weight[r], 0, 0),

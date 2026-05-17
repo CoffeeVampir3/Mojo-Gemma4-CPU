@@ -9,7 +9,7 @@ from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.helpers import (
-    RankBuffers, Binding, ArenaBases, MAX_WORKERS,
+    RankBuffers, Binding, ArenaBases,
 )
 from kernels.reductions import dispatch_broadcast, dispatch_allreduce
 from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
@@ -235,7 +235,7 @@ struct Gemma4Layout[degree: Int](Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Gemma4SlidingScratch[degree: Int](
+struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     ScratchIsland, Copyable, ImplicitlyCopyable
 ):
     comptime S = Gemma4Shapes[Self.degree]
@@ -264,12 +264,12 @@ struct Gemma4SlidingScratch[degree: Int](
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Scalar[DType.float32], 128 * Self.flash_stride,
+        Scalar[DType.float32], Self.max_worker_count * Self.flash_stride,
     ]
 
 
 @fieldwise_init
-struct Gemma4FullScratch[degree: Int](
+struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
     ScratchIsland, Copyable, ImplicitlyCopyable
 ):
     comptime S = Gemma4Shapes[Self.degree]
@@ -299,7 +299,7 @@ struct Gemma4FullScratch[degree: Int](
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Scalar[DType.float32], 128 * Self.partial_stride,
+        Scalar[DType.float32], Self.max_worker_count * Self.partial_stride,
     ]
 
     var q_local_band: ScratchPhase["merge_partials", "o_proj"]
@@ -309,7 +309,7 @@ struct Gemma4FullScratch[degree: Int](
 
 
 @fieldwise_init
-struct Gemma4FfnMoeScratch[degree: Int](
+struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     ScratchIsland, Copyable, ImplicitlyCopyable
 ):
     comptime S = Gemma4Shapes[Self.degree]
@@ -340,7 +340,7 @@ struct Gemma4FfnMoeScratch[degree: Int](
         "router_sharded", "router_sharded",
     ]
     var moe_router_scaled: ScratchBuffer[
-        Scalar[DType.float32], MAX_WORKERS * C.HIDDEN,
+        Scalar[DType.float32], Self.max_worker_count * C.HIDDEN,
     ]
 
     var router_cands: ScratchPhase["router_sharded", "merge_cands"]
@@ -378,7 +378,7 @@ struct Gemma4FfnMoeScratch[degree: Int](
     ]
     var moe_gate_scratch: ScratchBuffer[
         Scalar[DType.float32],
-        MAX_WORKERS * PHASE1_MR * 2 * PHASE1_TILE_J,
+        Self.max_worker_count * PHASE1_MR * 2 * PHASE1_TILE_J,
     ]
 
     var phase2_accum: ScratchPhase["phase2_down", "phase2_down"]
@@ -408,28 +408,37 @@ struct Gemma4HeadScratch[degree: Int](
 
 
 @fieldwise_init
-struct Gemma4ForwardScratch[degree: Int](Copyable, ImplicitlyCopyable):
-    var sliding: Gemma4SlidingScratch[Self.degree]
-    var full: Gemma4FullScratch[Self.degree]
-    var ffn: Gemma4FfnMoeScratch[Self.degree]
+struct Gemma4ForwardScratch[
+    degree: Int, max_worker_count: Int = 128,
+](Copyable, ImplicitlyCopyable):
+    var sliding: Gemma4SlidingScratch[Self.degree, Self.max_worker_count]
+    var full: Gemma4FullScratch[Self.degree, Self.max_worker_count]
+    var ffn: Gemma4FfnMoeScratch[Self.degree, Self.max_worker_count]
     var head: Gemma4HeadScratch[Self.degree]
 
 
-def calculate_peak_scratch[degree: Int]() -> Int:
-    return aggregate_scratch_peak[Gemma4ForwardScratch[degree]]()
+def calculate_peak_scratch[degree: Int, max_worker_count: Int = 128]() -> Int:
+    return aggregate_scratch_peak[
+        Gemma4ForwardScratch[degree, max_worker_count],
+    ]()
 
 
-comptime Gemma4ScratchPool[degree: Int] = TemporalScratchPool[
-    calculate_peak_scratch[degree](),
+comptime Gemma4ScratchPool[
+    degree: Int, max_worker_count: Int = 128,
+] = TemporalScratchPool[
+    calculate_peak_scratch[degree, max_worker_count](),
 ]
 
 
-def build_gemma4_plan[degree: Int](mut descs: List[WeightDesc]) -> Gemma4Layout[degree]:
+def build_gemma4_plan[
+    degree: Int, max_worker_count: Int = 128,
+](mut descs: List[WeightDesc]) -> Gemma4Layout[degree]:
     comptime assert SlidingAttentionContract[degree], "sliding attention distribution contract failed"
     comptime assert FullAttentionContract[degree], "full attention distribution contract failed"
     comptime assert DenseMlpContract[degree], "dense MLP distribution contract failed"
     comptime assert MoeContract[degree], "MoE distribution contract failed"
     comptime assert LmHeadContract[degree], "LM head distribution contract failed"
+    comptime assert max_worker_count > 0, "max_worker_count must be positive"
 
     var sl_proto = SlidingLayerRefs[degree]()
     var sl_stride = stamp_offsets(sl_proto)
@@ -476,7 +485,7 @@ def build_gemma4_plan[degree: Int](mut descs: List[WeightDesc]) -> Gemma4Layout[
     var activations = ActivationSlots()
     state_cursor = stamp_offsets(activations, state_cursor)
 
-    var scratch_cap = calculate_peak_scratch[degree]()
+    var scratch_cap = calculate_peak_scratch[degree, max_worker_count]()
     state_cursor = align_up(state_cursor)
     var scratch_off = state_cursor
     state_cursor = align_up(state_cursor + scratch_cap)
@@ -520,13 +529,13 @@ def full_valid_count(rank: Int, pos: Int, degree: Int) -> Int:
 
 
 def dispatch_sliding_attention_qkv[
-    P: BurstThreadPool, //, degree: Int,
+    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
 ](
     layout: Gemma4Layout[degree],
     ctx: BindContext[degree],
     pos: Int,
     layer_idx: Int,
-    mut scratch: Gemma4ScratchPool[degree],
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: HeapMoveArray[P],
 ):
     comptime S = Gemma4Shapes[degree]
@@ -540,7 +549,7 @@ def dispatch_sliding_attention_qkv[
     comptime rope_half = C.ROPE_HALF_SLIDING
     comptime kv_cols = kv_rows
     comptime flash_stride = FLASH_PARTIAL_STRIDE[num_q_heads, head_dim]
-    comptime Island = Gemma4SlidingScratch[degree]
+    comptime Island = Gemma4SlidingScratch[degree, max_worker_count]
 
     var attn_ctx = ctx.with_layer(layout.sliding.base(ctx.arena_bases[0], layer_idx))
     var attn = layout.sliding.proto.attn
@@ -552,6 +561,7 @@ def dispatch_sliding_attention_qkv[
 
     dispatch_gemv_chained_qkv[
         q_rows=q_rows, kv_rows=kv_rows, cols=C.HIDDEN, tp=degree,
+        max_worker_count=max_worker_count,
     ](xs,
       attn.q_proj.binding(attn_ctx),
       attn.k_proj.binding(attn_ctx),
@@ -561,6 +571,7 @@ def dispatch_sliding_attention_qkv[
     dispatch_rms_norm_qkv_heads[
         head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
         num_q=num_q_heads, num_kv=num_kv_heads, tp=degree,
+        max_worker_count=max_worker_count,
     ](q_outs, q_outs, k_outs, k_outs, v_outs, v_outs,
       attn.q_norm.binding(attn_ctx),
       attn.k_norm.binding(attn_ctx),
@@ -575,6 +586,7 @@ def dispatch_sliding_attention_qkv[
         num_q=num_q_heads, num_kv=num_kv_heads,
         head_dim=head_dim, kv_cache_stride=kv_cols,
         slot_mask=C.SLIDING_WINDOW - 1, cache_degree=1, tp=degree,
+        max_worker_count=max_worker_count,
     ](q_outs, k_outs, v_outs,
       k_kv, v_kv,
       layout.sliding_rope.cos.state_binding(ctx),
@@ -587,25 +599,32 @@ def dispatch_sliding_attention_qkv[
         head_dim=head_dim, num_q=num_q_heads,
         gqa_ratio=num_q_heads // num_kv_heads, kv_stride=kv_cols,
         window=C.SLIDING_WINDOW, tp=degree,
+        max_worker_count=max_worker_count,
     ](q_outs, k_kv, v_kv, partials, pos, sliding_valid_len(pos), pools)
 
-    dispatch_merge_flash_partials[head_dim, num_q_heads, tp=degree](
+    dispatch_merge_flash_partials[
+        head_dim, num_q_heads, tp=degree,
+        max_worker_count=max_worker_count,
+    ](
         q_outs, partials, flash_stride, nws, pools)
 
-    dispatch_gemv[rows=C.HIDDEN, cols=q_rows, tp=degree](
+    dispatch_gemv[
+        rows=C.HIDDEN, cols=q_rows, tp=degree,
+        max_worker_count=max_worker_count,
+    ](
         q_outs,
         attn.o_proj.binding(attn_ctx),
         xs, pools)
 
 
 def dispatch_full_attention_qkv[
-    P: BurstThreadPool, //, degree: Int,
+    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
 ](
     layout: Gemma4Layout[degree],
     ctx: BindContext[degree],
     pos: Int,
     layer_idx: Int,
-    mut scratch: Gemma4ScratchPool[degree],
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: HeapMoveArray[P],
 ):
     comptime S = Gemma4Shapes[degree]
@@ -622,7 +641,7 @@ def dispatch_full_attention_qkv[
     comptime pair_stride = head_dim // 2
     comptime kv_cols = k_rows
     comptime partial_stride = PARTIAL_STRIDE[num_q_heads, head_dim]
-    comptime Island = Gemma4FullScratch[degree]
+    comptime Island = Gemma4FullScratch[degree, max_worker_count]
 
     var attn_ctx = ctx.with_layer(layout.full.base(ctx.arena_bases[0], layer_idx))
     var attn = layout.full.proto.attn
@@ -632,14 +651,21 @@ def dispatch_full_attention_qkv[
     var v_outs = k_outs.shifted(k_rows)
     var xs = layout.activations.x_residual.state_binding(ctx)
 
-    dispatch_gemv[rows=q_rows, cols=C.HIDDEN, tp=degree](
+    dispatch_gemv[
+        rows=q_rows, cols=C.HIDDEN, tp=degree,
+        max_worker_count=max_worker_count,
+    ](
         xs, attn.q_proj.binding(attn_ctx), q_outs, pools)
-    dispatch_gemv[rows=k_rows, cols=C.HIDDEN, tp=degree](
+    dispatch_gemv[
+        rows=k_rows, cols=C.HIDDEN, tp=degree,
+        max_worker_count=max_worker_count,
+    ](
         xs, attn.k_proj.binding(attn_ctx), k_outs, pools)
 
     dispatch_rms_norm_qkv_heads[
         head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
         num_q=num_q_heads, num_kv=num_kv_heads, tp=degree,
+        max_worker_count=max_worker_count,
     ](q_outs, q_outs, k_outs, k_outs, k_outs, v_outs,
       attn.q_norm.binding(attn_ctx),
       attn.k_norm.binding(attn_ctx),
@@ -658,6 +684,7 @@ def dispatch_full_attention_qkv[
         num_q=num_q_heads, num_kv=num_kv_heads,
         head_dim=head_dim, kv_cache_stride=kv_cols,
         slot_mask=-1, cache_degree=degree, tp=degree,
+        max_worker_count=max_worker_count,
     ](q_outs, k_outs, v_outs,
       k_kv, v_kv,
       layout.full_rope.cos.state_binding(rope_owner_ctx),
@@ -673,29 +700,34 @@ def dispatch_full_attention_qkv[
 
     var nws = dispatch_full_attention[
         head_dim=head_dim, num_q=num_q_heads,
-        gqa_ratio=C.NUM_HEADS // C.NUM_KV_HEADS_FULL, kv_stride=kv_cols, tp=degree,
+        gqa_ratio=C.NUM_HEADS // C.NUM_KV_HEADS_FULL, kv_stride=kv_cols,
+        tp=degree, max_worker_count=max_worker_count,
     ](q_outs, k_kv, v_kv, partials, valid_lens, pools)
 
     dispatch_merge_context_flash_partials[
         head_dim=head_dim, num_q=num_q_heads,
         local_num_q=local_num_q_heads, tp=degree,
+        max_worker_count=max_worker_count,
     ](q_local_outs, partials, partial_stride, nws, pools)
 
-    dispatch_gemv[rows=C.HIDDEN, cols=local_q_rows, tp=degree](
+    dispatch_gemv[
+        rows=C.HIDDEN, cols=local_q_rows, tp=degree,
+        max_worker_count=max_worker_count,
+    ](
         q_local_outs,
         attn.o_proj.binding(attn_ctx),
         xs, pools)
 
 
 def dispatch_moe[
-    P: BurstThreadPool, //, degree: Int,
+    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
 ](
     body: BodyRefs[degree],
     ctx: BindContext[degree],
     x_input: BF16Bind[degree],
     moe_out: BF16Bind[degree],
     seq_len: Int,
-    mut scratch: Gemma4ScratchPool[degree],
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: HeapMoveArray[P],
 ):
     comptime experts_per_rank = C.NUM_EXPERTS // degree
@@ -703,7 +735,7 @@ def dispatch_moe[
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
     comptime rms_eps = Scalar[DType.float32](C.RMS_NORM_EPS)
     comptime immut = ImmutOrigin(MutAnyOrigin)
-    comptime Ffn = Gemma4FfnMoeScratch[degree]
+    comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
 
     var per_expert_scale_ptr = body.router_pes.at(ctx.layer_base)
 
@@ -721,6 +753,7 @@ def dispatch_moe[
     dispatch_router_sharded[
         hidden=C.HIDDEN, experts_per_rank=experts_per_rank,
         top_k=C.TOP_K, tp=degree, rms_eps=rms_eps,
+        max_worker_count=max_worker_count,
     ](x_input,
       body.router_proj.binding(ctx),
       body.router_scale.binding(ctx),
@@ -731,6 +764,7 @@ def dispatch_moe[
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
     ](x_input, x_normed,
       body.pre_ffn_norm_2.binding(ctx), seq_len, pools)
 
@@ -741,6 +775,7 @@ def dispatch_moe[
         hidden=C.HIDDEN, gate_up_fused=C.MOE_GATE_UP_FUSED,
         intermediate=C.MOE_INTERMEDIATE,
         experts_per_rank=experts_per_rank, tp=degree,
+        max_worker_count=max_worker_count,
     ](x_normed, expert_offset, routes,
       body.experts_gate_up.binding(ctx),
       gate_scratch, hidden_bucket, pools)
@@ -748,6 +783,7 @@ def dispatch_moe[
     dispatch_phase2_down[
         hidden=C.HIDDEN, intermediate=C.MOE_INTERMEDIATE,
         experts_per_rank=experts_per_rank, tp=degree,
+        max_worker_count=max_worker_count,
     ](expert_offset, routes, hidden_bucket,
       body.experts_down.binding(ctx),
       moe_accum, moe_out, seq_len, pools)
@@ -759,25 +795,27 @@ def dispatch_moe[
     for r in range(degree):
         ar_src.ptrs[r] = moe_out[r].as_immutable()
         ar_dst.ptrs[r] = moe_out[r]
-    dispatch_allreduce[BF16, degree](ar_src, ar_dst, pools)
+    dispatch_allreduce[
+        BF16, degree, max_worker_count=max_worker_count,
+    ](ar_src, ar_dst, pools)
 
 
 def dispatch_ffn[
-    P: BurstThreadPool, //, degree: Int,
+    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
 ](
     body: BodyRefs[degree],
     ctx: BindContext[degree],
     x_main: BF16Bind[degree],
     x_residual: BF16Bind[degree],
     seq_len: Int,
-    mut scratch: Gemma4ScratchPool[degree],
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: HeapMoveArray[P],
 ):
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
     comptime intermediate_per_rank = Gemma4Shapes[degree].GateUp.DATA_N
     comptime immut = ImmutOrigin(MutAnyOrigin)
-    comptime Ffn = Gemma4FfnMoeScratch[degree]
+    comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
 
     var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_base)
 
@@ -787,26 +825,31 @@ def dispatch_ffn[
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
     ](x_main, x_residual,
       body.pre_ffn_norm.binding(ctx), seq_len, pools)
 
     dispatch_gemv[
         rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
+        max_worker_count=max_worker_count,
     ](x_residual, body.gate_proj.binding(ctx), gate, pools)
 
     dispatch_gemv[
         rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
+        max_worker_count=max_worker_count,
     ](x_residual, body.up_proj.binding(ctx), up, pools)
 
     dispatch_gelu_gate_up[
         intermediate=intermediate_per_rank, tp=degree,
+        max_worker_count=max_worker_count,
     ](gate, up, gate, seq_len, pools)
 
-    dispatch_moe[degree=degree](
+    dispatch_moe[degree=degree, max_worker_count=max_worker_count](
         body, ctx, x_main, x_residual, seq_len, scratch, pools)
 
     dispatch_gemv[
         rows=C.HIDDEN, cols=intermediate_per_rank, tp=degree,
+        max_worker_count=max_worker_count,
     ](gate, body.down_proj.binding(ctx), dense_out, pools)
 
     var dense_ar_src = RankBuffers[DType.bfloat16, degree, immut](
@@ -816,34 +859,42 @@ def dispatch_ffn[
     for r in range(degree):
         dense_ar_src.ptrs[r] = dense_out[r].as_immutable()
         dense_ar_dst.ptrs[r] = dense_out[r]
-    dispatch_allreduce[BF16, degree](dense_ar_src, dense_ar_dst, pools)
+    dispatch_allreduce[
+        BF16, degree, max_worker_count=max_worker_count,
+    ](dense_ar_src, dense_ar_dst, pools)
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
     ](dense_out, dense_out,
       body.post_ffn_norm_1.binding(ctx), seq_len, pools)
 
     fused_norm_residual_add[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
     ](x_residual, dense_out, dense_out,
       body.post_ffn_norm_2.binding(ctx), seq_len, pools)
 
     fused_norm_residual_add[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
     ](dense_out, x_main, x_main,
       body.post_ffn_norm.binding(ctx), seq_len, pools)
 
     var ls_value = layer_scalar_ptr[0].cast[DType.float32]()
     dispatch_scalar_mul[
-        hidden=C.HIDDEN, tp=degree,
+        hidden=C.HIDDEN, tp=degree, max_worker_count=max_worker_count,
     ](x_main, x_main, ls_value, seq_len, pools)
 
 
-struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
+struct Gemma4[
+    degree: Int, max_worker_count: Int = 128,
+    Pool: BurstThreadPool = BurstPool[],
+](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[Self.Pool]
     var layout: Gemma4Layout[Self.degree]
-    var scratch: Gemma4ScratchPool[Self.degree]
+    var scratch: Gemma4ScratchPool[Self.degree, Self.max_worker_count]
     var arena_bases: ArenaBases[Self.degree]
 
     def __init__(out self,
@@ -857,7 +908,9 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         self.layout = layout.bind(self.arena_bases[0])
         self.arenas = arenas^
         self.pools = pools^
-        self.scratch = Gemma4ScratchPool[Self.degree](
+        self.scratch = Gemma4ScratchPool[
+            Self.degree, Self.max_worker_count,
+        ](
             self.layout.arena.scratch_base())
 
     def model_init(mut self):
@@ -926,11 +979,14 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             src.ptrs[r] = embed_row.as_immutable()
             dst.ptrs[r] = x_main_ranks[r]
 
-        dispatch_broadcast[BF16, Self.degree](src, dst, self.pools, src_rank=owner)
+        dispatch_broadcast[
+            BF16, Self.degree, max_worker_count=Self.max_worker_count,
+        ](src, dst, self.pools, src_rank=owner)
 
         comptime embed_scale = sqrt[DType.float32, 1](C.HIDDEN).cast[DType.bfloat16]().cast[DType.float32]()
         dispatch_scalar_mul[
             hidden=C.HIDDEN, tp=Self.degree,
+            max_worker_count=Self.max_worker_count,
         ](x_main_ranks, x_main_ranks, embed_scale, 1, self.pools)
 
         var ar_src = RankBuffers[DType.bfloat16, Self.degree, immut](count=C.HIDDEN)
@@ -952,27 +1008,39 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 body = layout.sliding.proto.body
 
             dispatch_rms_norm[
-                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
+                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+                tp=Self.degree, max_worker_count=Self.max_worker_count,
             ](x_main_ranks, x_res_ranks,
               body.input_norm.binding(layer_ctx),
               1, self.pools)
 
             if is_full_layer(i):
-                dispatch_full_attention_qkv[degree=Self.degree](
+                dispatch_full_attention_qkv[
+                    degree=Self.degree,
+                    max_worker_count=Self.max_worker_count,
+                ](
                     layout, ctx, pos, fi, self.scratch, self.pools)
             else:
-                dispatch_sliding_attention_qkv[degree=Self.degree](
+                dispatch_sliding_attention_qkv[
+                    degree=Self.degree,
+                    max_worker_count=Self.max_worker_count,
+                ](
                     layout, ctx, pos, si, self.scratch, self.pools)
 
-            dispatch_allreduce[BF16, Self.degree](ar_src, ar_dst, self.pools)
+            dispatch_allreduce[
+                BF16, Self.degree, max_worker_count=Self.max_worker_count,
+            ](ar_src, ar_dst, self.pools)
 
             fused_norm_residual_add[
-                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
+                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+                tp=Self.degree, max_worker_count=Self.max_worker_count,
             ](x_res_ranks, x_main_ranks, x_main_ranks,
               body.post_attn_norm.binding(layer_ctx),
               1, self.pools)
 
-            dispatch_ffn[degree=Self.degree](
+            dispatch_ffn[
+                degree=Self.degree, max_worker_count=Self.max_worker_count,
+            ](
                 body, layer_ctx, x_main_ranks, x_res_ranks, 1,
                 self.scratch, self.pools)
 
@@ -983,7 +1051,8 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
         var tail_ctx = ctx.with_layer(layout.tail.base(self.arena_bases[0], 0))
         dispatch_rms_norm[
-            hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
+            hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+            tp=Self.degree, max_worker_count=Self.max_worker_count,
         ](x_main_ranks, x_main_ranks,
           layout.tail.proto.final_norm.binding(tail_ctx),
           1, self.pools)
@@ -995,6 +1064,7 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         dispatch_gemv_softcap[
             rows=vocab_per_rank, cols=C.HIDDEN, tp=Self.degree,
             cap=C.LOGIT_SOFTCAP,
+            max_worker_count=Self.max_worker_count,
         ](x_main_ranks, layout.tail.proto.embed.binding(tail_ctx), logits, self.pools)
 
         return TemporalLogitsView[C.VOCAB_SIZE, Self.degree](
@@ -1013,7 +1083,9 @@ struct Gemma4[degree: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         print("found", len(shards), "shard(s)")
 
         var descs = List[WeightDesc]()
-        var layout = build_gemma4_plan[Self.degree](descs)
+        var layout = build_gemma4_plan[
+            Self.degree, Self.max_worker_count,
+        ](descs)
 
         var size = layout.arena.host_arena_bytes()
         print("allocating", size // (1024 * 1024), "MB x " + String(Self.degree) + " rank(s) (" +

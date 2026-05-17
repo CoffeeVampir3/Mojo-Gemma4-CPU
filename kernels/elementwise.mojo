@@ -50,7 +50,8 @@ comptime GELU_GATE_UP_INLINE_TOKENS = 16
 
 
 def dispatch_gelu_gate_up[
-    P: BurstThreadPool, //, intermediate: Int, tp: Int,
+    P: BurstThreadPool, //,
+    intermediate: Int, tp: Int, max_worker_count: Int = 128,
 ](
     gate: Binding[Scalar[DType.bfloat16], tp],
     up: Binding[Scalar[DType.bfloat16], tp],
@@ -67,9 +68,12 @@ def dispatch_gelu_gate_up[
         return
 
     var data_bytes = seq_len * intermediate * 6
-    var buf = DispatchBuffer[GeluGateUpTokenKernel[intermediate]]()
+    var buf = DispatchBuffer[
+        GeluGateUpTokenKernel[intermediate], max_worker_count,
+    ]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             GeluGateUpTokenKernel[intermediate](
                 gate[r], up[r], dst[r], 0, 0),
@@ -111,7 +115,8 @@ comptime SCALAR_MUL_INLINE_TOKENS = 16
 
 
 def dispatch_scalar_mul[
-    P: BurstThreadPool, //, hidden: Int, tp: Int,
+    P: BurstThreadPool, //,
+    hidden: Int, tp: Int, max_worker_count: Int = 128,
 ](
     src: Binding[Scalar[DType.bfloat16], tp],
     dst: Binding[Scalar[DType.bfloat16], tp],
@@ -128,9 +133,12 @@ def dispatch_scalar_mul[
         return
 
     var data_bytes = seq_len * hidden * 4
-    var buf = DispatchBuffer[ScalarMulTokenKernel[hidden]]()
+    var buf = DispatchBuffer[
+        ScalarMulTokenKernel[hidden], max_worker_count,
+    ]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             ScalarMulTokenKernel[hidden](
                 src[r], dst[r], scalar, 0, 0),

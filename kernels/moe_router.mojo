@@ -127,7 +127,7 @@ comptime ROUTER_INLINE_TOKENS = 16
 def dispatch_router_sharded[
     P: BurstThreadPool, //,
     hidden: Int, experts_per_rank: Int, top_k: Int, tp: Int,
-    rms_eps: Scalar[DType.float32],
+    rms_eps: Scalar[DType.float32], max_worker_count: Int = 128,
 ](
     x: Binding[Scalar[DType.bfloat16], tp],
     router_proj: Binding[Scalar[DType.bfloat16], tp],
@@ -154,10 +154,11 @@ def dispatch_router_sharded[
 
     var data_bytes = seq_len * (hidden + experts_per_rank * hidden) * 2
     var buf = DispatchBuffer[
-        RouterShardedKernel[hidden, experts_per_rank, top_k, rms_eps]
+        RouterShardedKernel[hidden, experts_per_rank, top_k, rms_eps],
+        max_worker_count,
     ]()
     for r in range(tp):
-        var cap = pools[r].get_capacity()
+        var cap = min(max_worker_count, pools[r].get_capacity())
         var nw = recommended_workers(data_bytes, cap)
         nw = min(nw, seq_len)
         for w in range(nw):

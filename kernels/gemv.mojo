@@ -93,7 +93,7 @@ comptime GEMV_INLINE_ROWS = 4
 
 def dispatch_gemv[
     P: BurstThreadPool, //,
-    rows: Int, cols: Int, tp: Int,
+    rows: Int, cols: Int, tp: Int, max_worker_count: Int = 128,
 ](
     x: Binding[Scalar[DType.bfloat16], tp],
     weight: Binding[Scalar[DType.bfloat16], tp],
@@ -107,9 +107,10 @@ def dispatch_gemv[
             gemv_range[rows, cols](x[r], weight[r], output[r], 0, rows)
         return
 
-    var buf = DispatchBuffer[GemvKernel[rows, cols]]()
+    var buf = DispatchBuffer[GemvKernel[rows, cols], max_worker_count]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             GemvKernel[rows, cols](x[r], weight[r], output[r], 0, 0),
             pools[r], rows, num_workers=nw)
@@ -137,6 +138,7 @@ struct GemvSoftcapKernel[
 def dispatch_gemv_softcap[
     P: BurstThreadPool, //,
     rows: Int, cols: Int, tp: Int, cap: Float64,
+    max_worker_count: Int = 128,
 ](
     x: Binding[Scalar[DType.bfloat16], tp],
     weight: Binding[Scalar[DType.bfloat16], tp],
@@ -151,9 +153,12 @@ def dispatch_gemv_softcap[
                 x[r], weight[r], output[r], 0, rows)
         return
 
-    var buf = DispatchBuffer[GemvSoftcapKernel[rows, cols, cap]]()
+    var buf = DispatchBuffer[
+        GemvSoftcapKernel[rows, cols, cap], max_worker_count,
+    ]()
     for r in range(tp):
-        var nw = recommended_workers(data_bytes, pools[r].get_capacity())
+        var nw = recommended_workers(
+            data_bytes, min(max_worker_count, pools[r].get_capacity()))
         tile_dispatch(buf,
             GemvSoftcapKernel[rows, cols, cap](x[r], weight[r], output[r], 0, 0),
             pools[r], rows, num_workers=nw)
@@ -181,6 +186,7 @@ struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](OutputPart
 def dispatch_gemv_chained_qkv[
     P: BurstThreadPool, //,
     q_rows: Int, kv_rows: Int, cols: Int, tp: Int,
+    max_worker_count: Int = 128,
 ](
     x: Binding[Scalar[DType.bfloat16], tp],
     q_weight: Binding[Scalar[DType.bfloat16], tp],
@@ -198,9 +204,9 @@ def dispatch_gemv_chained_qkv[
     comptime QK = Chain[QKernel, KKernel]
     comptime QKV = Chain[QK, VKernel]
 
-    var buf = DispatchBuffer[QKV]()
+    var buf = DispatchBuffer[QKV, max_worker_count]()
     for r in range(tp):
-        var nw = pools[r].get_capacity()
+        var nw = min(max_worker_count, pools[r].get_capacity())
         tile_dispatch(buf,
             QKV(
                 QK(

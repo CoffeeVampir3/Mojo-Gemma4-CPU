@@ -4,7 +4,6 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
-comptime MAX_WORKERS = 128
 comptime DISPATCH_BW_PRODUCT = 2280
 
 
@@ -40,17 +39,22 @@ struct RankBuffers[dtype: DType, tp: Int, origin: Origin]:
         return self.ptrs[rank]
 
 
-struct DispatchBuffer[K: BurstKernel]:
-    var items: InlineArray[Self.K, MAX_WORKERS]
+struct DispatchBuffer[K: BurstKernel, max_worker_count: Int = 128]:
+    var items: InlineArray[Self.K, Self.max_worker_count]
     var count: Int
 
     def __init__(out self):
-        self.items = InlineArray[Self.K, MAX_WORKERS](uninitialized=True)
+        comptime assert Self.max_worker_count > 0, (
+            "max_worker_count must be positive")
+        self.items = InlineArray[Self.K, Self.max_worker_count](uninitialized=True)
         self.count = 0
 
     @always_inline
     def slot(mut self) -> UnsafePointer[Self.K, origin_of(self.items)]:
-        debug_assert(self.count < MAX_WORKERS, "DispatchBuffer overflow")
+        debug_assert(
+            self.count < Self.max_worker_count,
+            "DispatchBuffer overflow",
+        )
         var idx = self.count
         self.count += 1
         return UnsafePointer(to=self.items[idx])
@@ -139,13 +143,15 @@ struct Binding[T: AnyType, tp: Int](Copyable, ImplicitlyCopyable):
 
 
 def tile_dispatch[
-    K: OutputPartitionedKernel, P: BurstThreadPool,
-](mut buf: DispatchBuffer[K], proto: K, mut pool: P, total: Int,
+    K: OutputPartitionedKernel, P: BurstThreadPool, //,
+    max_worker_count: Int = 128,
+](mut buf: DispatchBuffer[K, max_worker_count], proto: K, mut pool: P, total: Int,
   base: Int = 0, num_workers: Int = 0):
     if total <= 0:
         return
-    var workers = pool.get_capacity() if num_workers <= 0 else min(
-        num_workers, pool.get_capacity())
+    var capacity = min(max_worker_count, pool.get_capacity())
+    var workers = capacity if num_workers <= 0 else min(
+        num_workers, capacity)
     workers = min(workers, total)
     for w in range(workers):
         var wr = worker_range(total, workers, w, base)
