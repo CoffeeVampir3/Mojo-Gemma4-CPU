@@ -14,7 +14,6 @@ from .helpers import (
 
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime F32Ptr  = UnsafePointer[Scalar[DType.float32],  MutAnyOrigin]
-comptime I32Ptr  = UnsafePointer[Scalar[DType.int32],    MutAnyOrigin]
 comptime W = simd_width_of[DType.float32]()
 
 

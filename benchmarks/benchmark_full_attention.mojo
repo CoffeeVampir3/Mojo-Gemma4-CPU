@@ -11,7 +11,7 @@ from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.full_attention import dispatch_full_attention, PARTIAL_STRIDE
 from kernels.logsum_merge import dispatch_merge_context_flash_partials
-from kernels.helpers import NumaPointerArray
+from kernels.helpers import Binding, ArenaBases
 
 
 comptime ALIGNMENT = 64
@@ -33,8 +33,8 @@ comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
 
 def arena_bases[tp: Int](
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
-) -> InlineArray[Int, tp]:
-    var bases = InlineArray[Int, tp](uninitialized=True)
+) -> ArenaBases[tp]:
+    var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
         bases[r] = Int(arenas[r].base.value())
     return bases
@@ -67,7 +67,7 @@ def fill_pattern(ptr: BF16Ptr, count: Int):
 
 
 def fill_pattern_all[tp: Int](
-    ptrs: NumaPointerArray[DType.bfloat16, tp], count: Int,
+    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
 ):
     for r in range(tp):
         fill_pattern(ptrs[r], count)
@@ -106,7 +106,7 @@ def fmt_bw(total_bytes: Int, ns: Int) -> String:
 
 def section_validation[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
-    output: BF16Ptr, partials: F32Ptr, bases: InlineArray[Int, tp],
+    output: BF16Ptr, partials: F32Ptr, bases: ArenaBases[tp],
 ):
     print("\n=== Validation (valid_len=64) ===")
     comptime VL = 64
@@ -116,16 +116,16 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     var nw = dispatch_full_attention[
         head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
         gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=tp](
-        NumaPointerArray[DType.bfloat16, tp](q, bases),
-        NumaPointerArray[DType.bfloat16, tp](k_cache, bases),
-        NumaPointerArray[DType.bfloat16, tp](v_cache, bases),
-        NumaPointerArray[DType.float32, tp](partials, bases),
+        Binding[Scalar[DType.bfloat16], tp](q, bases),
+        Binding[Scalar[DType.bfloat16], tp](k_cache, bases),
+        Binding[Scalar[DType.bfloat16], tp](v_cache, bases),
+        Binding[Scalar[DType.float32], tp](partials, bases),
         full_valid_lens[tp](VL), pools)
     dispatch_merge_context_flash_partials[
         head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q, local_num_q=LOCAL_NUM_Q, tp=tp,
     ](
-        NumaPointerArray[DType.bfloat16, tp](output, bases),
-        NumaPointerArray[DType.float32, tp](partials, bases),
+        Binding[Scalar[DType.bfloat16], tp](output, bases),
+        Binding[Scalar[DType.float32], tp](partials, bases),
         PSTRIDE, nw, pools)
 
     print("  output[0..3]: "
@@ -144,7 +144,7 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
 
 def section_context_sweep[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
-    output: BF16Ptr, partials: F32Ptr, bases: InlineArray[Int, tp],
+    output: BF16Ptr, partials: F32Ptr, bases: ArenaBases[tp],
 ):
     print("\n=== Context sweep (replicated Q + context-local attention + merge) ===")
     print("  valid_len | latency      | KV read  | BW")
@@ -164,17 +164,17 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
             var nw = dispatch_full_attention[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                 gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=tp](
-                NumaPointerArray[DType.bfloat16, tp](q, bases),
-                NumaPointerArray[DType.bfloat16, tp](k_cache, bases),
-                NumaPointerArray[DType.bfloat16, tp](v_cache, bases),
-                NumaPointerArray[DType.float32, tp](partials, bases),
+                Binding[Scalar[DType.bfloat16], tp](q, bases),
+                Binding[Scalar[DType.bfloat16], tp](k_cache, bases),
+                Binding[Scalar[DType.bfloat16], tp](v_cache, bases),
+                Binding[Scalar[DType.float32], tp](partials, bases),
                 full_valid_lens[tp](vl), pools)
             dispatch_merge_context_flash_partials[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                 local_num_q=LOCAL_NUM_Q, tp=tp,
             ](
-                NumaPointerArray[DType.bfloat16, tp](output, bases),
-                NumaPointerArray[DType.float32, tp](partials, bases),
+                Binding[Scalar[DType.bfloat16], tp](output, bases),
+                Binding[Scalar[DType.float32], tp](partials, bases),
                 PSTRIDE, nw, pools)
             keep(output[0])
 
@@ -186,17 +186,17 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 var nw = dispatch_full_attention[
                     head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                     gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=tp](
-                    NumaPointerArray[DType.bfloat16, tp](q, bases),
-                    NumaPointerArray[DType.bfloat16, tp](k_cache, bases),
-                    NumaPointerArray[DType.bfloat16, tp](v_cache, bases),
-                    NumaPointerArray[DType.float32, tp](partials, bases),
+                    Binding[Scalar[DType.bfloat16], tp](q, bases),
+                    Binding[Scalar[DType.bfloat16], tp](k_cache, bases),
+                    Binding[Scalar[DType.bfloat16], tp](v_cache, bases),
+                    Binding[Scalar[DType.float32], tp](partials, bases),
                     full_valid_lens[tp](vl), pools)
                 dispatch_merge_context_flash_partials[
                     head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                     local_num_q=LOCAL_NUM_Q, tp=tp,
                 ](
-                    NumaPointerArray[DType.bfloat16, tp](output, bases),
-                    NumaPointerArray[DType.float32, tp](partials, bases),
+                    Binding[Scalar[DType.bfloat16], tp](output, bases),
+                    Binding[Scalar[DType.float32], tp](partials, bases),
                     PSTRIDE, nw, pools)
                 elapsed += Int(perf_counter_ns()) - t0
             keep(output[0])
@@ -226,11 +226,11 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var partials = arena_alloc_all[DType.float32, tp](arenas, MAX_WORKERS * PSTRIDE)
 
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](q, bases), GLOBAL_NUM_Q * HEAD_DIM)
+        Binding[Scalar[DType.bfloat16], tp](q, bases), GLOBAL_NUM_Q * HEAD_DIM)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](k_cache, bases), MAX_SEQ * KV_STRIDE)
+        Binding[Scalar[DType.bfloat16], tp](k_cache, bases), MAX_SEQ * KV_STRIDE)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](v_cache, bases), MAX_SEQ * KV_STRIDE)
+        Binding[Scalar[DType.bfloat16], tp](v_cache, bases), MAX_SEQ * KV_STRIDE)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 

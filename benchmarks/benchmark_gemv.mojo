@@ -44,8 +44,8 @@ def arena_alloc[dtype: DType](
 
 def arena_bases[tp: Int](
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
-) -> InlineArray[Int, tp]:
-    var bases = InlineArray[Int, tp](uninitialized=True)
+) -> ArenaBases[tp]:
+    var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
         bases[r] = Int(arenas[r].base.value())
     return bases
@@ -68,7 +68,7 @@ def fill_pattern(ptr: BF16Ptr, count: Int):
 
 
 def fill_pattern_all[tp: Int](
-    ptrs: NumaPointerArray[DType.bfloat16, tp], count: Int,
+    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
 ):
     for r in range(tp):
         fill_pattern(ptrs[r], count)
@@ -242,11 +242,11 @@ def measure_dispatch_gemv[
     P: BurstThreadPool, //, rows: Int, tp: Int,
 ](
     mut pools: HeapMoveArray[P], x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    bases: InlineArray[Int, tp],
+    bases: ArenaBases[tp],
 ) -> Int:
-    var xs = NumaPointerArray[DType.bfloat16, tp](x, bases)
-    var ws = NumaPointerArray[DType.bfloat16, tp](weight, bases)
-    var outs = NumaPointerArray[DType.bfloat16, tp](output, bases)
+    var xs = Binding[Scalar[DType.bfloat16], tp](x, bases)
+    var ws = Binding[Scalar[DType.bfloat16], tp](weight, bases)
+    var outs = Binding[Scalar[DType.bfloat16], tp](output, bases)
 
     for _ in range(WARMUP):
         dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
@@ -282,7 +282,7 @@ def print_projection_row(name: String, rows: Int, ns: Int):
 
 def section_projection_sizes[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P], x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    bases: InlineArray[Int, tp],
+    bases: ArenaBases[tp],
 ):
     print("\n=== Real projection sizes (full dispatch) ===")
     print("  projection         | rows  | weight MB | time         | BW")
@@ -313,20 +313,20 @@ def section_chained_qkv[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P], x: BF16Ptr,
     q_weight: BF16Ptr, k_weight: BF16Ptr, v_weight: BF16Ptr,
     q_out: BF16Ptr, k_out: BF16Ptr, v_out: BF16Ptr,
-    bases: InlineArray[Int, tp],
+    bases: ArenaBases[tp],
 ):
     print("\n=== Chained QKV vs 3x separate dispatch (sliding, TP="
         + String(tp) + ") ===")
 
     comptime Q_R = Q_SLIDING // tp
     comptime KV_R = KV_SLIDING // tp
-    var xs = NumaPointerArray[DType.bfloat16, tp](x, bases)
-    var qw = NumaPointerArray[DType.bfloat16, tp](q_weight, bases)
-    var kw = NumaPointerArray[DType.bfloat16, tp](k_weight, bases)
-    var vw = NumaPointerArray[DType.bfloat16, tp](v_weight, bases)
-    var qo = NumaPointerArray[DType.bfloat16, tp](q_out, bases)
-    var ko = NumaPointerArray[DType.bfloat16, tp](k_out, bases)
-    var vo = NumaPointerArray[DType.bfloat16, tp](v_out, bases)
+    var xs = Binding[Scalar[DType.bfloat16], tp](x, bases)
+    var qw = Binding[Scalar[DType.bfloat16], tp](q_weight, bases)
+    var kw = Binding[Scalar[DType.bfloat16], tp](k_weight, bases)
+    var vw = Binding[Scalar[DType.bfloat16], tp](v_weight, bases)
+    var qo = Binding[Scalar[DType.bfloat16], tp](q_out, bases)
+    var ko = Binding[Scalar[DType.bfloat16], tp](k_out, bases)
+    var vo = Binding[Scalar[DType.bfloat16], tp](v_out, bases)
 
     for _ in range(WARMUP):
         dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
@@ -386,9 +386,9 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var weight = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_WEIGHT_ELEMS)
     var output = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_ROWS)
 
-    fill_pattern_all[tp](NumaPointerArray[DType.bfloat16, tp](x, bases), HIDDEN)
+    fill_pattern_all[tp](Binding[Scalar[DType.bfloat16], tp](x, bases), HIDDEN)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](weight, bases), MAX_WEIGHT_ELEMS)
+        Binding[Scalar[DType.bfloat16], tp](weight, bases), MAX_WEIGHT_ELEMS)
 
     var cap = pools[0].get_capacity()
     print("pool capacity: " + String(cap) + " workers")
@@ -408,11 +408,11 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var k_out = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R)
     var v_out = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](q_weight, bases), Q_R * HIDDEN)
+        Binding[Scalar[DType.bfloat16], tp](q_weight, bases), Q_R * HIDDEN)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](k_weight, bases), KV_R * HIDDEN)
+        Binding[Scalar[DType.bfloat16], tp](k_weight, bases), KV_R * HIDDEN)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](v_weight, bases), KV_R * HIDDEN)
+        Binding[Scalar[DType.bfloat16], tp](v_weight, bases), KV_R * HIDDEN)
 
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())

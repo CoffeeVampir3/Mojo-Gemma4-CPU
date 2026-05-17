@@ -9,7 +9,10 @@ from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.logsum_merge import dispatch_merge_flash_partials
-from kernels.helpers import OutputPartitionedKernel, DispatchBuffer, tile_dispatch, NumaPointerArray
+from kernels.helpers import (
+    OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
+    Binding, ArenaBases,
+)
 
 
 comptime ALIGNMENT = 64
@@ -57,8 +60,8 @@ def arena_alloc[dtype: DType](
 
 def arena_bases[tp: Int](
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
-) -> InlineArray[Int, tp]:
-    var bases = InlineArray[Int, tp](uninitialized=True)
+) -> ArenaBases[tp]:
+    var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
         bases[r] = Int(arenas[r].base.value())
     return bases
@@ -90,7 +93,7 @@ def fill_partials[head_dim: Int, num_q: Int](
 
 
 def fill_partials_all[head_dim: Int, num_q: Int, tp: Int](
-    ptrs: NumaPointerArray[DType.float32, tp],
+    ptrs: Binding[Scalar[DType.float32], tp],
     stride: Int, num_sources: Int,
 ):
     for r in range(tp):
@@ -114,13 +117,13 @@ def measure_finalize[
     P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
 ](
     output: BF16Ptr, partials: F32Ptr, stride: Int, scratch: F32Ptr,
-    num_sources: Int, mut pools: HeapMoveArray[P], bases: InlineArray[Int, tp],
+    num_sources: Int, mut pools: HeapMoveArray[P], bases: ArenaBases[tp],
 ) -> Int:
     warm_pool(scratch, pools[0])
     for _ in range(WARMUP):
         dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-            NumaPointerArray[DType.bfloat16, tp](output, bases),
-            NumaPointerArray[DType.float32, tp](partials, bases),
+            Binding[Scalar[DType.bfloat16], tp](output, bases),
+            Binding[Scalar[DType.float32], tp](partials, bases),
             stride, source_counts[tp](num_sources), pools,
             inline_max_bytes=0)
         keep(output[0])
@@ -131,8 +134,8 @@ def measure_finalize[
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-                NumaPointerArray[DType.bfloat16, tp](output, bases),
-                NumaPointerArray[DType.float32, tp](partials, bases),
+                Binding[Scalar[DType.bfloat16], tp](output, bases),
+                Binding[Scalar[DType.float32], tp](partials, bases),
                 stride, source_counts[tp](num_sources), pools,
                 inline_max_bytes=0)
             keep(output[0])
@@ -147,13 +150,13 @@ def measure_finalize_inline[
     P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
 ](
     output: BF16Ptr, partials: F32Ptr, stride: Int, scratch: F32Ptr,
-    num_sources: Int, mut pools: HeapMoveArray[P], bases: InlineArray[Int, tp],
+    num_sources: Int, mut pools: HeapMoveArray[P], bases: ArenaBases[tp],
 ) -> Int:
     warm_pool(scratch, pools[0])
     for _ in range(WARMUP):
         dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-            NumaPointerArray[DType.bfloat16, tp](output, bases),
-            NumaPointerArray[DType.float32, tp](partials, bases),
+            Binding[Scalar[DType.bfloat16], tp](output, bases),
+            Binding[Scalar[DType.float32], tp](partials, bases),
             stride, source_counts[tp](num_sources), pools,
             inline_max_bytes=FORCE_INLINE)
         keep(output[0])
@@ -164,8 +167,8 @@ def measure_finalize_inline[
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-                NumaPointerArray[DType.bfloat16, tp](output, bases),
-                NumaPointerArray[DType.float32, tp](partials, bases),
+                Binding[Scalar[DType.bfloat16], tp](output, bases),
+                Binding[Scalar[DType.float32], tp](partials, bases),
                 stride, source_counts[tp](num_sources), pools,
                 inline_max_bytes=FORCE_INLINE)
             keep(output[0])
@@ -189,7 +192,7 @@ def run_config[
     var scratch = arena_alloc[DType.float32](arenas[0], pools[0].get_capacity())
 
     fill_partials_all[head_dim, num_q, tp](
-        NumaPointerArray[DType.float32, tp](partials, bases),
+        Binding[Scalar[DType.float32], tp](partials, bases),
         stride, MAX_SOURCES)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())

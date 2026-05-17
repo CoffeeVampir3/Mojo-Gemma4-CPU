@@ -9,7 +9,7 @@ from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.helpers import NumaPointerArray
+from kernels.helpers import Binding, ArenaBases
 from kernels.rope import (
     rope_head, dispatch_rope_cache_write,
     init_rope_table, init_rope_table_partial_strided,
@@ -48,8 +48,8 @@ def arena_alloc[dtype: DType](
 
 def arena_bases[tp: Int](
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
-) -> InlineArray[Int, tp]:
-    var bases = InlineArray[Int, tp](uninitialized=True)
+) -> ArenaBases[tp]:
+    var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
         bases[r] = Int(arenas[r].base.value())
     return bases
@@ -72,27 +72,27 @@ def fill_pattern(ptr: BF16Ptr, count: Int):
 
 
 def fill_pattern_all[tp: Int](
-    ptrs: NumaPointerArray[DType.bfloat16, tp], count: Int,
+    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
 ):
     for r in range(tp):
         fill_pattern(ptrs[r], count)
 
 
 def init_sliding_tables_all[tp: Int](
-    cos_sl: F32Ptr, sin_sl: F32Ptr, bases: InlineArray[Int, tp],
+    cos_sl: F32Ptr, sin_sl: F32Ptr, bases: ArenaBases[tp],
 ):
-    var cos = NumaPointerArray[DType.float32, tp](cos_sl, bases)
-    var sin = NumaPointerArray[DType.float32, tp](sin_sl, bases)
+    var cos = Binding[Scalar[DType.float32], tp](cos_sl, bases)
+    var sin = Binding[Scalar[DType.float32], tp](sin_sl, bases)
     for r in range(tp):
         init_rope_table[HALF_SLIDING, MAX_POS](cos[r], sin[r], 10000.0)
 
 
 def init_full_tables_all[tp: Int](
-    cos_fl: F32Ptr, sin_fl: F32Ptr, bases: InlineArray[Int, tp],
+    cos_fl: F32Ptr, sin_fl: F32Ptr, bases: ArenaBases[tp],
 ):
     comptime LOCAL_ROWS = MAX_POS // tp
-    var cos = NumaPointerArray[DType.float32, tp](cos_fl, bases)
-    var sin = NumaPointerArray[DType.float32, tp](sin_fl, bases)
+    var cos = Binding[Scalar[DType.float32], tp](cos_fl, bases)
+    var sin = Binding[Scalar[DType.float32], tp](sin_fl, bases)
     for r in range(tp):
         init_rope_table_partial_strided[HALF_FULL, LOCAL_ROWS](
             cos[r], sin[r], 1000000.0, HEAD_DIM_FULL, r, tp)
@@ -203,20 +203,20 @@ def measure_sliding_cache_write[
     q: BF16Ptr, k_src: BF16Ptr, v_src: BF16Ptr,
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_sl: F32Ptr, sin_sl: F32Ptr,
-    bases: InlineArray[Int, tp],
+    bases: ArenaBases[tp],
 ) -> Int:
     comptime Q_ROWS = Q_DIM_SLIDING // tp
     comptime KV_ROWS = KV_DIM_SLIDING // tp
     comptime NUM_Q = Q_ROWS // HEAD_DIM_SLIDING
     comptime NUM_KV = KV_ROWS // HEAD_DIM_SLIDING
     comptime POS = 513
-    var qs = NumaPointerArray[DType.bfloat16, tp](q, bases)
-    var ks = NumaPointerArray[DType.bfloat16, tp](k_src, bases)
-    var vs = NumaPointerArray[DType.bfloat16, tp](v_src, bases)
-    var kc = NumaPointerArray[DType.bfloat16, tp](k_cache, bases)
-    var vc = NumaPointerArray[DType.bfloat16, tp](v_cache, bases)
-    var cos = NumaPointerArray[DType.float32, tp](cos_sl, bases)
-    var sin = NumaPointerArray[DType.float32, tp](sin_sl, bases)
+    var qs = Binding[Scalar[DType.bfloat16], tp](q, bases)
+    var ks = Binding[Scalar[DType.bfloat16], tp](k_src, bases)
+    var vs = Binding[Scalar[DType.bfloat16], tp](v_src, bases)
+    var kc = Binding[Scalar[DType.bfloat16], tp](k_cache, bases)
+    var vc = Binding[Scalar[DType.bfloat16], tp](v_cache, bases)
+    var cos = Binding[Scalar[DType.float32], tp](cos_sl, bases)
+    var sin = Binding[Scalar[DType.float32], tp](sin_sl, bases)
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
@@ -252,24 +252,24 @@ def measure_full_cache_write[
     q: BF16Ptr, k_src: BF16Ptr, v_src: BF16Ptr,
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_fl: F32Ptr, sin_fl: F32Ptr,
-    bases: InlineArray[Int, tp],
+    bases: ArenaBases[tp],
 ) -> Int:
     comptime Q_ROWS = Q_DIM_FULL // tp
     comptime NUM_Q = Q_ROWS // HEAD_DIM_FULL
     comptime NUM_KV = KV_DIM_FULL // HEAD_DIM_FULL
     comptime POS = 513
     var owner = POS % tp
-    var owner_bases = InlineArray[Int, tp](fill=bases[owner])
-    var full_cos = NumaPointerArray[DType.float32, tp](cos_fl, bases)[owner]
-    var full_sin = NumaPointerArray[DType.float32, tp](sin_fl, bases)[owner]
+    var owner_bases = ArenaBases[tp].fill(bases[owner])
+    var full_cos = Binding[Scalar[DType.float32], tp](cos_fl, bases)[owner]
+    var full_sin = Binding[Scalar[DType.float32], tp](sin_fl, bases)[owner]
 
-    var qs = NumaPointerArray[DType.bfloat16, tp](q, bases)
-    var ks = NumaPointerArray[DType.bfloat16, tp](k_src, bases)
-    var vs = NumaPointerArray[DType.bfloat16, tp](v_src, bases)
-    var kc = NumaPointerArray[DType.bfloat16, tp](k_cache, bases)
-    var vc = NumaPointerArray[DType.bfloat16, tp](v_cache, bases)
-    var cos = NumaPointerArray[DType.float32, tp](full_cos, owner_bases)
-    var sin = NumaPointerArray[DType.float32, tp](full_sin, owner_bases)
+    var qs = Binding[Scalar[DType.bfloat16], tp](q, bases)
+    var ks = Binding[Scalar[DType.bfloat16], tp](k_src, bases)
+    var vs = Binding[Scalar[DType.bfloat16], tp](v_src, bases)
+    var kc = Binding[Scalar[DType.bfloat16], tp](k_cache, bases)
+    var vc = Binding[Scalar[DType.bfloat16], tp](v_cache, bases)
+    var cos = Binding[Scalar[DType.float32], tp](full_cos, owner_bases)
+    var sin = Binding[Scalar[DType.float32], tp](full_sin, owner_bases)
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
@@ -305,7 +305,7 @@ def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
     full_q: BF16Ptr, full_k: BF16Ptr, full_v: BF16Ptr,
     full_k_cache: BF16Ptr, full_v_cache: BF16Ptr,
     cos_sl: F32Ptr, sin_sl: F32Ptr, cos_fl: F32Ptr, sin_fl: F32Ptr,
-    bases: InlineArray[Int, tp],
+    bases: ArenaBases[tp],
 ):
     print("\n=== dispatch_rope_cache_write model path (seq_len=1, TP="
         + String(tp) + ") ===")
@@ -362,19 +362,19 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var full_v_cache = arena_alloc_all[DType.bfloat16, tp](
         arenas, MAX_POS * KV_DIM_FULL)
 
-    fill_pattern_all[tp](NumaPointerArray[DType.bfloat16, tp](data, bases), MAX_DATA)
+    fill_pattern_all[tp](Binding[Scalar[DType.bfloat16], tp](data, bases), MAX_DATA)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](sliding_q, bases), SL_Q_ROWS)
+        Binding[Scalar[DType.bfloat16], tp](sliding_q, bases), SL_Q_ROWS)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](sliding_k, bases), SL_KV_ROWS)
+        Binding[Scalar[DType.bfloat16], tp](sliding_k, bases), SL_KV_ROWS)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](sliding_v, bases), SL_KV_ROWS)
+        Binding[Scalar[DType.bfloat16], tp](sliding_v, bases), SL_KV_ROWS)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](full_q, bases), FL_Q_ROWS)
+        Binding[Scalar[DType.bfloat16], tp](full_q, bases), FL_Q_ROWS)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](full_k, bases), KV_DIM_FULL)
+        Binding[Scalar[DType.bfloat16], tp](full_k, bases), KV_DIM_FULL)
     fill_pattern_all[tp](
-        NumaPointerArray[DType.bfloat16, tp](full_v, bases), KV_DIM_FULL)
+        Binding[Scalar[DType.bfloat16], tp](full_v, bases), KV_DIM_FULL)
     init_sliding_tables_all[tp](cos_sl, sin_sl, bases)
     init_full_tables_all[tp](cos_fl, sin_fl, bases)
 
