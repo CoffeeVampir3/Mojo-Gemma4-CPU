@@ -4,7 +4,7 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
-    OutputPartitionedKernel, Binding,
+    RangePartitionedKernel, Binding,
     fanout_dispatch,
     BF16Ptr, W,
 )
@@ -27,7 +27,7 @@ def gelu_gate_up_row[intermediate: Int](
 
 
 @fieldwise_init
-struct GeluGateUpTokenKernel[intermediate: Int](OutputPartitionedKernel):
+struct GeluGateUpTokenKernel[intermediate: Int](RangePartitionedKernel):
     var gate: BF16Ptr
     var up: BF16Ptr
     var dst: BF16Ptr
@@ -41,7 +41,7 @@ struct GeluGateUpTokenKernel[intermediate: Int](OutputPartitionedKernel):
                 self.gate + off, self.up + off, self.dst + off)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
@@ -80,7 +80,7 @@ def scalar_mul_row[hidden: Int](
 
 
 @fieldwise_init
-struct ScalarMulTokenKernel[hidden: Int](OutputPartitionedKernel):
+struct ScalarMulTokenKernel[hidden: Int](RangePartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
     var scalar: Float32
@@ -94,7 +94,7 @@ struct ScalarMulTokenKernel[hidden: Int](OutputPartitionedKernel):
                 self.src + off, self.dst + off, self.scalar)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 

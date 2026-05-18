@@ -6,9 +6,9 @@ from simd_math import pick_port_unroll, tree_reduce_accs
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    Chain, OutputPartitionedKernel,
+    Chain, RangePartitionedKernel,
     fanout_dispatch, saturate_workers,
-    Binding, BF16Ptr, W,
+    Binding, BF16Ptr, W, dot_into_accs,
 )
 from .dispatch_heuristics import NORM_INLINE_TOKENS
 
@@ -16,12 +16,9 @@ from .dispatch_heuristics import NORM_INLINE_TOKENS
 @always_inline
 def rms_reduce_row[hidden: Int](src: BF16Ptr) -> Float32:
     comptime PU = pick_port_unroll[W, hidden]()
-    comptime STRIDE = PU * W
-    var accs = InlineArray[SIMD[DType.float32, W], PU](fill=SIMD[DType.float32, W](0))
-    for i in range(hidden // STRIDE):
-        comptime for p in range(PU):
-            var v = (src + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
-            accs[p] = v.fma(v, accs[p])
+    var accs = InlineArray[SIMD[DType.float32, W], PU](
+        fill=SIMD[DType.float32, W](0))
+    dot_into_accs[cols=hidden](src, src, accs)
     return tree_reduce_accs(accs)
 
 
@@ -78,7 +75,7 @@ def norm_residual_add_row[
 struct RmsNormTokenKernel[
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
     scaled: Bool = True,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
     var weight: BF16Ptr
@@ -93,7 +90,7 @@ struct RmsNormTokenKernel[
                 self.weight)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
@@ -101,7 +98,7 @@ struct RmsNormTokenKernel[
 @fieldwise_init
 struct NormResidualAddTokenKernel[
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     var src: BF16Ptr
     var residual: BF16Ptr
     var dst: BF16Ptr
@@ -117,7 +114,7 @@ struct NormResidualAddTokenKernel[
                 self.weight)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
@@ -148,7 +145,7 @@ def dispatch_rms_norm[
 struct ScaledNormKernel[
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
     scaled: Bool, numer: Int, denom: Int,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
     var weight: BF16Ptr
@@ -165,7 +162,7 @@ struct ScaledNormKernel[
                 self.weight)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 

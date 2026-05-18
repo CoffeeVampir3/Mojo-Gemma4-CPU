@@ -7,7 +7,7 @@ from modeling.model_spec import Encoding
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from .helpers import (
-    OutputPartitionedKernel, RankBuffers, DispatchBuffer, Binding,
+    RangePartitionedKernel, RankBuffers, DispatchBuffer, Binding,
     join_all, tile_dispatch, recommended_workers,
 )
 
@@ -25,7 +25,9 @@ struct ReduceConfig[E: Encoding, tp: Int, src_origin: ImmutOrigin]:
 
 
 @fieldwise_init
-struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](OutputPartitionedKernel):
+struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](
+    RangePartitionedKernel
+):
     var dst: DstPtr[Self.dtype]
     var src: UnsafePointer[Scalar[Self.dtype], Self.src_origin]
     var start: Int
@@ -36,7 +38,7 @@ struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](OutputPartitionedKernel
                count=self.end - self.start)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
@@ -45,7 +47,7 @@ struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](OutputPartitionedKernel
 struct ReduceStoreKernel[
     E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin,
     Accum: DType = DType.float32,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     var config: UnsafePointer[ReduceConfig[Self.E, Self.tp, Self.src_origin], Self.cfg_origin]
     var rank: Int
     var start: Int
@@ -56,13 +58,15 @@ struct ReduceStoreKernel[
             self.config, self.rank, self.start, self.end)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
 
 @fieldwise_init
-struct GatherKernel[E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin](OutputPartitionedKernel):
+struct GatherKernel[
+    E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin,
+](RangePartitionedKernel):
     var config: UnsafePointer[ReduceConfig[Self.E, Self.tp, Self.src_origin], Self.cfg_origin]
     var rank: Int
     var start: Int
@@ -73,7 +77,7 @@ struct GatherKernel[E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: I
             self.config, self.rank, self.start, self.end)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 

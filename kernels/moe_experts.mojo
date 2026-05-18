@@ -4,7 +4,7 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
-    OutputPartitionedKernel, Binding,
+    RangePartitionedKernel, WorkerRangePartitionedKernel, Binding,
     BF16Ptr, F32Ptr, I32Ptr, W, BW,
     fanout_dispatch, saturate_workers,
 )
@@ -15,7 +15,7 @@ from .moe_router import SparseRoute, SparseRoutePtr
 @fieldwise_init
 struct Phase1GateUpKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, experts_per_rank: Int,
-](OutputPartitionedKernel):
+](WorkerRangePartitionedKernel):
     comptime TILE_J = 64
     comptime MR = 4
     comptime PU_GU = 4
@@ -188,7 +188,9 @@ struct Phase1GateUpKernel[
                 rec_block += 1
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
         self.worker_id = worker_id
         self.start = start
         self.end = end
@@ -229,7 +231,7 @@ def dispatch_phase1_gate_up[
 @fieldwise_init
 struct Phase2DownKernel[
     hidden: Int, intermediate: Int, experts_per_rank: Int,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     comptime TOK_TILE = 64
     comptime MR = 4
     comptime PU_DN = 2
@@ -349,7 +351,7 @@ struct Phase2DownKernel[
                 m += 1
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start * W
         self.end = end * W
 

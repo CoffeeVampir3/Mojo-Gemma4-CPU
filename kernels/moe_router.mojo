@@ -6,9 +6,9 @@ from threading.threading_traits import BurstThreadPool
 from simd_math import pick_port_unroll, tree_reduce_accs, fast_exp_softmax_biased
 from simd_math.ops import sqrt
 from .helpers import (
-    OutputPartitionedKernel, Binding,
+    WorkerRangePartitionedKernel, Binding,
     fanout_dispatch, saturate_workers,
-    BF16Ptr, F32Ptr, W,
+    BF16Ptr, F32Ptr, W, dot_into_accs,
 )
 from .dispatch_heuristics import ROUTER_INLINE_TOKENS
 from .rmsnorm import rms_reduce_row
@@ -51,7 +51,7 @@ def insert_candidate[top_k: Int](
 struct RouterShardedKernel[
     hidden: Int, experts_per_rank: Int, top_k: Int,
     rms_eps: Float32,
-](OutputPartitionedKernel):
+](WorkerRangePartitionedKernel):
     var x: BF16Ptr
     var router_proj: BF16Ptr
     var router_scale: BF16Ptr
@@ -64,7 +64,6 @@ struct RouterShardedKernel[
 
     def execute(mut self):
         comptime PU = pick_port_unroll[W, Self.hidden]()
-        comptime STRIDE = PU * W
         comptime sqrt_n = sqrt[DType.float32, 1](Float32(Self.hidden))
         comptime n_eps = Float32(
             Float32(Self.hidden) * Self.rms_eps)
@@ -88,12 +87,7 @@ struct RouterShardedKernel[
                 var row = self.router_proj + e * Self.hidden
                 var accs = InlineArray[SIMD[DType.float32, W], PU](
                     fill=SIMD[DType.float32, W](0))
-                for i in range(Self.hidden // STRIDE):
-                    comptime for p in range(PU):
-                        var off = i * STRIDE + p * W
-                        var xv = (scratch + off).load[width=W]()
-                        var wv = (row + off).load[width=W]().cast[DType.float32]()
-                        accs[p] = xv.fma(wv, accs[p])
+                dot_into_accs[cols=Self.hidden](scratch, row, accs)
                 var logit = tree_reduce_accs(accs)
                 insert_candidate[Self.top_k](
                     Int32(self.expert_base + e), logit, cands)
@@ -103,7 +97,9 @@ struct RouterShardedKernel[
                 dst[k] = cands[k]
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
         self.worker_id = worker_id
         self.start = start
         self.end = end

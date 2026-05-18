@@ -5,24 +5,11 @@ from simd_math.ops import tanh_f32
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    Chain, OutputPartitionedKernel,
+    Chain, RangePartitionedKernel,
     fanout_dispatch, saturate_workers,
-    Binding, BF16Ptr, W,
+    Binding, BF16Ptr, W, dot_into_accs,
 )
 from .dispatch_heuristics import GEMV_INLINE_ROWS
-
-
-@always_inline
-def dot_row[cols: Int, PU: Int](
-    x: BF16Ptr, weight_row: BF16Ptr,
-    mut accs: InlineArray[SIMD[DType.float32, W], PU],
-):
-    comptime STRIDE = PU * W
-    for i in range(cols // STRIDE):
-        comptime for p in range(PU):
-            var xv = (x + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
-            var wv = (weight_row + i * STRIDE + p * W).load[width=W]().cast[DType.float32]()
-            accs[p] = xv.fma(wv, accs[p])
 
 
 @always_inline
@@ -35,7 +22,7 @@ def gemv_range[rows: Int, cols: Int](
     for row in range(start, end):
         comptime for p in range(PU):
             accs[p] = SIMD[DType.float32, W](0)
-        dot_row[cols, PU](x, weight + row * cols, accs)
+        dot_into_accs[cols=cols](x, weight + row * cols, accs)
         (output + row)[] = tree_reduce_accs(accs).cast[DType.bfloat16]()
 
 
@@ -62,13 +49,13 @@ def gemv_softcap_range[
     for row in range(start, end):
         comptime for p in range(PU):
             accs[p] = SIMD[DType.float32, W](0)
-        dot_row[cols, PU](x, weight + row * cols, accs)
+        dot_into_accs[cols=cols](x, weight + row * cols, accs)
         var capped = softcap_value[cap](tree_reduce_accs(accs))
         (output + row)[] = capped.cast[DType.bfloat16]()
 
 
 @fieldwise_init
-struct GemvKernel[rows: Int, cols: Int](OutputPartitionedKernel):
+struct GemvKernel[rows: Int, cols: Int](RangePartitionedKernel):
     var x: BF16Ptr
     var weight: BF16Ptr
     var output: BF16Ptr
@@ -80,7 +67,7 @@ struct GemvKernel[rows: Int, cols: Int](OutputPartitionedKernel):
             self.x, self.weight, self.output, self.start, self.end)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
@@ -108,7 +95,7 @@ def dispatch_gemv[
 @fieldwise_init
 struct GemvSoftcapKernel[
     rows: Int, cols: Int, cap: Float64,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     var x: BF16Ptr
     var weight: BF16Ptr
     var output: BF16Ptr
@@ -120,7 +107,7 @@ struct GemvSoftcapKernel[
             self.x, self.weight, self.output, self.start, self.end)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
@@ -147,7 +134,9 @@ def dispatch_gemv_softcap[
 
 
 @fieldwise_init
-struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](OutputPartitionedKernel):
+struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](
+    RangePartitionedKernel,
+):
     var x: BF16Ptr
     var weight: BF16Ptr
     var output: BF16Ptr
@@ -161,7 +150,7 @@ struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](OutputPart
             self.x, self.weight, self.output, my_start, my_end)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 

@@ -5,7 +5,7 @@ from simd_math import sincos_simd
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    OutputPartitionedKernel, Binding,
+    RangePartitionedKernel, Binding,
     fanout_dispatch,
     BF16Ptr, F32Ptr, W,
 )
@@ -71,7 +71,7 @@ struct RopeCacheWriteKernel[
     kv_cache_stride: Int,
     slot_mask: Int,
     cache_degree: Int,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     var q: BF16Ptr
     var k_src: BF16Ptr
     var v_src: BF16Ptr
@@ -113,7 +113,7 @@ struct RopeCacheWriteKernel[
                 memcpy(dest=v_dst, src=v_tok, count=kv_stride)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 

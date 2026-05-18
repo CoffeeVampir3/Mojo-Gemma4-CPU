@@ -2,12 +2,10 @@ from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
-from std.sys.info import simd_width_of
 
 from numa import NumaArena, NumaTopology
-from threading import BurstPool
-from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
+from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
 from kernels.helpers import (
     DispatchBuffer, recommended_workers, Binding, ArenaBases,
@@ -90,10 +88,10 @@ def fill_ones_all[tp: Int](
 def fmt_ns(ns: Int) -> String:
     if ns < 1000:
         return String(ns) + " ns"
-    elif ns < 1000000:
+    elif ns < 1_000_000:
         return String(ns // 1000) + "." + String((ns % 1000) // 100) + " us"
     else:
-        return String(ns // 1000000) + "." + String((ns % 1000000) // 100000) + " ms"
+        return String(ns // 1_000_000) + "." + String((ns % 1_000_000) // 100000) + " ms"
 
 
 def fmt_bw(total_bytes: Int, ns: Int) -> String:
@@ -101,6 +99,17 @@ def fmt_bw(total_bytes: Int, ns: Int) -> String:
         return "inf GB/s"
     var bw_100 = total_bytes * 100 // ns
     return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
+
+
+def max_last_ts[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P],
+) -> Int:
+    var hi = 0
+    for r in range(tp):
+        var ts = pools[r].last_worker_timestamp()
+        if ts > hi:
+            hi = ts
+    return hi
 
 
 def section_row_primitives(src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr):
@@ -199,6 +208,7 @@ def section_fused_primitives(
     print("  norm+residual add: " + fmt_ns(best)
         + "  (" + fmt_bw(HIDDEN * 2 * 4, best) + " 2r+w+w)")
 
+
 def section_dispatch_overhead[P: BurstThreadPool](
     mut pool: P, src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
 ):
@@ -224,24 +234,32 @@ def section_dispatch_overhead[P: BurstThreadPool](
         buf.slot()[] = RmsNormTokenKernel[HIDDEN, SQRT_N, N_EPS](src, dst, weight, 0, 1)
         buf.dispatch(pool)
         pool.join()
-    var best_1w = Int(1 << 60)
+    var best_wall = Int(1 << 60)
+    var best_kernel = Int(1 << 60)
     for _ in range(TRIALS):
-        var elapsed = 0
+        var wall_sum = 0
+        var kernel_sum = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             buf.slot()[] = RmsNormTokenKernel[HIDDEN, SQRT_N, N_EPS](src, dst, weight, 0, 1)
             buf.dispatch(pool)
             pool.join()
             var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // ITERS
-        if avg < best_1w:
-            best_1w = avg
+            var t_done = pool.last_worker_timestamp()
+            wall_sum += t1 - t0
+            kernel_sum += t_done - t0
+        var avg_wall = wall_sum // ITERS
+        var avg_kernel = kernel_sum // ITERS
+        if avg_wall < best_wall:
+            best_wall = avg_wall
+        if avg_kernel < best_kernel:
+            best_kernel = avg_kernel
     keep(dst[0])
 
     print("  inline:      " + fmt_ns(best_inline))
-    print("  1w dispatch: " + fmt_ns(best_1w))
-    print("  overhead:    " + fmt_ns(best_1w - best_inline))
+    print("  1w kernel:   " + fmt_ns(best_kernel))
+    print("  1w wall:     " + fmt_ns(best_wall))
+    print("  overhead:    " + fmt_ns(best_wall - best_inline))
 
 
 def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
@@ -249,7 +267,7 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
     bases: ArenaBases[tp],
 ):
     print("\n=== Standalone norm: seq_len sweep ===")
-    print("  seq | inline       | dispatched   | workers | tokens/us")
+    print("  seq | inline       | kernel       | wall         | workers | tokens/us")
 
     comptime NUM_SIZES = 9
     var sizes = InlineArray[Int, NUM_SIZES](fill=0)
@@ -291,9 +309,11 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](dst, bases),
                 Binding[BFloat16, tp](weight, bases),
                 seq, pools)
-        var best_dispatched = Int(1 << 60)
+        var best_wall = Int(1 << 60)
+        var best_kernel = Int(1 << 60)
         for _ in range(TRIALS):
-            var elapsed = 0
+            var wall_sum = 0
+            var kernel_sum = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
                 dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
@@ -302,10 +322,15 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
                     Binding[BFloat16, tp](weight, bases),
                     seq, pools)
                 var t1 = Int(perf_counter_ns())
-                elapsed += t1 - t0
-            var avg = elapsed // ITERS
-            if avg < best_dispatched:
-                best_dispatched = avg
+                var t_done = max_last_ts[tp=tp](pools)
+                wall_sum += t1 - t0
+                kernel_sum += t_done - t0
+            var avg_wall = wall_sum // ITERS
+            var avg_kernel = kernel_sum // ITERS
+            if avg_wall < best_wall:
+                best_wall = avg_wall
+            if avg_kernel < best_kernel:
+                best_kernel = avg_kernel
         keep(dst[0])
 
         var data_bytes = seq * HIDDEN * 2
@@ -314,13 +339,14 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
             nw = 0
 
         var throughput = 0
-        if best_dispatched > 0:
-            throughput = seq * 1000 // best_dispatched
+        if best_kernel > 0:
+            throughput = seq * 1000 // best_kernel
 
         var pad = "  " if seq < 10 else " " if seq < 100 else ""
         print("  " + String(seq) + pad
             + "  | " + fmt_ns(best_inline)
-            + " | " + fmt_ns(best_dispatched)
+            + " | " + fmt_ns(best_kernel)
+            + " | " + fmt_ns(best_wall)
             + " | " + String(nw)
             + "       | " + String(throughput))
 
@@ -331,7 +357,7 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
     bases: ArenaBases[tp],
 ):
     print("\n=== Norm+residual add: seq_len sweep ===")
-    print("  seq | inline       | dispatched   | workers | tokens/us")
+    print("  seq | inline       | kernel       | wall         | workers | tokens/us")
 
     comptime NUM_SIZES = 9
     var sizes = InlineArray[Int, NUM_SIZES](fill=0)
@@ -378,9 +404,11 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](res_dst, bases),
                 Binding[BFloat16, tp](weight, bases),
                 seq, pools)
-        var best_dispatched = Int(1 << 60)
+        var best_wall = Int(1 << 60)
+        var best_kernel = Int(1 << 60)
         for _ in range(TRIALS):
-            var elapsed = 0
+            var wall_sum = 0
+            var kernel_sum = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
                 fused_norm_residual_add[
@@ -392,10 +420,15 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
                     Binding[BFloat16, tp](weight, bases),
                     seq, pools)
                 var t1 = Int(perf_counter_ns())
-                elapsed += t1 - t0
-            var avg = elapsed // ITERS
-            if avg < best_dispatched:
-                best_dispatched = avg
+                var t_done = max_last_ts[tp=tp](pools)
+                wall_sum += t1 - t0
+                kernel_sum += t_done - t0
+            var avg_wall = wall_sum // ITERS
+            var avg_kernel = kernel_sum // ITERS
+            if avg_wall < best_wall:
+                best_wall = avg_wall
+            if avg_kernel < best_kernel:
+                best_kernel = avg_kernel
         keep(res_dst[0])
 
         var data_bytes = seq * HIDDEN * 4
@@ -404,13 +437,14 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
             nw = 0
 
         var throughput = 0
-        if best_dispatched > 0:
-            throughput = seq * 1000 // best_dispatched
+        if best_kernel > 0:
+            throughput = seq * 1000 // best_kernel
 
         var pad = "  " if seq < 10 else " " if seq < 100 else ""
         print("  " + String(seq) + pad
             + "  | " + fmt_ns(best_inline)
-            + " | " + fmt_ns(best_dispatched)
+            + " | " + fmt_ns(best_kernel)
+            + " | " + fmt_ns(best_wall)
             + " | " + String(nw)
             + "       | " + String(throughput))
 
@@ -466,35 +500,13 @@ def main():
             print("arena alloc failed on node", topo[i])
             return
 
-    if topo.has_isolation():
-        print("mode: isolated")
-        var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
-        for i in range(tp):
-            pools.push(IsolatedBurstPool[].for_rank(topo, i))
-            print("  node " + String(topo[i]) + ": "
-                + String(pools[i].get_capacity()) + " workers")
-        print("")
-        if tp == 1:
-            run_all[tp=1](pools, arenas)
-        elif tp == 2:
-            run_all[tp=2](pools, arenas)
-        elif tp == 4:
-            run_all[tp=4](pools, arenas)
-        else:
-            print("unsupported tp=" + String(tp))
-    else:
-        print("mode: spin-backoff")
-        var pools = HeapMoveArray[BurstPool[]](tp)
-        for i in range(tp):
-            pools.push(BurstPool[].for_rank(topo, i))
-            print("  node " + String(topo[i]) + ": "
-                + String(pools[i].get_capacity()) + " workers")
-        print("")
-        if tp == 1:
-            run_all[tp=1](pools, arenas)
-        elif tp == 2:
-            run_all[tp=2](pools, arenas)
-        elif tp == 4:
-            run_all[tp=4](pools, arenas)
-        else:
-            print("unsupported tp=" + String(tp))
+    @parameter
+    def dispatch_rmsnorm_tp[
+        P: BurstThreadPool, //, degree: Int,
+    ](var selected_pools: HeapMoveArray[P]):
+        run_all[tp=degree](selected_pools, arenas)
+
+    with_topological_rank_dispatch[
+        power_of_two_unrolling=3,
+        dispatch=dispatch_rmsnorm_tp,
+    ](topo, "mode: isolated", "mode: spin-backoff")

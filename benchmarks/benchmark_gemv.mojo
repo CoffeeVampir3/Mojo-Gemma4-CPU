@@ -5,14 +5,14 @@ from std.benchmark import keep
 from std.sys.info import simd_width_of
 
 from numa import NumaArena, NumaTopology
-from threading import BurstPool
-from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
+from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.helpers import DispatchBuffer, tile_dispatch, Binding, ArenaBases
+from kernels.helpers import (
+    DispatchBuffer, tile_dispatch, Binding, ArenaBases, dot_into_accs,
+)
 from kernels.gemv import (
-    dot_row, gemv_range, dispatch_gemv, dispatch_gemv_chained_qkv,
-    GemvKernel,
+    gemv_range, dispatch_gemv, dispatch_gemv_chained_qkv, GemvKernel,
 )
 from simd_math import pick_port_unroll, tree_reduce_accs
 
@@ -90,6 +90,17 @@ def fmt_bw(total_bytes: Int, ns: Int) -> String:
     return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
 
 
+def max_last_ts[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P],
+) -> Int:
+    var hi = 0
+    for r in range(tp):
+        var ts = pools[r].last_worker_timestamp()
+        if ts > hi:
+            hi = ts
+    return hi
+
+
 def section_dot_primitive(x: BF16Ptr, weight: BF16Ptr):
     print("\n=== dot_row primitive (single row, HIDDEN=" + String(HIDDEN) + ") ===")
 
@@ -99,7 +110,7 @@ def section_dot_primitive(x: BF16Ptr, weight: BF16Ptr):
     for _ in range(WARMUP):
         comptime for p in range(PU):
             accs[p] = SIMD[DType.float32, FW](0)
-        dot_row[HIDDEN, PU](x, weight, accs)
+        dot_into_accs[cols=HIDDEN](x, weight, accs)
         keep(tree_reduce_accs(accs))
 
     var best = Int(1 << 60)
@@ -109,7 +120,7 @@ def section_dot_primitive(x: BF16Ptr, weight: BF16Ptr):
             var t0 = Int(perf_counter_ns())
             comptime for p in range(PU):
                 accs[p] = SIMD[DType.float32, FW](0)
-            dot_row[HIDDEN, PU](x, weight, accs)
+            dot_into_accs[cols=HIDDEN](x, weight, accs)
             keep(tree_reduce_accs(accs))
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
@@ -177,7 +188,7 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
     var cap = pool.get_capacity()
     print("\n=== Dispatch scaling (local Q rows=" + String(rows)
         + " rows, capacity=" + String(cap) + ") ===")
-    print("  workers | time         | weight BW    | speedup")
+    print("  workers | kernel time  | wall time    | weight BW    | speedup")
 
     for _ in range(WARMUP):
         gemv_range[rows, HIDDEN](x, weight, output, 0, rows)
@@ -196,6 +207,7 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
 
     var weight_bytes = rows * HIDDEN * 2
     print("  inline  | " + fmt_ns(best_inline)
+        + " | " + fmt_ns(best_inline)
         + " | " + fmt_bw(weight_bytes, best_inline) + " | 1.0x")
 
     var nw = 1
@@ -207,9 +219,11 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
                 pool, rows, num_workers=nw)
             pool.join()
 
-        var best = Int(1 << 60)
+        var best_wall = Int(1 << 60)
+        var best_kernel = Int(1 << 60)
         for _ in range(TRIALS):
-            var elapsed = 0
+            var wall_sum = 0
+            var kernel_sum = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
                 _ = tile_dispatch(buf,
@@ -217,17 +231,23 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
                     pool, rows, num_workers=nw)
                 pool.join()
                 var t1 = Int(perf_counter_ns())
-                elapsed += t1 - t0
-            var avg = elapsed // ITERS
-            if avg < best:
-                best = avg
+                var t_done = pool.last_worker_timestamp()
+                wall_sum += t1 - t0
+                kernel_sum += t_done - t0
+            var avg_wall = wall_sum // ITERS
+            var avg_kernel = kernel_sum // ITERS
+            if avg_wall < best_wall:
+                best_wall = avg_wall
+            if avg_kernel < best_kernel:
+                best_kernel = avg_kernel
         keep(output[0])
 
-        var speedup_10 = best_inline * 10 // best
+        var speedup_10 = best_inline * 10 // best_kernel
         var pad = "  " if nw < 10 else " "
         print("  " + String(nw) + pad
-            + "      | " + fmt_ns(best)
-            + " | " + fmt_bw(weight_bytes, best)
+            + "      | " + fmt_ns(best_kernel)
+            + " | " + fmt_ns(best_wall)
+            + " | " + fmt_bw(weight_bytes, best_kernel)
             + " | " + String(speedup_10 // 10) + "." + String(speedup_10 % 10) + "x")
 
         if nw < 4:
@@ -243,7 +263,7 @@ def measure_dispatch_gemv[
 ](
     mut pools: HeapMoveArray[P], x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
     bases: ArenaBases[tp],
-) -> Int:
+) -> Tuple[Int, Int]:
     var xs = Binding[BFloat16, tp](x, bases)
     var ws = Binding[BFloat16, tp](weight, bases)
     var outs = Binding[BFloat16, tp](output, bases)
@@ -252,22 +272,29 @@ def measure_dispatch_gemv[
         dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
         keep(output[0])
 
-    var best = Int(1 << 60)
+    var best_wall = Int(1 << 60)
+    var best_kernel = Int(1 << 60)
     for _ in range(TRIALS):
-        var elapsed = 0
+        var wall_sum = 0
+        var kernel_sum = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
             var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // ITERS
-        if avg < best:
-            best = avg
+            var t_done = max_last_ts[tp=tp](pools)
+            wall_sum += t1 - t0
+            kernel_sum += t_done - t0
+        var avg_wall = wall_sum // ITERS
+        var avg_kernel = kernel_sum // ITERS
+        if avg_wall < best_wall:
+            best_wall = avg_wall
+        if avg_kernel < best_kernel:
+            best_kernel = avg_kernel
     keep(output[0])
-    return best
+    return Tuple[Int, Int](best_kernel, best_wall)
 
 
-def print_projection_row(name: String, rows: Int, ns: Int):
+def print_projection_row(name: String, rows: Int, kernel_ns: Int, wall_ns: Int):
     var weight_bytes = rows * HIDDEN * 2
     var mb = weight_bytes // (1024 * 1024)
     var pad = ""
@@ -276,8 +303,9 @@ def print_projection_row(name: String, rows: Int, ns: Int):
     print("  " + name + pad
         + "| " + String(rows)
         + "  | " + String(mb)
-        + "        | " + fmt_ns(ns)
-        + " | " + fmt_bw(weight_bytes, ns))
+        + "        | " + fmt_ns(kernel_ns)
+        + " | " + fmt_ns(wall_ns)
+        + " | " + fmt_bw(weight_bytes, kernel_ns))
 
 
 def section_projection_sizes[P: BurstThreadPool, //, tp: Int](
@@ -285,7 +313,7 @@ def section_projection_sizes[P: BurstThreadPool, //, tp: Int](
     bases: ArenaBases[tp],
 ):
     print("\n=== Real projection sizes (full dispatch) ===")
-    print("  projection         | rows  | weight MB | time         | BW")
+    print("  projection         | rows  | weight MB | kernel time  | wall time    | BW")
 
     comptime SL_Q = Q_SLIDING // tp
     comptime SL_KV = KV_SLIDING // tp
@@ -294,19 +322,19 @@ def section_projection_sizes[P: BurstThreadPool, //, tp: Int](
 
     var sl_q = measure_dispatch_gemv[SL_Q, tp](
         pools, x, weight, output, bases)
-    print_projection_row("sliding Q", SL_Q, sl_q)
+    print_projection_row("sliding Q", SL_Q, sl_q[0], sl_q[1])
 
     var sl_kv = measure_dispatch_gemv[SL_KV, tp](
         pools, x, weight, output, bases)
-    print_projection_row("sliding KV", SL_KV, sl_kv)
+    print_projection_row("sliding KV", SL_KV, sl_kv[0], sl_kv[1])
 
     var fl_q = measure_dispatch_gemv[FL_Q, tp](
         pools, x, weight, output, bases)
-    print_projection_row("full Q", FL_Q, fl_q)
+    print_projection_row("full Q", FL_Q, fl_q[0], fl_q[1])
 
     var fl_k = measure_dispatch_gemv[FL_K, tp](
         pools, x, weight, output, bases)
-    print_projection_row("full K replicated", FL_K, fl_k)
+    print_projection_row("full K replicated", FL_K, fl_k[0], fl_k[1])
 
 
 def section_chained_qkv[P: BurstThreadPool, //, tp: Int](
@@ -333,46 +361,62 @@ def section_chained_qkv[P: BurstThreadPool, //, tp: Int](
         dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, kw, ko, pools)
         dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, vw, vo, pools)
 
-    var best_separate = Int(1 << 60)
+    var best_sep_wall = Int(1 << 60)
+    var best_sep_kernel = Int(1 << 60)
     for _ in range(TRIALS):
-        var elapsed = 0
+        var wall_sum = 0
+        var kernel_sum = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
             dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, kw, ko, pools)
             dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, vw, vo, pools)
             var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // ITERS
-        if avg < best_separate:
-            best_separate = avg
+            var t_done = max_last_ts[tp=tp](pools)
+            wall_sum += t1 - t0
+            kernel_sum += t_done - t0
+        var avg_wall = wall_sum // ITERS
+        var avg_kernel = kernel_sum // ITERS
+        if avg_wall < best_sep_wall:
+            best_sep_wall = avg_wall
+        if avg_kernel < best_sep_kernel:
+            best_sep_kernel = avg_kernel
     keep(q_out[0])
 
     for _ in range(WARMUP):
         dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN, tp=tp](
             xs, qw, kw, vw, qo, ko, vo, pools)
 
-    var best_chained = Int(1 << 60)
+    var best_ch_wall = Int(1 << 60)
+    var best_ch_kernel = Int(1 << 60)
     for _ in range(TRIALS):
-        var elapsed = 0
+        var wall_sum = 0
+        var kernel_sum = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN, tp=tp](
                 xs, qw, kw, vw, qo, ko, vo, pools)
             var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // ITERS
-        if avg < best_chained:
-            best_chained = avg
+            var t_done = max_last_ts[tp=tp](pools)
+            wall_sum += t1 - t0
+            kernel_sum += t_done - t0
+        var avg_wall = wall_sum // ITERS
+        var avg_kernel = kernel_sum // ITERS
+        if avg_wall < best_ch_wall:
+            best_ch_wall = avg_wall
+        if avg_kernel < best_ch_kernel:
+            best_ch_kernel = avg_kernel
     keep(q_out[0])
 
     var total_weight_bytes = (Q_R + KV_R + KV_R) * HIDDEN * 2
-    print("  3x separate: " + fmt_ns(best_separate)
-        + "  (" + fmt_bw(total_weight_bytes, best_separate) + ")")
-    print("  chained:     " + fmt_ns(best_chained)
-        + "  (" + fmt_bw(total_weight_bytes, best_chained) + ")")
-    print("  savings:     " + fmt_ns(best_separate - best_chained)
-        + "  (" + String(100 - best_chained * 100 // best_separate) + "%)")
+    print("  3x separate: kernel=" + fmt_ns(best_sep_kernel)
+        + " wall=" + fmt_ns(best_sep_wall)
+        + "  (" + fmt_bw(total_weight_bytes, best_sep_kernel) + ")")
+    print("  chained:     kernel=" + fmt_ns(best_ch_kernel)
+        + " wall=" + fmt_ns(best_ch_wall)
+        + "  (" + fmt_bw(total_weight_bytes, best_ch_kernel) + ")")
+    print("  savings:     kernel=" + fmt_ns(best_sep_kernel - best_ch_kernel)
+        + "  (" + String(100 - best_ch_kernel * 100 // best_sep_kernel) + "%)")
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -437,35 +481,13 @@ def main():
             print("arena alloc failed on node", topo[i])
             return
 
-    if topo.has_isolation():
-        print("mode: isolated")
-        var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
-        for i in range(tp):
-            pools.push(IsolatedBurstPool[].for_rank(topo, i))
-            print("  node " + String(topo[i]) + ": "
-                + String(pools[i].get_capacity()) + " workers")
-        print("")
-        if tp == 1:
-            run_all[tp=1](pools, arenas)
-        elif tp == 2:
-            run_all[tp=2](pools, arenas)
-        elif tp == 4:
-            run_all[tp=4](pools, arenas)
-        else:
-            print("unsupported tp=" + String(tp))
-    else:
-        print("mode: spin-backoff")
-        var pools = HeapMoveArray[BurstPool[]](tp)
-        for i in range(tp):
-            pools.push(BurstPool[].for_rank(topo, i))
-            print("  node " + String(topo[i]) + ": "
-                + String(pools[i].get_capacity()) + " workers")
-        print("")
-        if tp == 1:
-            run_all[tp=1](pools, arenas)
-        elif tp == 2:
-            run_all[tp=2](pools, arenas)
-        elif tp == 4:
-            run_all[tp=4](pools, arenas)
-        else:
-            print("unsupported tp=" + String(tp))
+    @parameter
+    def dispatch_gemv_tp[
+        P: BurstThreadPool, //, degree: Int,
+    ](var selected_pools: HeapMoveArray[P]):
+        run_all[tp=degree](selected_pools, arenas)
+
+    with_topological_rank_dispatch[
+        power_of_two_unrolling=3,
+        dispatch=dispatch_gemv_tp,
+    ](topo, "mode: isolated", "mode: spin-backoff")

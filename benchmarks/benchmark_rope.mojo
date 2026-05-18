@@ -2,12 +2,10 @@ from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
-from std.sys.info import simd_width_of
 
 from numa import NumaArena, NumaTopology
-from threading import BurstPool
-from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
+from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
 from kernels.helpers import Binding, ArenaBases
 from kernels.rope import (
@@ -114,6 +112,17 @@ def fmt_bw(total_bytes: Int, ns: Int) -> String:
     return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
 
 
+def max_last_ts[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P],
+) -> Int:
+    var hi = 0
+    for r in range(tp):
+        var ts = pools[r].last_worker_timestamp()
+        if ts > hi:
+            hi = ts
+    return hi
+
+
 def section_head_primitive(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr,
                            cos_fl: F32Ptr, sin_fl: F32Ptr):
     print("\n=== rope_head primitive (single head) ===")
@@ -204,7 +213,7 @@ def measure_sliding_cache_write[
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_sl: F32Ptr, sin_sl: F32Ptr,
     bases: ArenaBases[tp],
-) -> Int:
+) -> Tuple[Int, Int]:
     comptime Q_ROWS = Q_DIM_SLIDING // tp
     comptime KV_ROWS = KV_DIM_SLIDING // tp
     comptime NUM_Q = Q_ROWS // HEAD_DIM_SLIDING
@@ -226,9 +235,11 @@ def measure_sliding_cache_write[
             slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
         ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
 
-    var best = Int(1 << 60)
+    var best_wall = Int(1 << 60)
+    var best_kernel = Int(1 << 60)
     for _ in range(TRIALS):
-        var elapsed = 0
+        var wall_sum = 0
+        var kernel_sum = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_rope_cache_write[
@@ -237,12 +248,18 @@ def measure_sliding_cache_write[
                 head_dim=HEAD_DIM_SLIDING, kv_cache_stride=KV_ROWS,
                 slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
             ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
-            elapsed += Int(perf_counter_ns()) - t0
-        var avg = elapsed // ITERS
-        if avg < best:
-            best = avg
+            var t1 = Int(perf_counter_ns())
+            var t_done = max_last_ts[tp=tp](pools)
+            wall_sum += t1 - t0
+            kernel_sum += t_done - t0
+        var avg_wall = wall_sum // ITERS
+        var avg_kernel = kernel_sum // ITERS
+        if avg_wall < best_wall:
+            best_wall = avg_wall
+        if avg_kernel < best_kernel:
+            best_kernel = avg_kernel
     keep(q[0])
-    return best
+    return (best_kernel, best_wall)
 
 
 def measure_full_cache_write[
@@ -253,7 +270,7 @@ def measure_full_cache_write[
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_fl: F32Ptr, sin_fl: F32Ptr,
     bases: ArenaBases[tp],
-) -> Int:
+) -> Tuple[Int, Int]:
     comptime Q_ROWS = Q_DIM_FULL // tp
     comptime NUM_Q = Q_ROWS // HEAD_DIM_FULL
     comptime NUM_KV = KV_DIM_FULL // HEAD_DIM_FULL
@@ -279,9 +296,11 @@ def measure_full_cache_write[
             slot_mask=-1, cache_degree=tp, tp=tp,
         ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
 
-    var best = Int(1 << 60)
+    var best_wall = Int(1 << 60)
+    var best_kernel = Int(1 << 60)
     for _ in range(TRIALS):
-        var elapsed = 0
+        var wall_sum = 0
+        var kernel_sum = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_rope_cache_write[
@@ -290,12 +309,18 @@ def measure_full_cache_write[
                 head_dim=HEAD_DIM_FULL, kv_cache_stride=KV_DIM_FULL,
                 slot_mask=-1, cache_degree=tp, tp=tp,
             ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
-            elapsed += Int(perf_counter_ns()) - t0
-        var avg = elapsed // ITERS
-        if avg < best:
-            best = avg
+            var t1 = Int(perf_counter_ns())
+            var t_done = max_last_ts[tp=tp](pools)
+            wall_sum += t1 - t0
+            kernel_sum += t_done - t0
+        var avg_wall = wall_sum // ITERS
+        var avg_kernel = kernel_sum // ITERS
+        if avg_wall < best_wall:
+            best_wall = avg_wall
+        if avg_kernel < best_kernel:
+            best_kernel = avg_kernel
     keep(q[0])
-    return best
+    return (best_kernel, best_wall)
 
 
 def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
@@ -319,10 +344,12 @@ def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
 
     comptime SL_BYTES = (Q_DIM_SLIDING // tp + 2 * (KV_DIM_SLIDING // tp)) * 2
     comptime FL_BYTES = (Q_DIM_FULL // tp + 2 * KV_DIM_FULL) * 2
-    print("  sliding: " + fmt_ns(sliding)
-        + "  (" + fmt_bw(SL_BYTES, sliding) + " q/k/v touch)")
-    print("  full:    " + fmt_ns(full)
-        + "  (" + fmt_bw(FL_BYTES, full) + " q/k/v touch)")
+    print("  sliding: kernel=" + fmt_ns(sliding[0])
+        + " | wall=" + fmt_ns(sliding[1])
+        + "  (" + fmt_bw(SL_BYTES, sliding[0]) + " q/k/v touch)")
+    print("  full:    kernel=" + fmt_ns(full[0])
+        + " | wall=" + fmt_ns(full[1])
+        + "  (" + fmt_bw(FL_BYTES, full[0]) + " q/k/v touch)")
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -411,35 +438,13 @@ def main():
             print("arena alloc failed on node", topo[i])
             return
 
-    if topo.has_isolation():
-        print("mode: isolated")
-        var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
-        for i in range(tp):
-            pools.push(IsolatedBurstPool[].for_rank(topo, i))
-            print("  node " + String(topo[i]) + ": "
-                + String(pools[i].get_capacity()) + " workers")
-        print("")
-        if tp == 1:
-            run_all[tp=1](pools, arenas)
-        elif tp == 2:
-            run_all[tp=2](pools, arenas)
-        elif tp == 4:
-            run_all[tp=4](pools, arenas)
-        else:
-            print("unsupported tp=" + String(tp))
-    else:
-        print("mode: spin-backoff")
-        var pools = HeapMoveArray[BurstPool[]](tp)
-        for i in range(tp):
-            pools.push(BurstPool[].for_rank(topo, i))
-            print("  node " + String(topo[i]) + ": "
-                + String(pools[i].get_capacity()) + " workers")
-        print("")
-        if tp == 1:
-            run_all[tp=1](pools, arenas)
-        elif tp == 2:
-            run_all[tp=2](pools, arenas)
-        elif tp == 4:
-            run_all[tp=4](pools, arenas)
-        else:
-            print("unsupported tp=" + String(tp))
+    @parameter
+    def dispatch_rope_tp[
+        P: BurstThreadPool, //, degree: Int,
+    ](var selected_pools: HeapMoveArray[P]):
+        run_all[tp=degree](selected_pools, arenas)
+
+    with_topological_rank_dispatch[
+        power_of_two_unrolling=3,
+        dispatch=dispatch_rope_tp,
+    ](topo, "mode: isolated", "mode: spin-backoff")

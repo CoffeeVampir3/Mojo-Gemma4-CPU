@@ -2,6 +2,7 @@ from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
 from notstdcollections import HeapMoveArray
+from simd_math import pick_port_unroll
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 from .dispatch_heuristics import (
@@ -27,6 +28,93 @@ trait OutputPartitionedKernel(BurstKernel):
 
     @always_inline
     def set_partition(mut self, worker_id: Int, start: Int, end: Int): ...
+
+
+trait RangePartitionedKernel(OutputPartitionedKernel):
+    """Kernel that only consumes (start, end). Implementers provide
+    `install_range`; `set_partition` is wired automatically."""
+
+    @always_inline
+    def install_range(mut self, start: Int, end: Int): ...
+
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.install_range(start, end)
+
+
+trait WorkerRangePartitionedKernel(OutputPartitionedKernel):
+    """Kernel that also needs the worker id (per-worker scratch).
+    Implementers provide `install_worker_range`."""
+
+    @always_inline
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ): ...
+
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.install_worker_range(worker_id, start, end)
+
+
+@always_inline
+def dot_into_accs[
+    port_unroll: Int,
+    x_dtype: DType, w_dtype: DType,
+    accum: DType, //,
+    cols: Int,
+](
+    x: UnsafePointer[Scalar[x_dtype], MutAnyOrigin],
+    w: UnsafePointer[Scalar[w_dtype], MutAnyOrigin],
+    mut accs: InlineArray[SIMD[accum, simd_width_of[accum]()], port_unroll],
+):
+    comptime width = simd_width_of[accum]()
+    comptime STRIDE = port_unroll * width
+    for i in range(cols // STRIDE):
+        comptime for p in range(port_unroll):
+            var off = i * STRIDE + p * width
+            var xv = (x + off).load[width=width]().cast[accum]()
+            var wv = (w + off).load[width=width]().cast[accum]()
+            accs[p] = xv.fma(wv, accs[p])
+
+
+@always_inline
+def accumulate_scaled[
+    src_dtype: DType, accum: DType, //,
+    cols: Int,
+](
+    src: UnsafePointer[Scalar[src_dtype], MutAnyOrigin],
+    weight: Scalar[accum],
+    acc: UnsafePointer[Scalar[accum], MutAnyOrigin],
+):
+    """`acc[i] += weight * src[i]` over `cols` with PU-unrolled SIMD."""
+    comptime width = simd_width_of[accum]()
+    comptime PU = pick_port_unroll[width, cols]()
+    comptime STRIDE = PU * width
+    var w_vec = SIMD[accum, width](weight)
+    for i in range(cols // STRIDE):
+        comptime for p in range(PU):
+            var off = i * STRIDE + p * width
+            var vv = (src + off).load[width=width]().cast[accum]()
+            var av = (acc + off).load[width=width]()
+            (acc + off).store(vv.fma(w_vec, av))
+
+
+@always_inline
+def scale_unrolled[
+    accum: DType, //,
+    cols: Int,
+](
+    acc: UnsafePointer[Scalar[accum], MutAnyOrigin],
+    factor: Scalar[accum],
+):
+    comptime width = simd_width_of[accum]()
+    comptime PU = pick_port_unroll[width, cols]()
+    comptime STRIDE = PU * width
+    var f = SIMD[accum, width](factor)
+    for i in range(cols // STRIDE):
+        comptime for p in range(PU):
+            var off = i * STRIDE + p * width
+            (acc + off).store((acc + off).load[width=width]() * f)
 
 
 @fieldwise_init

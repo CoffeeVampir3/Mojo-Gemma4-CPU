@@ -4,9 +4,8 @@ from std.time import perf_counter_ns
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
-from threading import BurstPool
-from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
+from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
 from kernels.logsum_merge import dispatch_merge_flash_partials, FinalizeKernel
 from kernels.helpers import (
@@ -112,12 +111,29 @@ def fmt_ns(ns: Int) -> String:
         return String(ns // 1000000) + "." + String((ns % 1000000) // 100000) + " ms"
 
 
+def max_last_ts[P: BurstThreadPool, //, tp: Int](
+    mut pools: HeapMoveArray[P],
+) -> Int:
+    var hi = 0
+    for r in range(tp):
+        var ts = pools[r].last_worker_timestamp()
+        if ts > hi:
+            hi = ts
+    return hi
+
+
+@fieldwise_init
+struct MergeTiming(Copyable, ImplicitlyCopyable):
+    var kernel_ns: Int
+    var wall_ns: Int
+
+
 def measure_finalize[
     P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
 ](
     output: BF16Ptr, partials: F32Ptr, scratch: F32Ptr,
     num_sources: Int, mut pools: HeapMoveArray[P], bases: ArenaBases[tp],
-) -> Int:
+) -> MergeTiming:
     warm_pool(scratch, pools[0])
     for _ in range(WARMUP):
         dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
@@ -127,9 +143,11 @@ def measure_finalize[
             inline_max_bytes=0)
         keep(output[0])
 
-    var best = Int(1 << 60)
+    var best_wall = Int(1 << 60)
+    var best_kernel = Int(1 << 60)
     for _ in range(TRIALS):
-        var elapsed = 0
+        var wall_sum = 0
+        var kernel_sum = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
@@ -137,12 +155,18 @@ def measure_finalize[
                 Binding[Float32, tp](partials, bases),
                 source_counts[tp](num_sources), pools,
                 inline_max_bytes=0)
+            var t1 = Int(perf_counter_ns())
+            var t_done = max_last_ts[tp=tp](pools)
             keep(output[0])
-            elapsed += Int(perf_counter_ns()) - t0
-        var avg = elapsed // ITERS
-        if avg < best:
-            best = avg
-    return best
+            wall_sum += t1 - t0
+            kernel_sum += t_done - t0
+        var avg_wall = wall_sum // ITERS
+        var avg_kernel = kernel_sum // ITERS
+        if avg_wall < best_wall:
+            best_wall = avg_wall
+        if avg_kernel < best_kernel:
+            best_kernel = avg_kernel
+    return MergeTiming(best_kernel, best_wall)
 
 
 def measure_finalize_inline[
@@ -198,15 +222,15 @@ def run_config[
 
     print("\n=== head_dim=" + String(head_dim) + " num_q=" + String(num_q)
         + " pool_capacity=" + String(pools[0].get_capacity()) + " ===")
-    print("  sources | data     | inline     | dispatched")
+    print("  sources | data     | inline     | kernel     | wall       -> best")
 
-    var source_counts = InlineArray[Int, 7](fill=0)
-    source_counts[0] = 2; source_counts[1] = 4; source_counts[2] = 8
-    source_counts[3] = 16; source_counts[4] = 32; source_counts[5] = 64
-    source_counts[6] = 128
+    var counts = InlineArray[Int, 7](fill=0)
+    counts[0] = 2; counts[1] = 4; counts[2] = 8
+    counts[3] = 16; counts[4] = 32; counts[5] = 64
+    counts[6] = 128
 
     for s in range(7):
-        var ns = source_counts[s]
+        var ns = counts[s]
         var data_bytes = ns * (head_dim + 2) * 4 * num_q
 
         var t_inline = measure_finalize_inline[head_dim, num_q, tp](
@@ -225,12 +249,23 @@ def run_config[
         line += " " * (7 - kb_str.byte_length())
         line += "| " + fmt_ns(t_inline)
         line += " " * max(0, 11 - fmt_ns(t_inline).byte_length())
-        line += "| " + fmt_ns(t_dispatched)
+        line += "| " + fmt_ns(t_dispatched.kernel_ns)
+        line += " " * max(0, 11 - fmt_ns(t_dispatched.kernel_ns).byte_length())
+        line += "| " + fmt_ns(t_dispatched.wall_ns)
+        line += " " * max(0, 11 - fmt_ns(t_dispatched.wall_ns).byte_length())
 
-        var best_label = "inline" if t_inline <= t_dispatched else "dispatched"
-        line += " -> " + best_label
+        var best_label = "inline" if t_inline <= t_dispatched.kernel_ns else "dispatched"
+        line += "-> " + best_label
 
         print(line)
+
+
+def run_all[P: BurstThreadPool, //, tp: Int](
+    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: HeapMoveArray[P],
+):
+    run_config[head_dim=256, num_q=8, tp=tp](arenas, pools)
+    run_config[head_dim=512, num_q=16, tp=tp](arenas, pools)
 
 
 def main():
@@ -239,7 +274,7 @@ def main():
 
     print("logsum_merge worker count sweep")
     print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus")
+        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
 
     comptime ARENA_BYTES = 128 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
@@ -249,35 +284,13 @@ def main():
             print("arena alloc failed on node", topo[i])
             return
 
-    if topo.has_isolation():
-        print("mode: isolated")
-        var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
-        for i in range(tp):
-            pools.push(IsolatedBurstPool[].for_rank(topo, i))
-        if tp == 1:
-            run_config[head_dim=256, num_q=8, tp=1](arenas, pools)
-            run_config[head_dim=512, num_q=16, tp=1](arenas, pools)
-        elif tp == 2:
-            run_config[head_dim=256, num_q=8, tp=2](arenas, pools)
-            run_config[head_dim=512, num_q=16, tp=2](arenas, pools)
-        elif tp == 4:
-            run_config[head_dim=256, num_q=8, tp=4](arenas, pools)
-            run_config[head_dim=512, num_q=16, tp=4](arenas, pools)
-        else:
-            print("unsupported tp=" + String(tp))
-    else:
-        print("mode: spin-backoff")
-        var pools = HeapMoveArray[BurstPool[]](tp)
-        for i in range(tp):
-            pools.push(BurstPool[].for_rank(topo, i))
-        if tp == 1:
-            run_config[head_dim=256, num_q=8, tp=1](arenas, pools)
-            run_config[head_dim=512, num_q=16, tp=1](arenas, pools)
-        elif tp == 2:
-            run_config[head_dim=256, num_q=8, tp=2](arenas, pools)
-            run_config[head_dim=512, num_q=16, tp=2](arenas, pools)
-        elif tp == 4:
-            run_config[head_dim=256, num_q=8, tp=4](arenas, pools)
-            run_config[head_dim=512, num_q=16, tp=4](arenas, pools)
-        else:
-            print("unsupported tp=" + String(tp))
+    @parameter
+    def dispatch_logsum_merge_tp[
+        P: BurstThreadPool, //, degree: Int,
+    ](var selected_pools: HeapMoveArray[P]):
+        run_all[tp=degree](arenas, selected_pools)
+
+    with_topological_rank_dispatch[
+        power_of_two_unrolling=3,
+        dispatch=dispatch_logsum_merge_tp,
+    ](topo, "mode: isolated", "mode: spin-backoff")

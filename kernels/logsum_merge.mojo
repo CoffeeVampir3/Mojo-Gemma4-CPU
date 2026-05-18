@@ -6,7 +6,7 @@ from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
-    OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
+    RangePartitionedKernel, DispatchBuffer, tile_dispatch,
     fanout_dispatch, join_all, Binding,
 )
 from .attention_ops import flash_partial_stride
@@ -99,7 +99,7 @@ def finalize_head[head_dim: Int, num_q: Int](
 
 
 @fieldwise_init
-struct FinalizeKernel[head_dim: Int, num_q: Int](OutputPartitionedKernel):
+struct FinalizeKernel[head_dim: Int, num_q: Int](RangePartitionedKernel):
     comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
     var output: BF16Ptr
@@ -115,7 +115,7 @@ struct FinalizeKernel[head_dim: Int, num_q: Int](OutputPartitionedKernel):
                 self.num_sources, h)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 
@@ -220,7 +220,7 @@ def finalize_context_head[
 @fieldwise_init
 struct ContextFinalizeKernel[
     head_dim: Int, num_q: Int, local_num_q: Int, tp: Int, cfg_origin: Origin,
-](OutputPartitionedKernel):
+](RangePartitionedKernel):
     var config: UnsafePointer[
         ContextFlashMergeConfig[Self.head_dim, Self.num_q, Self.tp],
         Self.cfg_origin]
@@ -236,7 +236,7 @@ struct ContextFinalizeKernel[
             ](self.config, self.q_rank, local_h)
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
 

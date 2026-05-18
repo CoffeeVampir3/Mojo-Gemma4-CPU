@@ -5,18 +5,17 @@ from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
-    OutputPartitionedKernel, fanout_dispatch_per_rank, Binding,
+    WorkerRangePartitionedKernel, fanout_dispatch_per_rank, Binding,
+    accumulate_scaled, scale_unrolled,
 )
-from .attention_ops import (
-    score_position, accumulate_v, scale_acc, flash_partial_stride,
-)
+from .attention_ops import score_position, flash_partial_stride
 
 
 @fieldwise_init
 struct FlashDecodeKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int,
-](OutputPartitionedKernel):
+](WorkerRangePartitionedKernel):
     comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
     var q: BF16Ptr
@@ -68,14 +67,15 @@ struct FlashDecodeKernel[
                 var weights = fast_exp_softmax_biased[TILE](
                     scores - SIMD[DType.float32, TILE](m_new))
 
-                scale_acc[Self.head_dim](acc_ptrs[q_idx], corr)
+                scale_unrolled[cols=Self.head_dim](acc_ptrs[q_idx], corr)
                 l[q_idx] = l[q_idx] * corr + weights.reduce_add()
                 m[q_idx] = m_new
 
                 for t in range(tile_len):
                     var cache_slot = (self.start_pos + pos + t) & (Self.window - 1)
                     var v_head = self.v_base + cache_slot * Self.kv_stride + kv_h * Self.head_dim
-                    accumulate_v[Self.head_dim](v_head, weights[t], acc_ptrs[q_idx])
+                    accumulate_scaled[cols=Self.head_dim](
+                        v_head, weights[t], acc_ptrs[q_idx])
 
             pos += TILE
 
@@ -84,7 +84,9 @@ struct FlashDecodeKernel[
             (my_partial + l_off + h)[] = l[h]
 
     @always_inline
-    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
         self.worker_id = worker_id
         self.start = start
         self.end = end
