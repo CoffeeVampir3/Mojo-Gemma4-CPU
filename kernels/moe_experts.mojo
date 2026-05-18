@@ -8,8 +8,52 @@ from .helpers import (
     BF16Ptr, F32Ptr, I32Ptr, W, BW,
     fanout_dispatch, saturate_workers,
 )
-from .dpbf16 import bf16_pair_dot
+from .dpbf16 import bf16_panel_dot_to_scalars
 from .moe_router import SparseRoute, SparseRoutePtr
+
+
+@always_inline
+def emit_gate_up_panel[
+    panel: Int, hidden: Int, intermediate: Int, tile_j: Int, port_unroll: Int,
+](
+    routes: SparseRoutePtr,
+    x_normed: BF16Ptr,
+    rec_start: Int,
+    gate_w_base: BF16Ptr,
+    up_w_base: BF16Ptr,
+    gate_part: F32Ptr,
+    up_part: F32Ptr,
+    bucket_base: BF16Ptr,
+):
+    """Per-tile MR-or-1 panel: gather the panel's x rows, run gate and up
+    dots column-by-column through `bf16_panel_dot_to_scalars`, then fuse
+    gelu(g) * u and store into the panel's slice of `hidden_bucket`."""
+    var x_rows = InlineArray[BF16Ptr, panel](uninitialized=True)
+    comptime for r in range(panel):
+        x_rows[r] = x_normed + Int(routes[rec_start + r].token) * hidden
+
+    for j_off in range(tile_j):
+        var w_row_g = gate_w_base + j_off * hidden
+        var w_row_u = up_w_base + j_off * hidden
+        var g_vals = bf16_panel_dot_to_scalars[
+            cols=hidden, port_unroll=port_unroll,
+        ](w_row_g, x_rows)
+        var u_vals = bf16_panel_dot_to_scalars[
+            cols=hidden, port_unroll=port_unroll,
+        ](w_row_u, x_rows)
+        comptime for r in range(panel):
+            gate_part[r * tile_j + j_off] = g_vals[r]
+            up_part[r * tile_j + j_off] = u_vals[r]
+
+    comptime for r in range(panel):
+        var bucket_row = bucket_base + r * intermediate
+        var src_g = gate_part + r * tile_j
+        var src_u = up_part + r * tile_j
+        for j_off in range(0, tile_j, W):
+            var g = (src_g + j_off).load[width=W]()
+            var u = (src_u + j_off).load[width=W]()
+            var v = gelu_tanh_f32[W](g) * u
+            (bucket_row + j_off).store(v.cast[DType.bfloat16]())
 
 
 @fieldwise_init
@@ -75,116 +119,35 @@ struct Phase1GateUpKernel[
 
             var rec_block = 0
             while rec_block + MR <= n_tok:
-                var x_rows = InlineArray[BF16Ptr, MR](uninitialized=True)
-                comptime for r in range(MR):
-                    x_rows[r] = (
-                        self.x_normed
-                        + Int(self.routes[rec_lo + rec_block + r].token)
-                            * Self.hidden)
-
-                for j_off in range(tile_j):
-                    var w_row = gate_w_base + j_off * Self.hidden
-                    var accs = InlineArray[
-                        InlineArray[SIMD[DType.float32, W], PU_GU], MR,
-                    ](uninitialized=True)
-                    comptime for r in range(MR):
-                        comptime for p in range(PU_GU):
-                            accs[r][p] = SIMD[DType.float32, W](0)
-                    for i in range(Self.hidden // STRIDE_GU):
-                        comptime for p in range(PU_GU):
-                            var off = i * STRIDE_GU + p * BW
-                            var w_v = (w_row + off).load[width=BW]()
-                            comptime for r in range(MR):
-                                var x_v = (x_rows[r] + off).load[width=BW]()
-                                accs[r][p] = bf16_pair_dot(accs[r][p], x_v, w_v)
-                    comptime for r in range(MR):
-                        var s = SIMD[DType.float32, W](0)
-                        comptime for p in range(PU_GU):
-                            s += accs[r][p]
-                        gate_part[r * tile_j + j_off] = s.reduce_add()
-
-                for j_off in range(tile_j):
-                    var w_row = up_w_base + j_off * Self.hidden
-                    var accs = InlineArray[
-                        InlineArray[SIMD[DType.float32, W], PU_GU], MR,
-                    ](uninitialized=True)
-                    comptime for r in range(MR):
-                        comptime for p in range(PU_GU):
-                            accs[r][p] = SIMD[DType.float32, W](0)
-                    for i in range(Self.hidden // STRIDE_GU):
-                        comptime for p in range(PU_GU):
-                            var off = i * STRIDE_GU + p * BW
-                            var w_v = (w_row + off).load[width=BW]()
-                            comptime for r in range(MR):
-                                var x_v = (x_rows[r] + off).load[width=BW]()
-                                accs[r][p] = bf16_pair_dot(accs[r][p], x_v, w_v)
-                    comptime for r in range(MR):
-                        var s = SIMD[DType.float32, W](0)
-                        comptime for p in range(PU_GU):
-                            s += accs[r][p]
-                        up_part[r * tile_j + j_off] = s.reduce_add()
-
-                comptime for r in range(MR):
-                    var bucket_row = (
-                        self.hidden_bucket
-                        + (rec_lo + rec_block + r) * Self.intermediate
-                        + j_lo)
-                    var src_g = gate_part + r * tile_j
-                    var src_u = up_part + r * tile_j
-                    for j_off in range(0, tile_j, W):
-                        var g = (src_g + j_off).load[width=W]()
-                        var u = (src_u + j_off).load[width=W]()
-                        var v = gelu_tanh_f32[W](g) * u
-                        (bucket_row + j_off).store(v.cast[DType.bfloat16]())
-
-                rec_block += MR
-
-            while rec_block < n_tok:
-                var tok = Int(self.routes[rec_lo + rec_block].token)
-                var x_row = self.x_normed + tok * Self.hidden
-
-                for j_off in range(tile_j):
-                    var w_row = gate_w_base + j_off * Self.hidden
-                    var accs = InlineArray[
-                        SIMD[DType.float32, W], PU_GU,
-                    ](fill=SIMD[DType.float32, W](0))
-                    for i in range(Self.hidden // STRIDE_GU):
-                        comptime for p in range(PU_GU):
-                            var off = i * STRIDE_GU + p * BW
-                            var w_v = (w_row + off).load[width=BW]()
-                            var x_v = (x_row + off).load[width=BW]()
-                            accs[p] = bf16_pair_dot(accs[p], x_v, w_v)
-                    var s = SIMD[DType.float32, W](0)
-                    comptime for p in range(PU_GU):
-                        s += accs[p]
-                    gate_part[j_off] = s.reduce_add()
-
-                for j_off in range(tile_j):
-                    var w_row = up_w_base + j_off * Self.hidden
-                    var accs = InlineArray[
-                        SIMD[DType.float32, W], PU_GU,
-                    ](fill=SIMD[DType.float32, W](0))
-                    for i in range(Self.hidden // STRIDE_GU):
-                        comptime for p in range(PU_GU):
-                            var off = i * STRIDE_GU + p * BW
-                            var w_v = (w_row + off).load[width=BW]()
-                            var x_v = (x_row + off).load[width=BW]()
-                            accs[p] = bf16_pair_dot(accs[p], x_v, w_v)
-                    var s = SIMD[DType.float32, W](0)
-                    comptime for p in range(PU_GU):
-                        s += accs[p]
-                    up_part[j_off] = s.reduce_add()
-
-                var bucket_row = (
+                var bucket_base = (
                     self.hidden_bucket
                     + (rec_lo + rec_block) * Self.intermediate
                     + j_lo)
-                for j_off in range(0, tile_j, W):
-                    var g = (gate_part + j_off).load[width=W]()
-                    var u = (up_part + j_off).load[width=W]()
-                    var v = gelu_tanh_f32[W](g) * u
-                    (bucket_row + j_off).store(v.cast[DType.bfloat16]())
+                emit_gate_up_panel[
+                    panel=MR, hidden=Self.hidden,
+                    intermediate=Self.intermediate, tile_j=tile_j,
+                    port_unroll=PU_GU,
+                ](
+                    self.routes, self.x_normed, rec_lo + rec_block,
+                    gate_w_base, up_w_base,
+                    gate_part, up_part, bucket_base,
+                )
+                rec_block += MR
 
+            while rec_block < n_tok:
+                var bucket_base = (
+                    self.hidden_bucket
+                    + (rec_lo + rec_block) * Self.intermediate
+                    + j_lo)
+                emit_gate_up_panel[
+                    panel=1, hidden=Self.hidden,
+                    intermediate=Self.intermediate, tile_j=tile_j,
+                    port_unroll=PU_GU,
+                ](
+                    self.routes, self.x_normed, rec_lo + rec_block,
+                    gate_w_base, up_w_base,
+                    gate_part, up_part, bucket_base,
+                )
                 rec_block += 1
 
     @always_inline
@@ -226,6 +189,39 @@ def dispatch_phase1_gate_up[
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
     ](pools, total_units, total_units * hidden * 2)
+
+
+@always_inline
+def emit_down_panel[
+    panel: Int, hidden: Int, intermediate: Int, port_unroll: Int,
+](
+    routes: SparseRoutePtr,
+    moe_accum: F32Ptr,
+    rec_start: Int,
+    hm_base: BF16Ptr,
+    down_w: BF16Ptr,
+    start: Int, end: Int,
+):
+    """Per panel: collect hm rows + per-token dst rows + weights, then
+    iterate output channels m in [start, end), dot the down weight column
+    against the panel via `bf16_panel_dot_to_scalars`, and scatter-add
+    `out * weight` into each token's accumulator."""
+    var hm_rows = InlineArray[BF16Ptr, panel](uninitialized=True)
+    var dst_rows = InlineArray[F32Ptr, panel](uninitialized=True)
+    var weights = InlineArray[Float32, panel](uninitialized=True)
+    comptime for r in range(panel):
+        hm_rows[r] = hm_base + r * intermediate
+        var rec = routes[rec_start + r]
+        dst_rows[r] = moe_accum + Int(rec.token) * hidden
+        weights[r] = rec.weight
+
+    for m in range(start, end):
+        var w_row = down_w + m * intermediate
+        var vals = bf16_panel_dot_to_scalars[
+            cols=intermediate, port_unroll=port_unroll,
+        ](w_row, hm_rows)
+        comptime for r in range(panel):
+            (dst_rows[r] + m)[] = (dst_rows[r] + m)[] + vals[r] * weights[r]
 
 
 @fieldwise_init
@@ -274,66 +270,30 @@ struct Phase2DownKernel[
             var tok_base = 0
             while tok_base < n_tok_total:
                 var n_tok = min(Self.TOK_TILE, n_tok_total - tok_base)
-                var route_base = self.routes + rec_lo + tok_base
-                var bucket_base = (
-                    self.hidden_bucket + (rec_lo + tok_base) * Self.intermediate)
 
                 var rec_block = 0
                 while rec_block + MR <= n_tok:
-                    var hm_rows = InlineArray[BF16Ptr, MR](uninitialized=True)
-                    var dst_rows = InlineArray[F32Ptr, MR](uninitialized=True)
-                    var weights = InlineArray[Float32, MR](uninitialized=True)
-                    comptime for r in range(MR):
-                        hm_rows[r] = bucket_base + (rec_block + r) * Self.intermediate
-                        var rec = route_base[rec_block + r]
-                        dst_rows[r] = self.moe_accum + Int(rec.token) * Self.hidden
-                        weights[r] = rec.weight
-
-                    for m in range(self.start, self.end):
-                        var w_row = down_w + m * Self.intermediate
-                        var accs = InlineArray[
-                            InlineArray[SIMD[DType.float32, W], PU_DN], MR,
-                        ](uninitialized=True)
-                        comptime for r in range(MR):
-                            comptime for p in range(PU_DN):
-                                accs[r][p] = SIMD[DType.float32, W](0)
-                        for i in range(Self.intermediate // STRIDE_DN):
-                            comptime for p in range(PU_DN):
-                                var off = i * STRIDE_DN + p * BW
-                                var w_v = (w_row + off).load[width=BW]()
-                                comptime for r in range(MR):
-                                    var x_v = (hm_rows[r] + off).load[width=BW]()
-                                    accs[r][p] = bf16_pair_dot(accs[r][p], x_v, w_v)
-                        comptime for r in range(MR):
-                            var s = SIMD[DType.float32, W](0)
-                            comptime for p in range(PU_DN):
-                                s += accs[r][p]
-                            var out = s.reduce_add()
-                            (dst_rows[r] + m)[] = (
-                                (dst_rows[r] + m)[] + out * weights[r])
+                    var rec_start = rec_lo + tok_base + rec_block
+                    var hm_base = self.hidden_bucket + rec_start * Self.intermediate
+                    emit_down_panel[
+                        panel=MR, hidden=Self.hidden,
+                        intermediate=Self.intermediate, port_unroll=PU_DN,
+                    ](
+                        self.routes, self.moe_accum, rec_start,
+                        hm_base, down_w, self.start, self.end,
+                    )
                     rec_block += MR
 
                 while rec_block < n_tok:
-                    var hm_row = bucket_base + rec_block * Self.intermediate
-                    var rec = route_base[rec_block]
-                    var dst_row = self.moe_accum + Int(rec.token) * Self.hidden
-                    var weight = rec.weight
-                    for m in range(self.start, self.end):
-                        var w_row = down_w + m * Self.intermediate
-                        var accs = InlineArray[
-                            SIMD[DType.float32, W], PU_DN,
-                        ](fill=SIMD[DType.float32, W](0))
-                        for i in range(Self.intermediate // STRIDE_DN):
-                            comptime for p in range(PU_DN):
-                                var off = i * STRIDE_DN + p * BW
-                                var w_v = (w_row + off).load[width=BW]()
-                                var x_v = (hm_row + off).load[width=BW]()
-                                accs[p] = bf16_pair_dot(accs[p], x_v, w_v)
-                        var s = SIMD[DType.float32, W](0)
-                        comptime for p in range(PU_DN):
-                            s += accs[p]
-                        var out = s.reduce_add()
-                        (dst_row + m)[] = (dst_row + m)[] + out * weight
+                    var rec_start = rec_lo + tok_base + rec_block
+                    var hm_base = self.hidden_bucket + rec_start * Self.intermediate
+                    emit_down_panel[
+                        panel=1, hidden=Self.hidden,
+                        intermediate=Self.intermediate, port_unroll=PU_DN,
+                    ](
+                        self.routes, self.moe_accum, rec_start,
+                        hm_base, down_w, self.start, self.end,
+                    )
                     rec_block += 1
 
                 tok_base += n_tok
