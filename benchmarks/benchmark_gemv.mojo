@@ -202,7 +202,7 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
     while nw <= cap:
         var buf = DispatchBuffer[GemvKernel[rows, HIDDEN]]()
         for _ in range(WARMUP):
-            tile_dispatch(buf,
+            _ = tile_dispatch(buf,
                 GemvKernel[rows, HIDDEN](x, weight, output, 0, 0),
                 pool, rows, num_workers=nw)
             pool.join()
@@ -212,7 +212,7 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
             var elapsed = 0
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
-                tile_dispatch(buf,
+                _ = tile_dispatch(buf,
                     GemvKernel[rows, HIDDEN](x, weight, output, 0, 0),
                     pool, rows, num_workers=nw)
                 pool.join()

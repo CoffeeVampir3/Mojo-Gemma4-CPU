@@ -5,13 +5,11 @@ from simd_math import sincos_simd
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, Binding,
-    tile_dispatch, recommended_workers, join_all,
+    OutputPartitionedKernel, Binding,
+    fanout_dispatch,
     BF16Ptr, F32Ptr, W,
 )
-
-
-comptime ROPE_INLINE_TOKENS = 16
+from .dispatch_heuristics import ROPE_INLINE_TOKENS
 
 
 @always_inline
@@ -137,31 +135,21 @@ def dispatch_rope_cache_write[
     base_pos: Int, seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    comptime Kern = RopeCacheWriteKernel[
+    comptime K = RopeCacheWriteKernel[
         half, pair_stride, num_q, num_kv, head_dim,
         kv_cache_stride, slot_mask, cache_degree]
+    comptime row_bytes = (num_q + 2 * num_kv) * head_dim * 2
 
-    if seq_len <= ROPE_INLINE_TOKENS:
-        for r in range(tp):
-            var kern = Kern(q[r], k_src[r], v_src[r],
-                k_cache[r], v_cache[r],
-                cos_table[r], sin_table[r],
-                base_pos, r % cache_degree, 0, seq_len)
-            kern.execute()
-        return
-
-    var data_bytes = seq_len * (num_q + 2 * num_kv) * head_dim * 2
-    var buf = DispatchBuffer[Kern, max_worker_count]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
-            Kern(q[r], k_src[r], v_src[r],
+    @parameter
+    def make(r: Int) -> K:
+        return K(q[r], k_src[r], v_src[r],
                  k_cache[r], v_cache[r],
                  cos_table[r], sin_table[r],
-                 base_pos, r % cache_degree, 0, 0),
-            pools[r], seq_len, num_workers=nw)
-    join_all[tp](pools)
+                 base_pos, r % cache_degree, 0, 0)
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, seq_len, seq_len * row_bytes,
+        inline_threshold_bytes=ROPE_INLINE_TOKENS * row_bytes)
 
 def init_rope_table[half: Int, max_pos: Int](
     cos_buf: F32Ptr, sin_buf: F32Ptr,

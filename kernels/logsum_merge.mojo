@@ -7,12 +7,12 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
     OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
-    recommended_workers, join_all, Binding,
+    fanout_dispatch, join_all, Binding,
 )
-
-
-comptime INLINE_MAX_BYTES = 131072
-comptime DISPATCH_SATURATE_BYTES = 1048576
+from .attention_ops import flash_partial_stride
+from .dispatch_heuristics import (
+    MERGE_INLINE_MAX_BYTES, MERGE_SATURATE_BYTES,
+)
 
 
 @always_inline
@@ -100,8 +100,7 @@ def finalize_head[head_dim: Int, num_q: Int](
 
 @fieldwise_init
 struct FinalizeKernel[head_dim: Int, num_q: Int](OutputPartitionedKernel):
-    comptime PARTIAL_STRIDE = (
-        (Self.num_q * Self.head_dim + 2 * Self.num_q) * 4 + 63) // 64 * 16
+    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
     var output: BF16Ptr
     var partials: F32Ptr
@@ -123,8 +122,7 @@ struct FinalizeKernel[head_dim: Int, num_q: Int](OutputPartitionedKernel):
 
 @fieldwise_init
 struct ContextFlashMergeConfig[head_dim: Int, num_q: Int, tp: Int]:
-    comptime PARTIAL_STRIDE = (
-        (Self.num_q * Self.head_dim + 2 * Self.num_q) * 4 + 63) // 64 * 16
+    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
     var output: Binding[BFloat16, Self.tp]
     var partials: Binding[Float32, Self.tp]
@@ -245,7 +243,7 @@ struct ContextFinalizeKernel[
 
 @always_inline
 def merge_workers[num_q: Int](data_bytes: Int, capacity: Int) -> Int:
-    if data_bytes >= DISPATCH_SATURATE_BYTES:
+    if data_bytes >= MERGE_SATURATE_BYTES:
         return min(num_q, capacity)
     return min(8, min(num_q, capacity))
 
@@ -258,7 +256,7 @@ def dispatch_merge_flash_partials[
     partials_buf: Binding[Float32, tp],
     num_sources: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],
-    inline_max_bytes: Int = INLINE_MAX_BYTES,
+    inline_max_bytes: Int = MERGE_INLINE_MAX_BYTES,
 ):
     comptime K = FinalizeKernel[head_dim, num_q]
     comptime PSTRIDE = K.PARTIAL_STRIDE
@@ -276,7 +274,7 @@ def dispatch_merge_flash_partials[
             continue
         var nw = merge_workers[num_q](
             data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
+        _ = tile_dispatch(buf,
             K(output[r], partials_buf[r], num_sources[r], 0, 0),
             pools[r], num_q, num_workers=nw)
     join_all[tp](pools)
@@ -292,11 +290,6 @@ def dispatch_merge_context_flash_partials[
     num_sources: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],
 ):
-    var cfg = ContextFlashMergeConfig[head_dim, num_q, tp](
-        output, partials_buf, num_sources)
-    var config = UnsafePointer(to=cfg).as_immutable()
-    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
-
     var total_sources = 0
     for r in range(tp):
         total_sources += num_sources[r]
@@ -306,17 +299,18 @@ def dispatch_merge_context_flash_partials[
             memset_zero(output[r], local_num_q * head_dim)
         return
 
-    var buf = DispatchBuffer[
-        ContextFinalizeKernel[head_dim, num_q, local_num_q, tp, cfg_ro],
-        max_worker_count,
-    ]()
-    for q_rank in range(tp):
-        var data_bytes = total_sources * (head_dim + 2) * 4 * local_num_q
-        var nw = merge_workers[local_num_q](
-            data_bytes, min(max_worker_count, pools[q_rank].get_capacity()))
-        tile_dispatch(buf,
-            ContextFinalizeKernel[
-                head_dim, num_q, local_num_q, tp, cfg_ro
-            ](config, q_rank, 0, 0),
-            pools[q_rank], local_num_q, num_workers=nw)
-    join_all[tp](pools)
+    var cfg = ContextFlashMergeConfig[head_dim, num_q, tp](
+        output, partials_buf, num_sources)
+    var config = UnsafePointer(to=cfg).as_immutable()
+    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
+    comptime K = ContextFinalizeKernel[head_dim, num_q, local_num_q, tp, cfg_ro]
+
+    @parameter
+    def make(q_rank: Int) -> K:
+        return K(config, q_rank, 0, 0)
+
+    fanout_dispatch[
+        tp, make,
+        max_worker_count=max_worker_count,
+        worker_policy=merge_workers[local_num_q],
+    ](pools, local_num_q, total_sources * (head_dim + 2) * 4 * local_num_q)

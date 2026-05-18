@@ -6,10 +6,11 @@ from threading.threading_traits import BurstThreadPool
 from simd_math import pick_port_unroll, tree_reduce_accs, fast_exp_softmax_biased
 from simd_math.ops import sqrt
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, Binding,
-    tile_dispatch, join_all,
+    OutputPartitionedKernel, Binding,
+    fanout_dispatch, saturate_workers,
     BF16Ptr, F32Ptr, W,
 )
+from .dispatch_heuristics import ROUTER_INLINE_TOKENS
 from .rmsnorm import rms_reduce_row
 
 
@@ -108,9 +109,6 @@ struct RouterShardedKernel[
         self.end = end
 
 
-comptime ROUTER_INLINE_TOKENS = 16
-
-
 def dispatch_router_sharded[
     P: BurstThreadPool, //,
     hidden: Int, experts_per_rank: Int, top_k: Int, tp: Int,
@@ -124,35 +122,20 @@ def dispatch_router_sharded[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    if seq_len <= 0:
-        return
+    comptime K = RouterShardedKernel[hidden, experts_per_rank, top_k, rms_eps]
 
-    if seq_len <= ROUTER_INLINE_TOKENS:
-        for r in range(tp):
-            var k = RouterShardedKernel[
-                hidden, experts_per_rank, top_k, rms_eps,
-            ](
-                x[r], router_proj[r], router_scale[r],
-                scaled_scratch[r], cands_out[r],
-                r * experts_per_rank, 0, 0, seq_len,
-            )
-            k.execute()
-        return
+    @parameter
+    def make(r: Int) -> K:
+        return K(x[r], router_proj[r], router_scale[r],
+                 scaled_scratch[r], cands_out[r],
+                 r * experts_per_rank, 0, 0, 0)
 
-    var buf = DispatchBuffer[
-        RouterShardedKernel[hidden, experts_per_rank, top_k, rms_eps],
-        max_worker_count,
-    ]()
-    for r in range(tp):
-        var proto = RouterShardedKernel[
-            hidden, experts_per_rank, top_k, rms_eps,
-        ](
-            x[r], router_proj[r], router_scale[r],
-            scaled_scratch[r], cands_out[r],
-            r * experts_per_rank, 0, 0, seq_len,
-        )
-        tile_dispatch(buf, proto, pools[r], seq_len)
-    join_all[tp](pools)
+    fanout_dispatch[
+        tp, make,
+        max_worker_count=max_worker_count,
+        worker_policy=saturate_workers,
+    ](pools, seq_len, seq_len * hidden * 2,
+      inline_threshold_bytes=ROUTER_INLINE_TOKENS * hidden * 2)
 
 
 def merge_router_candidates[tp: Int, top_k: Int](

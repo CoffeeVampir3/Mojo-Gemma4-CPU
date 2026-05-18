@@ -4,9 +4,9 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, Binding,
+    OutputPartitionedKernel, Binding,
     BF16Ptr, F32Ptr, I32Ptr, W, BW,
-    tile_dispatch, join_all,
+    fanout_dispatch, saturate_workers,
 )
 from .dpbf16 import bf16_pair_dot
 from .moe_router import SparseRoute, SparseRoutePtr
@@ -207,24 +207,23 @@ def dispatch_phase1_gate_up[
     hidden_bucket: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
-    comptime Kernel = Phase1GateUpKernel[
+    comptime K = Phase1GateUpKernel[
         hidden, gate_up_fused, intermediate, experts_per_rank,
     ]
-    comptime n_tiles = intermediate // Kernel.TILE_J
+    comptime n_tiles = intermediate // K.TILE_J
     comptime total_units = experts_per_rank * n_tiles
 
-    var buf = DispatchBuffer[Kernel, max_worker_count]()
-    for r in range(tp):
-        var cap = min(max_worker_count, pools[r].get_capacity())
-        var nw = min(cap, total_units)
-        tile_dispatch(buf,
-            Kernel(
-                x_normed[r], expert_offset[r], routes[r],
-                experts_gate_up[r], gate_scratch[r], hidden_bucket[r],
-                0, 0, 0,
-            ),
-            pools[r], total_units, num_workers=nw)
-    join_all[tp](pools)
+    @parameter
+    def make(r: Int) -> K:
+        return K(x_normed[r], expert_offset[r], routes[r],
+                 experts_gate_up[r], gate_scratch[r], hidden_bucket[r],
+                 0, 0, 0)
+
+    fanout_dispatch[
+        tp, make,
+        max_worker_count=max_worker_count,
+        worker_policy=saturate_workers,
+    ](pools, total_units, total_units * hidden * 2)
 
 
 @fieldwise_init
@@ -369,18 +368,17 @@ def dispatch_phase2_down[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    comptime Kernel = Phase2DownKernel[hidden, intermediate, experts_per_rank]
+    comptime K = Phase2DownKernel[hidden, intermediate, experts_per_rank]
     comptime hidden_strides = hidden // W
 
-    var buf = DispatchBuffer[Kernel, max_worker_count]()
-    for r in range(tp):
-        var cap = min(max_worker_count, pools[r].get_capacity())
-        var nw = min(cap, hidden_strides)
-        tile_dispatch(buf,
-            Kernel(
-                expert_offset[r], routes[r], hidden_bucket[r],
-                experts_down[r], moe_accum[r], moe_partial[r],
-                seq_len, 0, 0,
-            ),
-            pools[r], hidden_strides, num_workers=nw)
-    join_all[tp](pools)
+    @parameter
+    def make(r: Int) -> K:
+        return K(expert_offset[r], routes[r], hidden_bucket[r],
+                 experts_down[r], moe_accum[r], moe_partial[r],
+                 seq_len, 0, 0)
+
+    fanout_dispatch[
+        tp, make,
+        max_worker_count=max_worker_count,
+        worker_policy=saturate_workers,
+    ](pools, hidden_strides, seq_len * hidden * 2)

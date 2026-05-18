@@ -43,7 +43,7 @@ struct NoopKernel(OutputPartitionedKernel):
 
 def warm_pool[P: BurstThreadPool](scratch: F32Ptr, mut pool: P):
     var buf = DispatchBuffer[NoopKernel]()
-    tile_dispatch(buf, NoopKernel(scratch, 0, 0), pool, pool.get_capacity())
+    _ = tile_dispatch(buf, NoopKernel(scratch, 0, 0), pool, pool.get_capacity())
     pool.join()
 
 

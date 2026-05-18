@@ -4,9 +4,12 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, Binding,
-    tile_dispatch, recommended_workers, join_all,
+    OutputPartitionedKernel, Binding,
+    fanout_dispatch,
     BF16Ptr, W,
+)
+from .dispatch_heuristics import (
+    GELU_GATE_UP_INLINE_TOKENS, SCALAR_MUL_INLINE_TOKENS,
 )
 
 
@@ -43,9 +46,6 @@ struct GeluGateUpTokenKernel[intermediate: Int](OutputPartitionedKernel):
         self.end = end
 
 
-comptime GELU_GATE_UP_INLINE_TOKENS = 16
-
-
 def dispatch_gelu_gate_up[
     P: BurstThreadPool, //,
     intermediate: Int, tp: Int, max_worker_count: Int = 128,
@@ -56,26 +56,15 @@ def dispatch_gelu_gate_up[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    if seq_len <= GELU_GATE_UP_INLINE_TOKENS:
-        for r in range(tp):
-            for tok in range(seq_len):
-                var off = tok * intermediate
-                gelu_gate_up_row[intermediate](
-                    gate[r] + off, up[r] + off, dst[r] + off)
-        return
+    comptime K = GeluGateUpTokenKernel[intermediate]
 
-    var data_bytes = seq_len * intermediate * 6
-    var buf = DispatchBuffer[
-        GeluGateUpTokenKernel[intermediate], max_worker_count,
-    ]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
-            GeluGateUpTokenKernel[intermediate](
-                gate[r], up[r], dst[r], 0, 0),
-            pools[r], seq_len, num_workers=nw)
-    join_all[tp](pools)
+    @parameter
+    def make(r: Int) -> K:
+        return K(gate[r], up[r], dst[r], 0, 0)
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, seq_len, seq_len * intermediate * 6,
+        inline_threshold_bytes=GELU_GATE_UP_INLINE_TOKENS * intermediate * 6)
 
 
 @always_inline
@@ -110,9 +99,6 @@ struct ScalarMulTokenKernel[hidden: Int](OutputPartitionedKernel):
         self.end = end
 
 
-comptime SCALAR_MUL_INLINE_TOKENS = 16
-
-
 def dispatch_scalar_mul[
     P: BurstThreadPool, //,
     hidden: Int, tp: Int, max_worker_count: Int = 128,
@@ -123,23 +109,12 @@ def dispatch_scalar_mul[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    if seq_len <= SCALAR_MUL_INLINE_TOKENS:
-        for r in range(tp):
-            for tok in range(seq_len):
-                var off = tok * hidden
-                scalar_mul_row[hidden](
-                    src[r] + off, dst[r] + off, scalar)
-        return
+    comptime K = ScalarMulTokenKernel[hidden]
 
-    var data_bytes = seq_len * hidden * 4
-    var buf = DispatchBuffer[
-        ScalarMulTokenKernel[hidden], max_worker_count,
-    ]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
-            ScalarMulTokenKernel[hidden](
-                src[r], dst[r], scalar, 0, 0),
-            pools[r], seq_len, num_workers=nw)
-    join_all[tp](pools)
+    @parameter
+    def make(r: Int) -> K:
+        return K(src[r], dst[r], scalar, 0, 0)
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, seq_len, seq_len * hidden * 4,
+        inline_threshold_bytes=SCALAR_MUL_INLINE_TOKENS * hidden * 4)

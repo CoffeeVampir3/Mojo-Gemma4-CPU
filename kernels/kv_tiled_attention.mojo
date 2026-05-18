@@ -5,10 +5,11 @@ from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
-    OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
-    recommended_workers, join_all, Binding,
+    OutputPartitionedKernel, fanout_dispatch_per_rank, Binding,
 )
-from .attention_ops import score_position, accumulate_v, scale_acc
+from .attention_ops import (
+    score_position, accumulate_v, scale_acc, flash_partial_stride,
+)
 
 
 @fieldwise_init
@@ -16,8 +17,7 @@ struct FlashDecodeKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int,
 ](OutputPartitionedKernel):
-    comptime PARTIAL_STRIDE = (
-        (Self.num_q * Self.head_dim + 2 * Self.num_q) * 4 + 63) // 64 * 16
+    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
     var q: BF16Ptr
     var k_base: BF16Ptr
@@ -102,23 +102,26 @@ def dispatch_sliding_attention[
     pos: Int, valid_len: Int,
     mut pools: HeapMoveArray[P],
 ) -> InlineArray[Int, tp]:
-    var result = InlineArray[Int, tp](fill=0)
     if valid_len <= 0:
-        return result
+        return InlineArray[Int, tp](fill=0)
 
     var start_pos = pos - valid_len + 1
-    comptime K = FlashDecodeKernel[
-        head_dim, num_q, gqa_ratio, kv_stride, window]
-    var buf = DispatchBuffer[K, max_worker_count]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            valid_len * kv_stride * 2,
-            min(max_worker_count, pools[r].get_capacity()),
-        )
-        tile_dispatch(buf,
-            K(q[r], k_base[r], v_base[r], partials_buf[r],
-                0, start_pos, 0, 0),
-            pools[r], valid_len, num_workers=nw)
-        result[r] = nw
-    join_all[tp](pools)
-    return result
+    comptime K = FlashDecodeKernel[head_dim, num_q, gqa_ratio, kv_stride, window]
+
+    @parameter
+    def make(r: Int) -> K:
+        return K(q[r], k_base[r], v_base[r], partials_buf[r],
+                 0, start_pos, 0, 0)
+
+    @parameter
+    def total_for(r: Int) -> Int:
+        return valid_len
+
+    @parameter
+    def bytes_for(r: Int) -> Int:
+        return valid_len * kv_stride * 2
+
+    return fanout_dispatch_per_rank[
+        tp, make, total_for, bytes_for,
+        max_worker_count=max_worker_count,
+    ](pools)

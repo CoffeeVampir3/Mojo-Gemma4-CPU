@@ -177,7 +177,7 @@ def dispatch_allreduce[
             rank_count * E.ELEMENT_BYTES,
             min(max_worker_count, pools[r].get_capacity()),
         )
-        tile_dispatch(reduce_buf,
+        _ = tile_dispatch(reduce_buf,
             ReduceStoreKernel[E, tp, src_origin, cfg_ro, Accum](config, r, 0, 0),
             pools[r], rank_count, rank_start, nw)
     join_all[tp](pools)
@@ -188,7 +188,7 @@ def dispatch_allreduce[
     for r in range(tp):
         var nw = recommended_workers(
             data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(gather_buf,
+        _ = tile_dispatch(gather_buf,
             GatherKernel[E, tp, src_origin, cfg_ro](config, r, 0, 0),
             pools[r], src.count, num_workers=nw)
     join_all[tp](pools)
@@ -251,7 +251,7 @@ def dispatch_broadcast[
         if r != src_rank:
             var nw = recommended_workers(
                 data_bytes, min(max_worker_count, pools[r].get_capacity()))
-            tile_dispatch(buf,
+            _ = tile_dispatch(buf,
                 CopyKernel[E.DTYPE, src_origin](
                     dst[r].as_any_origin(), src[src_rank], 0, 0),
                 pools[r], src.count, num_workers=nw)

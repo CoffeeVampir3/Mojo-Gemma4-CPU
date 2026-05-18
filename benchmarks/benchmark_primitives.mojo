@@ -124,14 +124,14 @@ struct NoopKernel(BurstKernel):
 def timed_read[P: BurstThreadPool](mut pool: P, src: BF16Ptr, count: Int) -> Int:
     var buf = DispatchBuffer[ReadSweepKernel]()
     for _ in range(WARMUP):
-        tile_dispatch(buf, ReadSweepKernel(src, 0, 0), pool, count)
+        _ = tile_dispatch(buf, ReadSweepKernel(src, 0, 0), pool, count)
         pool.join()
     var best = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            tile_dispatch(buf, ReadSweepKernel(src, 0, 0), pool, count)
+            _ = tile_dispatch(buf, ReadSweepKernel(src, 0, 0), pool, count)
             pool.join()
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
@@ -144,14 +144,14 @@ def timed_read[P: BurstThreadPool](mut pool: P, src: BF16Ptr, count: Int) -> Int
 def timed_write[P: BurstThreadPool](mut pool: P, dst: BF16Ptr, count: Int) -> Int:
     var buf = DispatchBuffer[WriteSweepKernel]()
     for _ in range(WARMUP):
-        tile_dispatch(buf, WriteSweepKernel(dst, 0, 0), pool, count)
+        _ = tile_dispatch(buf, WriteSweepKernel(dst, 0, 0), pool, count)
         pool.join()
     var best = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            tile_dispatch(buf, WriteSweepKernel(dst, 0, 0), pool, count)
+            _ = tile_dispatch(buf, WriteSweepKernel(dst, 0, 0), pool, count)
             pool.join()
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
@@ -166,14 +166,14 @@ def timed_copy[P: BurstThreadPool](
 ) -> Int:
     var buf = DispatchBuffer[CopySweepKernel]()
     for _ in range(WARMUP):
-        tile_dispatch(buf, CopySweepKernel(dst, src, 0, 0), pool, count)
+        _ = tile_dispatch(buf, CopySweepKernel(dst, src, 0, 0), pool, count)
         pool.join()
     var best = Int(1 << 60)
     for _ in range(TRIALS):
         var elapsed = 0
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
-            tile_dispatch(buf, CopySweepKernel(dst, src, 0, 0), pool, count)
+            _ = tile_dispatch(buf, CopySweepKernel(dst, src, 0, 0), pool, count)
             pool.join()
             var t1 = Int(perf_counter_ns())
             elapsed += t1 - t0
@@ -234,21 +234,21 @@ def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
             var rbuf = DispatchBuffer[ReadSweepKernel]()
             var wbuf = DispatchBuffer[WriteSweepKernel]()
             for _ in range(WARMUP):
-                tile_dispatch(wbuf, WriteSweepKernel(bufs[owner], 0, 0),
+                _ = tile_dispatch(wbuf, WriteSweepKernel(bufs[owner], 0, 0),
                     pools[owner], count)
                 pools[owner].join()
-                tile_dispatch(rbuf, ReadSweepKernel(bufs[owner], 0, 0),
+                _ = tile_dispatch(rbuf, ReadSweepKernel(bufs[owner], 0, 0),
                     pools[reader], count)
                 pools[reader].join()
             var best = Int(1 << 60)
             for _ in range(TRIALS):
                 var elapsed = 0
                 for _ in range(ITERS):
-                    tile_dispatch(wbuf, WriteSweepKernel(bufs[owner], 0, 0),
+                    _ = tile_dispatch(wbuf, WriteSweepKernel(bufs[owner], 0, 0),
                         pools[owner], count)
                     pools[owner].join()
                     var t0 = Int(perf_counter_ns())
-                    tile_dispatch(rbuf, ReadSweepKernel(bufs[owner], 0, 0),
+                    _ = tile_dispatch(rbuf, ReadSweepKernel(bufs[owner], 0, 0),
                         pools[reader], count)
                     pools[reader].join()
                     var t1 = Int(perf_counter_ns())
@@ -275,7 +275,7 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
         for _ in range(WARMUP):
             var buf = DispatchBuffer[ReadSweepKernel]()
             for r in range(tp):
-                tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
+                _ = tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
                     pools[r], chunk, chunk * r)
             join_all[tp](pools)
         var best = Int(1 << 60)
@@ -285,7 +285,7 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
                 var buf = DispatchBuffer[ReadSweepKernel]()
                 var t0 = Int(perf_counter_ns())
                 for r in range(tp):
-                    tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
+                    _ = tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
                         pools[r], chunk, chunk * r)
                 join_all[tp](pools)
                 var t1 = Int(perf_counter_ns())

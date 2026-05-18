@@ -5,10 +5,11 @@ from simd_math.ops import tanh_f32
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    Chain, OutputPartitionedKernel, DispatchBuffer,
-    tile_dispatch, recommended_workers, join_all,
+    Chain, OutputPartitionedKernel,
+    fanout_dispatch, saturate_workers,
     Binding, BF16Ptr, W,
 )
+from .dispatch_heuristics import GEMV_INLINE_ROWS
 
 
 @always_inline
@@ -84,9 +85,6 @@ struct GemvKernel[rows: Int, cols: Int](OutputPartitionedKernel):
         self.end = end
 
 
-comptime GEMV_INLINE_ROWS = 4
-
-
 def dispatch_gemv[
     P: BurstThreadPool, //,
     rows: Int, cols: Int, tp: Int, max_worker_count: Int = 128,
@@ -96,21 +94,15 @@ def dispatch_gemv[
     output: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
-    comptime data_bytes = rows * cols * 2
+    comptime K = GemvKernel[rows, cols]
 
-    if rows <= GEMV_INLINE_ROWS:
-        for r in range(tp):
-            gemv_range[rows, cols](x[r], weight[r], output[r], 0, rows)
-        return
+    @parameter
+    def make(r: Int) -> K:
+        return K(x[r], weight[r], output[r], 0, 0)
 
-    var buf = DispatchBuffer[GemvKernel[rows, cols], max_worker_count]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
-            GemvKernel[rows, cols](x[r], weight[r], output[r], 0, 0),
-            pools[r], rows, num_workers=nw)
-    join_all[tp](pools)
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, rows, rows * cols * 2,
+        inline_threshold_bytes=GEMV_INLINE_ROWS * cols * 2)
 
 
 @fieldwise_init
@@ -143,24 +135,15 @@ def dispatch_gemv_softcap[
     output: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
-    comptime data_bytes = rows * cols * 2
+    comptime K = GemvSoftcapKernel[rows, cols, cap]
 
-    if rows <= GEMV_INLINE_ROWS:
-        for r in range(tp):
-            gemv_softcap_range[rows, cols, cap](
-                x[r], weight[r], output[r], 0, rows)
-        return
+    @parameter
+    def make(r: Int) -> K:
+        return K(x[r], weight[r], output[r], 0, 0)
 
-    var buf = DispatchBuffer[
-        GemvSoftcapKernel[rows, cols, cap], max_worker_count,
-    ]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
-            GemvSoftcapKernel[rows, cols, cap](x[r], weight[r], output[r], 0, 0),
-            pools[r], rows, num_workers=nw)
-    join_all[tp](pools)
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, rows, rows * cols * 2,
+        inline_threshold_bytes=GEMV_INLINE_ROWS * cols * 2)
 
 
 @fieldwise_init
@@ -204,16 +187,18 @@ def dispatch_gemv_chained_qkv[
     comptime QK = Chain[QKernel, KKernel]
     comptime QKV = Chain[QK, VKernel]
 
-    var buf = DispatchBuffer[QKV, max_worker_count]()
-    for r in range(tp):
-        var nw = min(max_worker_count, pools[r].get_capacity())
-        tile_dispatch(buf,
-            QKV(
-                QK(
-                    QKernel(x[r], q_weight[r], q_out[r], 0, 0),
-                    KKernel(x[r], k_weight[r], k_out[r], 0, 0),
-                ),
-                VKernel(x[r], v_weight[r], v_out[r], 0, 0),
+    @parameter
+    def make(r: Int) -> QKV:
+        return QKV(
+            QK(
+                QKernel(x[r], q_weight[r], q_out[r], 0, 0),
+                KKernel(x[r], k_weight[r], k_out[r], 0, 0),
             ),
-            pools[r], total_rows, num_workers=nw)
-    join_all[tp](pools)
+            VKernel(x[r], v_weight[r], v_out[r], 0, 0),
+        )
+
+    fanout_dispatch[
+        tp, make,
+        max_worker_count=max_worker_count,
+        worker_policy=saturate_workers,
+    ](pools, total_rows, total_rows * cols * 2)

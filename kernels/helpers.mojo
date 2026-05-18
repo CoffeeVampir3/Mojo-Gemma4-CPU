@@ -4,15 +4,16 @@ from std.sys.info import simd_width_of
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
+from .dispatch_heuristics import (
+    DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES,
+)
+
 
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 comptime F32Ptr  = UnsafePointer[Float32,  MutAnyOrigin]
 comptime I32Ptr  = UnsafePointer[Int32,    MutAnyOrigin]
 comptime W  = simd_width_of[DType.float32]()
 comptime BW = simd_width_of[DType.bfloat16]()
-
-
-comptime DISPATCH_BW_PRODUCT = 2280
 
 
 trait OutputPartitionedKernel(BurstKernel):
@@ -105,9 +106,6 @@ def worker_range(
     return (start, end)
 
 
-comptime PARALLEL_AMORTIZED_BYTES = 1024 * 1024
-
-
 @always_inline
 def recommended_workers(data_bytes: Int, capacity: Int) -> Int:
     if capacity <= 1:
@@ -167,9 +165,10 @@ def tile_dispatch[
     K: OutputPartitionedKernel, P: BurstThreadPool, //,
     max_worker_count: Int = 128,
 ](mut buf: DispatchBuffer[K, max_worker_count], proto: K, mut pool: P, total: Int,
-  base: Int = 0, num_workers: Int = 0):
+  base: Int = 0, num_workers: Int = 0) -> Int:
+    """Returns the number of worker partitions actually queued."""
     if total <= 0:
-        return
+        return 0
     var capacity = min(max_worker_count, pool.get_capacity())
     var workers = capacity if num_workers <= 0 else min(
         num_workers, capacity)
@@ -180,3 +179,66 @@ def tile_dispatch[
         item.set_partition(w, wr[0], wr[1])
         buf.slot()[] = item
     buf.dispatch(pool)
+    return workers
+
+
+@always_inline
+def saturate_workers(data_bytes: Int, capacity: Int) -> Int:
+    return capacity
+
+
+def fanout_dispatch[
+    K: OutputPartitionedKernel, P: BurstThreadPool, //,
+    tp: Int,
+    proto_for: def(Int) capturing [_] -> K,
+    max_worker_count: Int = 128,
+    worker_policy: def(
+        data_bytes: Int, capacity: Int,
+    ) thin -> Int = recommended_workers,
+](
+    mut pools: HeapMoveArray[P],
+    total: Int,
+    data_bytes: Int,
+    inline_threshold_bytes: Int = -1,
+):
+    if total <= 0:
+        return
+    if inline_threshold_bytes >= 0 and data_bytes <= inline_threshold_bytes:
+        for r in range(tp):
+            var k = proto_for(r)
+            k.set_partition(0, 0, total)
+            k.execute()
+        return
+    var buf = DispatchBuffer[K, max_worker_count]()
+    for r in range(tp):
+        var cap = min(max_worker_count, pools[r].get_capacity())
+        _ = tile_dispatch(buf, proto_for(r), pools[r], total,
+            num_workers=worker_policy(data_bytes, cap))
+    join_all[tp](pools)
+
+
+def fanout_dispatch_per_rank[
+    K: OutputPartitionedKernel, P: BurstThreadPool, //,
+    tp: Int,
+    proto_for: def(Int) capturing [_] -> K,
+    total_for: def(Int) capturing [_] -> Int,
+    data_bytes_for: def(Int) capturing [_] -> Int,
+    max_worker_count: Int = 128,
+    worker_policy: def(
+        data_bytes: Int, capacity: Int,
+    ) thin -> Int = recommended_workers,
+](
+    mut pools: HeapMoveArray[P],
+) -> InlineArray[Int, tp]:
+    var nws = InlineArray[Int, tp](fill=0)
+    var buf = DispatchBuffer[K, max_worker_count]()
+    for r in range(tp):
+        var total = total_for(r)
+        if total <= 0:
+            continue
+        var cap = min(max_worker_count, pools[r].get_capacity())
+        var nw = worker_policy(data_bytes_for(r), cap)
+        nws[r] = tile_dispatch(
+            buf, proto_for(r), pools[r], total, num_workers=nw)
+    join_all[tp](pools)
+    return nws

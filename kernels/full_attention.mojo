@@ -5,10 +5,11 @@ from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
-    OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
-    recommended_workers, join_all, Binding,
+    OutputPartitionedKernel, fanout_dispatch_per_rank, Binding,
 )
-from .attention_ops import score_position, accumulate_v, scale_acc
+from .attention_ops import (
+    score_position, accumulate_v, scale_acc, flash_partial_stride,
+)
 
 
 comptime TILE = W
@@ -18,8 +19,7 @@ comptime TILE = W
 struct FullAttentionKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int, kv_stride: Int,
 ](OutputPartitionedKernel):
-    comptime PARTIAL_STRIDE = (
-        (Self.num_q * Self.head_dim + 2 * Self.num_q) * 4 + 63) // 64 * 16
+    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
     var q: BF16Ptr
     var k_base: BF16Ptr
@@ -101,19 +101,20 @@ def dispatch_full_attention[
     mut pools: HeapMoveArray[P],
 ) -> InlineArray[Int, tp]:
     comptime K = FullAttentionKernel[head_dim, num_q, gqa_ratio, kv_stride]
-    var result = InlineArray[Int, tp](fill=0)
 
-    var buf = DispatchBuffer[K, max_worker_count]()
-    for r in range(tp):
-        if valid_len[r] <= 0:
-            continue
-        var nw = recommended_workers(
-            valid_len[r] * kv_stride * 2,
-            min(max_worker_count, pools[r].get_capacity()),
-        )
-        tile_dispatch(buf,
-            K(q[r], k_base[r], v_base[r], worker_partials[r], 0, 0, 0),
-            pools[r], valid_len[r], num_workers=nw)
-        result[r] = nw
-    join_all[tp](pools)
-    return result
+    @parameter
+    def make(r: Int) -> K:
+        return K(q[r], k_base[r], v_base[r], worker_partials[r], 0, 0, 0)
+
+    @parameter
+    def total_for(r: Int) -> Int:
+        return valid_len[r]
+
+    @parameter
+    def bytes_for(r: Int) -> Int:
+        return valid_len[r] * kv_stride * 2
+
+    return fanout_dispatch_per_rank[
+        tp, make, total_for, bytes_for,
+        max_worker_count=max_worker_count,
+    ](pools)

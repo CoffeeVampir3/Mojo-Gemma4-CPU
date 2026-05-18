@@ -5,6 +5,11 @@ from .helpers import BF16Ptr, F32Ptr, W
 
 
 @always_inline
+def flash_partial_stride[num_q: Int, head_dim: Int]() -> Int:
+    return ((num_q * head_dim + 2 * num_q) * 4 + 63) // 64 * 16
+
+
+@always_inline
 def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Float32:
     comptime PU = pick_port_unroll[W, head_dim]()
     comptime STRIDE = PU * W

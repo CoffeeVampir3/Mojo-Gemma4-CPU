@@ -6,10 +6,11 @@ from simd_math import pick_port_unroll, tree_reduce_accs
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    Chain, OutputPartitionedKernel, DispatchBuffer,
-    tile_dispatch, recommended_workers, join_all,
+    Chain, OutputPartitionedKernel,
+    fanout_dispatch, saturate_workers,
     Binding, BF16Ptr, W,
 )
+from .dispatch_heuristics import NORM_INLINE_TOKENS
 
 
 @always_inline
@@ -121,9 +122,6 @@ struct NormResidualAddTokenKernel[
         self.end = end
 
 
-comptime NORM_INLINE_TOKENS = 16
-
-
 def dispatch_rms_norm[
     P: BurstThreadPool, //,
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
@@ -135,26 +133,15 @@ def dispatch_rms_norm[
     count: Int,
     mut pools: HeapMoveArray[P],
 ):
-    if count <= NORM_INLINE_TOKENS:
-        for r in range(tp):
-            for tok in range(count):
-                rms_norm_row[hidden, sqrt_n, n_eps, scaled](
-                    src[r] + tok * hidden, dst[r] + tok * hidden, weight[r])
-        return
+    comptime K = RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled]
 
-    var data_bytes = count * hidden * 2
-    var buf = DispatchBuffer[
-        RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled],
-        max_worker_count,
-    ]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
-            RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled](
-                src[r], dst[r], weight[r], 0, 0),
-            pools[r], count, num_workers=nw)
-    join_all[tp](pools)
+    @parameter
+    def make(r: Int) -> K:
+        return K(src[r], dst[r], weight[r], 0, 0)
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, count, count * hidden * 2,
+        inline_threshold_bytes=NORM_INLINE_TOKENS * hidden * 2)
 
 
 @fieldwise_init
@@ -199,39 +186,28 @@ def dispatch_rms_norm_qkv_heads[
     mut pools: HeapMoveArray[P],
 ):
     comptime total = num_q + num_kv + num_kv
-
-    if total <= NORM_INLINE_TOKENS:
-        for r in range(tp):
-            for h in range(num_kv):
-                rms_norm_row[head_dim, sqrt_n, n_eps, scaled=False](
-                    v_src[r] + h * head_dim, v_dst[r] + h * head_dim, k_weight[r])
-            for h in range(num_q):
-                rms_norm_row[head_dim, sqrt_n, n_eps](
-                    q_src[r] + h * head_dim, q_dst[r] + h * head_dim, q_weight[r])
-            for h in range(num_kv):
-                rms_norm_row[head_dim, sqrt_n, n_eps](
-                    k_src[r] + h * head_dim, k_dst[r] + h * head_dim, k_weight[r])
-        return
-
     comptime VK = ScaledNormKernel[head_dim, sqrt_n, n_eps, False, num_kv, total]
     comptime QK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_q, total]
     comptime KK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_kv, total]
     comptime VQChain = Chain[VK, QK]
     comptime VQKChain = Chain[VQChain, KK]
 
-    var buf = DispatchBuffer[VQKChain, max_worker_count]()
-    for r in range(tp):
-        var nw = min(max_worker_count, pools[r].get_capacity())
-        tile_dispatch(buf,
-            VQKChain(
-                VQChain(
-                    VK(v_src[r], v_dst[r], k_weight[r], 0, 0),
-                    QK(q_src[r], q_dst[r], q_weight[r], 0, 0),
-                ),
-                KK(k_src[r], k_dst[r], k_weight[r], 0, 0),
+    @parameter
+    def make(r: Int) -> VQKChain:
+        return VQKChain(
+            VQChain(
+                VK(v_src[r], v_dst[r], k_weight[r], 0, 0),
+                QK(q_src[r], q_dst[r], q_weight[r], 0, 0),
             ),
-            pools[r], total, num_workers=nw)
-    join_all[tp](pools)
+            KK(k_src[r], k_dst[r], k_weight[r], 0, 0),
+        )
+
+    fanout_dispatch[
+        tp, make,
+        max_worker_count=max_worker_count,
+        worker_policy=saturate_workers,
+    ](pools, total, total * head_dim * 2,
+      inline_threshold_bytes=NORM_INLINE_TOKENS * head_dim * 2)
 
 
 def fused_norm_residual_add[
@@ -246,24 +222,12 @@ def fused_norm_residual_add[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    if seq_len <= NORM_INLINE_TOKENS:
-        for r in range(tp):
-            for tok in range(seq_len):
-                var off = tok * hidden
-                norm_residual_add_row[hidden, sqrt_n, n_eps](
-                    src[r] + off, residual[r] + off, dst[r] + off, weight[r])
-        return
+    comptime K = NormResidualAddTokenKernel[hidden, sqrt_n, n_eps]
 
-    var data_bytes = seq_len * hidden * 4
-    var buf = DispatchBuffer[
-        NormResidualAddTokenKernel[hidden, sqrt_n, n_eps],
-        max_worker_count,
-    ]()
-    for r in range(tp):
-        var nw = recommended_workers(
-            data_bytes, min(max_worker_count, pools[r].get_capacity()))
-        tile_dispatch(buf,
-            NormResidualAddTokenKernel[hidden, sqrt_n, n_eps](
-                src[r], residual[r], dst[r], weight[r], 0, 0),
-            pools[r], seq_len, num_workers=nw)
-    join_all[tp](pools)
+    @parameter
+    def make(r: Int) -> K:
+        return K(src[r], residual[r], dst[r], weight[r], 0, 0)
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, seq_len, seq_len * hidden * 4,
+        inline_threshold_bytes=NORM_INLINE_TOKENS * hidden * 4)
