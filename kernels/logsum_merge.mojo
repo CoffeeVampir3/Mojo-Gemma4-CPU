@@ -15,9 +15,19 @@ from .dispatch_heuristics import (
 )
 
 
+@fieldwise_init
+struct MergeSegment(Copyable, ImplicitlyCopyable):
+    var base: F32Ptr
+    var stride: Int
+    var n: Int
+
+
 @always_inline
-def merge_accumulate[head_dim: Int, num_q: Int](
-    base: F32Ptr, stride: Int, num_sources: Int, h: Int,
+def merge_segments[
+    head_dim: Int, num_q: Int, n_segments: Int,
+](
+    segments: InlineArray[MergeSegment, n_segments],
+    h: Int,
     mut acc: InlineArray[SIMD[DType.float32, W], head_dim // W],
 ) -> Tuple[Float32, Float32]:
     comptime m_off = num_q * head_dim
@@ -26,53 +36,62 @@ def merge_accumulate[head_dim: Int, num_q: Int](
     comptime STRIDE = PU * W
 
     var global_m = Float32(-1e30)
-    for s in range(num_sources):
-        var sm = (base + s * stride + m_off + h)[]
-        if sm > global_m:
-            global_m = sm
+    comptime for seg_idx in range(n_segments):
+        var seg = segments[seg_idx]
+        for s in range(seg.n):
+            var sm = (seg.base + s * seg.stride + m_off + h)[]
+            if sm > global_m:
+                global_m = sm
 
     var global_l = Float32(0)
     var first = True
 
-    var batch_start = 0
-    while batch_start < num_sources:
-        var batch_end = min(batch_start + W, num_sources)
-        var batch_len = batch_end - batch_start
-        var deltas = SIMD[DType.float32, W](-1e30)
-        var batch_ls = SIMD[DType.float32, W](0)
-        for b in range(batch_len):
-            var sp = base + (batch_start + b) * stride
-            deltas[b] = (sp + m_off + h)[] - global_m
-            batch_ls[b] = (sp + l_off + h)[]
-        var corrs = fast_exp_softmax_biased[W](deltas)
-        corrs = batch_ls.gt(SIMD[DType.float32, W](0)).select(
-            corrs, SIMD[DType.float32, W](0))
-        global_l += (batch_ls * corrs).reduce_add()
+    comptime for seg_idx in range(n_segments):
+        var seg = segments[seg_idx]
+        var base = seg.base
+        var stride = seg.stride
+        var batch_start = 0
+        while batch_start < seg.n:
+            var batch_end = min(batch_start + W, seg.n)
+            var batch_len = batch_end - batch_start
+            var deltas = SIMD[DType.float32, W](-1e30)
+            var batch_ls = SIMD[DType.float32, W](0)
+            for b in range(batch_len):
+                var sp = base + (batch_start + b) * stride
+                deltas[b] = (sp + m_off + h)[] - global_m
+                batch_ls[b] = (sp + l_off + h)[]
+            var corrs = fast_exp_softmax_biased[W](deltas)
+            corrs = batch_ls.gt(SIMD[DType.float32, W](0)).select(
+                corrs, SIMD[DType.float32, W](0))
+            global_l += (batch_ls * corrs).reduce_add()
 
-        for b in range(batch_len):
-            var c = corrs[b]
-            if c <= 0:
-                continue
-            var cv = SIMD[DType.float32, W](c)
-            var src = base + (batch_start + b) * stride + h * head_dim
-            if first:
-                for i in range(head_dim // STRIDE):
-                    comptime for p in range(PU):
-                        acc[i * PU + p] = (src + i * STRIDE + p * W).load[width=W]() * cv
-                first = False
-            else:
-                for i in range(head_dim // STRIDE):
-                    comptime for p in range(PU):
-                        var v = (src + i * STRIDE + p * W).load[width=W]()
-                        acc[i * PU + p] = v.fma(cv, acc[i * PU + p])
-        batch_start += W
+            for b in range(batch_len):
+                var c = corrs[b]
+                if c <= 0:
+                    continue
+                var cv = SIMD[DType.float32, W](c)
+                var src = base + (batch_start + b) * stride + h * head_dim
+                if first:
+                    for i in range(head_dim // STRIDE):
+                        comptime for p in range(PU):
+                            acc[i * PU + p] = (src + i * STRIDE + p * W).load[width=W]() * cv
+                    first = False
+                else:
+                    for i in range(head_dim // STRIDE):
+                        comptime for p in range(PU):
+                            var v = (src + i * STRIDE + p * W).load[width=W]()
+                            acc[i * PU + p] = v.fma(cv, acc[i * PU + p])
+            batch_start += W
 
     return (global_m, global_l)
 
 
 @always_inline
-def finalize_head[head_dim: Int, num_q: Int](
-    dst: BF16Ptr, base: F32Ptr, stride: Int, num_sources: Int,
+def write_finalized_head[
+    head_dim: Int, num_q: Int, n_segments: Int,
+](
+    dst: BF16Ptr,
+    segments: InlineArray[MergeSegment, n_segments],
     h: Int,
 ):
     comptime PU = pick_port_unroll[W, head_dim]()
@@ -81,21 +100,32 @@ def finalize_head[head_dim: Int, num_q: Int](
 
     var acc = InlineArray[SIMD[DType.float32, W], LANES](
         uninitialized=True)
-    var result = merge_accumulate[head_dim, num_q](base, stride, num_sources, h, acc)
+    var result = merge_segments[head_dim, num_q, n_segments](
+        segments, h, acc)
     var global_l = result[1]
 
-    var out = dst + h * head_dim
     if global_l <= 0:
         for i in range(head_dim // STRIDE):
             comptime for p in range(PU):
-                (out + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
+                (dst + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
         return
 
     var inv_l = SIMD[DType.float32, W](Float32(1.0) / global_l)
     for i in range(head_dim // STRIDE):
         comptime for p in range(PU):
-            (out + i * STRIDE + p * W).store(
+            (dst + i * STRIDE + p * W).store(
                 (acc[i * PU + p] * inv_l).cast[DType.bfloat16]())
+
+
+@always_inline
+def finalize_head[head_dim: Int, num_q: Int](
+    dst: BF16Ptr, base: F32Ptr, stride: Int, num_sources: Int,
+    h: Int,
+):
+    var segs = InlineArray[MergeSegment, 1](uninitialized=True)
+    segs[0] = MergeSegment(base, stride, num_sources)
+    write_finalized_head[head_dim, num_q, 1](
+        dst + h * head_dim, segs, h)
 
 
 @fieldwise_init
@@ -130,61 +160,6 @@ struct ContextFlashMergeConfig[head_dim: Int, num_q: Int, tp: Int]:
 
 
 @always_inline
-def merge_context_accumulate[
-    head_dim: Int, num_q: Int, tp: Int,
-](
-    config: UnsafePointer[ContextFlashMergeConfig[head_dim, num_q, tp], _],
-    h: Int,
-    mut acc: InlineArray[SIMD[DType.float32, W], head_dim // W],
-) -> Tuple[Float32, Float32]:
-    comptime m_off = num_q * head_dim
-    comptime l_off = m_off + num_q
-    comptime PU = pick_port_unroll[W, head_dim]()
-    comptime STRIDE = PU * W
-    comptime PSTRIDE = ContextFlashMergeConfig[head_dim, num_q, tp].PARTIAL_STRIDE
-
-    var global_m = Float32(-1e30)
-    for context_rank in range(tp):
-        var base = config[].partials[context_rank]
-        var ns = config[].num_sources[context_rank]
-        for s in range(ns):
-            var sm = (base + s * PSTRIDE + m_off + h)[]
-            if sm > global_m:
-                global_m = sm
-
-    var global_l = Float32(0)
-    var first = True
-    for context_rank in range(tp):
-        var base = config[].partials[context_rank]
-        var ns = config[].num_sources[context_rank]
-        for s in range(ns):
-            var sp = base + s * PSTRIDE
-            var l = (sp + l_off + h)[]
-            if l <= 0:
-                continue
-            var corr = fast_exp_softmax_biased[1](
-                SIMD[DType.float32, 1]((sp + m_off + h)[] - global_m))[0]
-            global_l += l * corr
-
-            var cv = SIMD[DType.float32, W](corr)
-            var src = sp + h * head_dim
-            if first:
-                for i in range(head_dim // STRIDE):
-                    comptime for p in range(PU):
-                        acc[i * PU + p] = (
-                            src + i * STRIDE + p * W
-                        ).load[width=W]() * cv
-                first = False
-            else:
-                for i in range(head_dim // STRIDE):
-                    comptime for p in range(PU):
-                        var v = (src + i * STRIDE + p * W).load[width=W]()
-                        acc[i * PU + p] = v.fma(cv, acc[i * PU + p])
-
-    return (global_m, global_l)
-
-
-@always_inline
 def finalize_context_head[
     head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
 ](
@@ -192,29 +167,16 @@ def finalize_context_head[
     q_rank: Int,
     local_h: Int,
 ):
-    comptime PU = pick_port_unroll[W, head_dim]()
-    comptime STRIDE = PU * W
-    comptime LANES = head_dim // W
+    comptime PSTRIDE = ContextFlashMergeConfig[head_dim, num_q, tp].PARTIAL_STRIDE
+
+    var segs = InlineArray[MergeSegment, tp](uninitialized=True)
+    comptime for r in range(tp):
+        segs[r] = MergeSegment(
+            config[].partials[r], PSTRIDE, config[].num_sources[r])
 
     var global_h = q_rank * local_num_q + local_h
-    var acc = InlineArray[SIMD[DType.float32, W], LANES](
-        uninitialized=True)
-    var result = merge_context_accumulate[head_dim, num_q, tp](
-        config, global_h, acc)
-    var global_l = result[1]
-
-    var out = config[].output[q_rank] + local_h * head_dim
-    if global_l <= 0:
-        for i in range(head_dim // STRIDE):
-            comptime for p in range(PU):
-                (out + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
-        return
-
-    var inv_l = SIMD[DType.float32, W](Float32(1.0) / global_l)
-    for i in range(head_dim // STRIDE):
-        comptime for p in range(PU):
-            (out + i * STRIDE + p * W).store(
-                (acc[i * PU + p] * inv_l).cast[DType.bfloat16]())
+    var dst = config[].output[q_rank] + local_h * head_dim
+    write_finalized_head[head_dim, num_q, tp](dst, segs, global_h)
 
 
 @fieldwise_init
