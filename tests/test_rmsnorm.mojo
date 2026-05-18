@@ -16,7 +16,7 @@ comptime HIDDEN = 2816
 comptime SQRT_N = sqrt[DType.float32, 1](HIDDEN)
 comptime N_EPS = HIDDEN * 1e-6
 
-comptime BF16ExtPtr = UnsafePointer[Scalar[DType.bfloat16], MutExternalOrigin]
+comptime BF16ExtPtr = UnsafePointer[BFloat16, MutExternalOrigin]
 comptime BASES = ArenaBases[1].fill(0)
 
 
@@ -55,17 +55,17 @@ def check(ok: Bool, msg: String):
 
 def fill_input(ptr: BF16ExtPtr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32((i % 127) - 63) * 0.01)
+        ptr[i] = BFloat16(Float32((i % 127) - 63) * 0.01)
 
 
 def fill_residual(ptr: BF16ExtPtr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32((i % 97) - 48) * 0.02)
+        ptr[i] = BFloat16(Float32((i % 97) - 48) * 0.02)
 
 
 def fill_weight(ptr: BF16ExtPtr, count: Int, seed: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](
+        ptr[i] = BFloat16(
             Float32(1.0) + Float32((i + seed) % 64) * 0.001)
 
 
@@ -80,10 +80,10 @@ def assert_same(a: BF16ExtPtr, b: BF16ExtPtr, count: Int, label: String):
 
 def check_rms_norm_seq(count: Int):
     var total = count * HIDDEN
-    var src = alloc[Scalar[DType.bfloat16]](total)
-    var expected = alloc[Scalar[DType.bfloat16]](total)
-    var got = alloc[Scalar[DType.bfloat16]](total)
-    var weight = alloc[Scalar[DType.bfloat16]](HIDDEN)
+    var src = alloc[BFloat16](total)
+    var expected = alloc[BFloat16](total)
+    var got = alloc[BFloat16](total)
+    var weight = alloc[BFloat16](HIDDEN)
 
     fill_input(src, total)
     fill_weight(weight, HIDDEN, 0)
@@ -101,9 +101,9 @@ def check_rms_norm_seq(count: Int):
     var pools = HeapMoveArray[TestPool](1)
     pools.push(TestPool(4, 0))
     dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=1](
-        Binding[Scalar[DType.bfloat16], 1](src_any, BASES),
-        Binding[Scalar[DType.bfloat16], 1](got_any, BASES),
-        Binding[Scalar[DType.bfloat16], 1](weight_any, BASES),
+        Binding[BFloat16, 1](src_any, BASES),
+        Binding[BFloat16, 1](got_any, BASES),
+        Binding[BFloat16, 1](weight_any, BASES),
         count, pools)
     assert_same(got, expected, total, "rms dispatch output")
 
@@ -115,11 +115,11 @@ def check_rms_norm_seq(count: Int):
 
 def check_fused_norm_residual_add_seq(count: Int):
     var total = count * HIDDEN
-    var src = alloc[Scalar[DType.bfloat16]](total)
-    var residual = alloc[Scalar[DType.bfloat16]](total)
-    var expected = alloc[Scalar[DType.bfloat16]](total)
-    var got = alloc[Scalar[DType.bfloat16]](total)
-    var weight = alloc[Scalar[DType.bfloat16]](HIDDEN)
+    var src = alloc[BFloat16](total)
+    var residual = alloc[BFloat16](total)
+    var expected = alloc[BFloat16](total)
+    var got = alloc[BFloat16](total)
+    var weight = alloc[BFloat16](HIDDEN)
 
     fill_input(src, total)
     fill_residual(residual, total)
@@ -143,10 +143,10 @@ def check_fused_norm_residual_add_seq(count: Int):
     fused_norm_residual_add[
         hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=1,
     ](
-        Binding[Scalar[DType.bfloat16], 1](src_any, BASES),
-        Binding[Scalar[DType.bfloat16], 1](got_any, BASES),
-        Binding[Scalar[DType.bfloat16], 1](got_any, BASES),
-        Binding[Scalar[DType.bfloat16], 1](weight_any, BASES),
+        Binding[BFloat16, 1](src_any, BASES),
+        Binding[BFloat16, 1](got_any, BASES),
+        Binding[BFloat16, 1](got_any, BASES),
+        Binding[BFloat16, 1](weight_any, BASES),
         count, pools)
 
     assert_same(got, expected, total, "fused norm residual add output")

@@ -14,8 +14,8 @@ comptime MR = 4
 comptime PU = 4
 comptime PU_FUSED = 2
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 @always_inline
@@ -157,23 +157,23 @@ def phase1_fused_mr_block(
 
 @no_inline
 def run_case() -> Int:
-    var x0 = alloc[Scalar[DType.bfloat16]](HIDDEN)
-    var x1 = alloc[Scalar[DType.bfloat16]](HIDDEN)
-    var x2 = alloc[Scalar[DType.bfloat16]](HIDDEN)
-    var x3 = alloc[Scalar[DType.bfloat16]](HIDDEN)
-    var gate_w = alloc[Scalar[DType.bfloat16]](INTERMEDIATE * HIDDEN)
-    var up_w = alloc[Scalar[DType.bfloat16]](INTERMEDIATE * HIDDEN)
-    var gate_part = alloc[Scalar[DType.float32]](MR * TILE_J)
-    var up_part = alloc[Scalar[DType.float32]](MR * TILE_J)
+    var x0 = alloc[BFloat16](HIDDEN)
+    var x1 = alloc[BFloat16](HIDDEN)
+    var x2 = alloc[BFloat16](HIDDEN)
+    var x3 = alloc[BFloat16](HIDDEN)
+    var gate_w = alloc[BFloat16](INTERMEDIATE * HIDDEN)
+    var up_w = alloc[BFloat16](INTERMEDIATE * HIDDEN)
+    var gate_part = alloc[Float32](MR * TILE_J)
+    var up_part = alloc[Float32](MR * TILE_J)
 
     for i in range(HIDDEN):
-        x0[i] = Scalar[DType.bfloat16](Float32(Float64(i % 127 - 63) * 0.01))
-        x1[i] = Scalar[DType.bfloat16](Float32(Float64(i % 113 - 56) * 0.01))
-        x2[i] = Scalar[DType.bfloat16](Float32(Float64(i % 101 - 50) * 0.01))
-        x3[i] = Scalar[DType.bfloat16](Float32(Float64(i % 89 - 44) * 0.01))
+        x0[i] = BFloat16(Float32(Float64(i % 127 - 63) * 0.01))
+        x1[i] = BFloat16(Float32(Float64(i % 113 - 56) * 0.01))
+        x2[i] = BFloat16(Float32(Float64(i % 101 - 50) * 0.01))
+        x3[i] = BFloat16(Float32(Float64(i % 89 - 44) * 0.01))
     for i in range(INTERMEDIATE * HIDDEN):
-        gate_w[i] = Scalar[DType.bfloat16](Float32(Float64(i % 97 - 48) * 0.01))
-        up_w[i] = Scalar[DType.bfloat16](Float32(Float64(i % 83 - 41) * 0.01))
+        gate_w[i] = BFloat16(Float32(Float64(i % 97 - 48) * 0.01))
+        up_w[i] = BFloat16(Float32(Float64(i % 83 - 41) * 0.01))
 
     phase1_split_mr_block(x0, x1, x2, x3, gate_w, up_w, gate_part, up_part)
     var checksum_a = Int(0)

@@ -19,19 +19,19 @@ comptime DISPATCH_SATURATE_BYTES = 1048576
 def merge_accumulate[head_dim: Int, num_q: Int](
     base: F32Ptr, stride: Int, num_sources: Int, h: Int,
     mut acc: InlineArray[SIMD[DType.float32, W], head_dim // W],
-) -> Tuple[Scalar[DType.float32], Scalar[DType.float32]]:
+) -> Tuple[Float32, Float32]:
     comptime m_off = num_q * head_dim
     comptime l_off = m_off + num_q
     comptime PU = pick_port_unroll[W, head_dim]()
     comptime STRIDE = PU * W
 
-    var global_m = Scalar[DType.float32](-1e30)
+    var global_m = Float32(-1e30)
     for s in range(num_sources):
         var sm = (base + s * stride + m_off + h)[]
         if sm > global_m:
             global_m = sm
 
-    var global_l = Scalar[DType.float32](0)
+    var global_l = Float32(0)
     var first = True
 
     var batch_start = 0
@@ -91,7 +91,7 @@ def finalize_head[head_dim: Int, num_q: Int](
                 (out + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
         return
 
-    var inv_l = SIMD[DType.float32, W](Scalar[DType.float32](1.0) / global_l)
+    var inv_l = SIMD[DType.float32, W](Float32(1.0) / global_l)
     for i in range(head_dim // STRIDE):
         comptime for p in range(PU):
             (out + i * STRIDE + p * W).store(
@@ -126,8 +126,8 @@ struct ContextFlashMergeConfig[head_dim: Int, num_q: Int, tp: Int]:
     comptime PARTIAL_STRIDE = (
         (Self.num_q * Self.head_dim + 2 * Self.num_q) * 4 + 63) // 64 * 16
 
-    var output: Binding[Scalar[DType.bfloat16], Self.tp]
-    var partials: Binding[Scalar[DType.float32], Self.tp]
+    var output: Binding[BFloat16, Self.tp]
+    var partials: Binding[Float32, Self.tp]
     var num_sources: InlineArray[Int, Self.tp]
 
 
@@ -138,14 +138,14 @@ def merge_context_accumulate[
     config: UnsafePointer[ContextFlashMergeConfig[head_dim, num_q, tp], _],
     h: Int,
     mut acc: InlineArray[SIMD[DType.float32, W], head_dim // W],
-) -> Tuple[Scalar[DType.float32], Scalar[DType.float32]]:
+) -> Tuple[Float32, Float32]:
     comptime m_off = num_q * head_dim
     comptime l_off = m_off + num_q
     comptime PU = pick_port_unroll[W, head_dim]()
     comptime STRIDE = PU * W
     comptime PSTRIDE = ContextFlashMergeConfig[head_dim, num_q, tp].PARTIAL_STRIDE
 
-    var global_m = Scalar[DType.float32](-1e30)
+    var global_m = Float32(-1e30)
     for context_rank in range(tp):
         var base = config[].partials[context_rank]
         var ns = config[].num_sources[context_rank]
@@ -154,7 +154,7 @@ def merge_context_accumulate[
             if sm > global_m:
                 global_m = sm
 
-    var global_l = Scalar[DType.float32](0)
+    var global_l = Float32(0)
     var first = True
     for context_rank in range(tp):
         var base = config[].partials[context_rank]
@@ -212,7 +212,7 @@ def finalize_context_head[
                 (out + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
         return
 
-    var inv_l = SIMD[DType.float32, W](Scalar[DType.float32](1.0) / global_l)
+    var inv_l = SIMD[DType.float32, W](Float32(1.0) / global_l)
     for i in range(head_dim // STRIDE):
         comptime for p in range(PU):
             (out + i * STRIDE + p * W).store(
@@ -254,8 +254,8 @@ def dispatch_merge_flash_partials[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, tp: Int, max_worker_count: Int = 128,
 ](
-    output: Binding[Scalar[DType.bfloat16], tp],
-    partials_buf: Binding[Scalar[DType.float32], tp],
+    output: Binding[BFloat16, tp],
+    partials_buf: Binding[Float32, tp],
     num_sources: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],
     inline_max_bytes: Int = INLINE_MAX_BYTES,
@@ -287,8 +287,8 @@ def dispatch_merge_context_flash_partials[
     head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
-    output: Binding[Scalar[DType.bfloat16], tp],
-    partials_buf: Binding[Scalar[DType.float32], tp],
+    output: Binding[BFloat16, tp],
+    partials_buf: Binding[Float32, tp],
     num_sources: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],
 ):

@@ -10,7 +10,7 @@ comptime DEGREE = 4
 comptime ROWS = MAX_POS // DEGREE
 comptime HEAD_DIM = 512
 
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutExternalOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutExternalOrigin]
 
 
 def check(ok: Bool, msg: String):
@@ -28,10 +28,10 @@ def check_same(a: F32Ptr, b: F32Ptr, count: Int, label: String):
 
 
 def main():
-    var direct_cos = alloc[Scalar[DType.float32]](MAX_POS * HALF)
-    var direct_sin = alloc[Scalar[DType.float32]](MAX_POS * HALF)
-    var sharded_cos = alloc[Scalar[DType.float32]](MAX_POS * HALF)
-    var sharded_sin = alloc[Scalar[DType.float32]](MAX_POS * HALF)
+    var direct_cos = alloc[Float32](MAX_POS * HALF)
+    var direct_sin = alloc[Float32](MAX_POS * HALF)
+    var sharded_cos = alloc[Float32](MAX_POS * HALF)
+    var sharded_sin = alloc[Float32](MAX_POS * HALF)
 
     init_rope_table_partial_strided[HALF, MAX_POS](
         direct_cos, direct_sin, 1000000.0, HEAD_DIM, 0, 1)

@@ -11,8 +11,8 @@ comptime NUM_SOURCES = 4
 comptime M_OFF = NUM_Q * HEAD_DIM
 comptime L_OFF = M_OFF + NUM_Q
 
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
 @always_inline
@@ -61,15 +61,15 @@ def merge_runtime_scalar(
     for local_h in range(NUM_Q):
         var h = local_h
 
-        var global_m = Scalar[DType.float32](-1e30)
+        var global_m = Float32(-1e30)
         for s in range(num_active):
             var sm = (sources[s] + M_OFF + h)[]
             if sm > global_m:
                 global_m = sm
 
-        var corrections = InlineArray[Scalar[DType.float32], NUM_SOURCES](
-            fill=Scalar[DType.float32](0))
-        var global_l = Scalar[DType.float32](0)
+        var corrections = InlineArray[Float32, NUM_SOURCES](
+            fill=Float32(0))
+        var global_l = Float32(0)
         for s in range(num_active):
             var sm = (sources[s] + M_OFF + h)[]
             var sl = (sources[s] + L_OFF + h)[]
@@ -81,7 +81,7 @@ def merge_runtime_scalar(
         if global_l <= 0:
             continue
 
-        var inv_l = Scalar[DType.float32](1.0) / global_l
+        var inv_l = Float32(1.0) / global_l
         var dst = output + local_h * HEAD_DIM
 
         for i in range(HEAD_DIM // STRIDE):
@@ -106,7 +106,7 @@ def merge_comptime_batched(
     for local_h in range(NUM_Q):
         var h = local_h
 
-        var global_m = Scalar[DType.float32](-1e30)
+        var global_m = Float32(-1e30)
         comptime for s in range(NUM_SOURCES):
             var sm = (sources[s] + M_OFF + h)[]
             if sm > global_m:
@@ -126,7 +126,7 @@ def merge_comptime_batched(
         if global_l <= 0:
             continue
 
-        var inv_l = Scalar[DType.float32](1.0) / global_l
+        var inv_l = Float32(1.0) / global_l
         var dst = output + local_h * HEAD_DIM
 
         for i in range(HEAD_DIM // STRIDE):
@@ -148,15 +148,15 @@ def run_case() -> Int:
     comptime PARTIAL_ELEMS = M_OFF + NUM_Q + NUM_Q
     var sources = InlineArray[F32Ptr, NUM_SOURCES](uninitialized=True)
     for s in range(NUM_SOURCES):
-        sources[s] = alloc[Scalar[DType.float32]](PARTIAL_ELEMS)
+        sources[s] = alloc[Float32](PARTIAL_ELEMS)
         for i in range(M_OFF):
-            sources[s][i] = Scalar[DType.float32](Float64(i % 97 - 48) * 0.01)
+            sources[s][i] = Float32(Float64(i % 97 - 48) * 0.01)
         for h in range(NUM_Q):
-            (sources[s] + M_OFF + h)[] = Scalar[DType.float32](Float64(s * 3 + h) * 0.1)
-            (sources[s] + L_OFF + h)[] = Scalar[DType.float32](Float64(h + 1) * 0.5)
+            (sources[s] + M_OFF + h)[] = Float32(Float64(s * 3 + h) * 0.1)
+            (sources[s] + L_OFF + h)[] = Float32(Float64(h + 1) * 0.5)
 
-    var out_a = alloc[Scalar[DType.bfloat16]](NUM_Q * HEAD_DIM)
-    var out_b = alloc[Scalar[DType.bfloat16]](NUM_Q * HEAD_DIM)
+    var out_a = alloc[BFloat16](NUM_Q * HEAD_DIM)
+    var out_b = alloc[BFloat16](NUM_Q * HEAD_DIM)
 
     merge_runtime_scalar(out_a, sources, NUM_SOURCES)
     merge_comptime_batched(out_b, sources)

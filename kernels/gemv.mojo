@@ -91,9 +91,9 @@ def dispatch_gemv[
     P: BurstThreadPool, //,
     rows: Int, cols: Int, tp: Int, max_worker_count: Int = 128,
 ](
-    x: Binding[Scalar[DType.bfloat16], tp],
-    weight: Binding[Scalar[DType.bfloat16], tp],
-    output: Binding[Scalar[DType.bfloat16], tp],
+    x: Binding[BFloat16, tp],
+    weight: Binding[BFloat16, tp],
+    output: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime data_bytes = rows * cols * 2
@@ -138,9 +138,9 @@ def dispatch_gemv_softcap[
     rows: Int, cols: Int, tp: Int, cap: Float64,
     max_worker_count: Int = 128,
 ](
-    x: Binding[Scalar[DType.bfloat16], tp],
-    weight: Binding[Scalar[DType.bfloat16], tp],
-    output: Binding[Scalar[DType.bfloat16], tp],
+    x: Binding[BFloat16, tp],
+    weight: Binding[BFloat16, tp],
+    output: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime data_bytes = rows * cols * 2
@@ -188,13 +188,13 @@ def dispatch_gemv_chained_qkv[
     q_rows: Int, kv_rows: Int, cols: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
-    x: Binding[Scalar[DType.bfloat16], tp],
-    q_weight: Binding[Scalar[DType.bfloat16], tp],
-    k_weight: Binding[Scalar[DType.bfloat16], tp],
-    v_weight: Binding[Scalar[DType.bfloat16], tp],
-    q_out: Binding[Scalar[DType.bfloat16], tp],
-    k_out: Binding[Scalar[DType.bfloat16], tp],
-    v_out: Binding[Scalar[DType.bfloat16], tp],
+    x: Binding[BFloat16, tp],
+    q_weight: Binding[BFloat16, tp],
+    k_weight: Binding[BFloat16, tp],
+    v_weight: Binding[BFloat16, tp],
+    q_out: Binding[BFloat16, tp],
+    k_out: Binding[BFloat16, tp],
+    v_out: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime total_rows = q_rows + kv_rows + kv_rows

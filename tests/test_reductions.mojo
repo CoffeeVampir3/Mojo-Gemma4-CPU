@@ -12,7 +12,7 @@ from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
 comptime ImmutExt = ImmutOrigin(MutExternalOrigin)
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutExternalOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutExternalOrigin]
 
 
 @fieldwise_init
@@ -56,7 +56,7 @@ def hash_val(i: Int, seed: Int) -> Float32:
 
 def hash_fill(ptr: BF16Ptr, n: Int, seed: Int):
     for i in range(n):
-        ptr[i] = Scalar[DType.bfloat16](hash_val(i, seed))
+        ptr[i] = BFloat16(hash_val(i, seed))
 
 
 @always_inline
@@ -70,7 +70,7 @@ def bf16_ulp_at(value: Float64) -> Float64:
 def fill_rank_bf16[tp: Int](ptrs: InlineArray[BF16Ptr, tp], n: Int):
     for r in range(tp):
         for i in range(n):
-            ptrs[r][i] = Scalar[DType.bfloat16](Float32(r * 10 + i % 32))
+            ptrs[r][i] = BFloat16(Float32(r * 10 + i % 32))
 
 
 def check_bf16(ptr: BF16Ptr, idx: Int, expected: Float32, msg: String):
@@ -89,8 +89,8 @@ def test_allreduce_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
     var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out = InlineArray[BF16Ptr, tp](uninitialized=True)
     for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        out[r] = alloc[Scalar[DType.bfloat16]](n)
+        raw[r] = alloc[BFloat16](n)
+        out[r] = alloc[BFloat16](n)
     fill_rank_bf16[tp](raw, n)
     var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
     var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n)
@@ -116,8 +116,8 @@ def test_broadcast_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
     var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out = InlineArray[BF16Ptr, tp](uninitialized=True)
     for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        out[r] = alloc[Scalar[DType.bfloat16]](n)
+        raw[r] = alloc[BFloat16](n)
+        out[r] = alloc[BFloat16](n)
     fill_rank_bf16[tp](raw, n)
     var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
     var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n)
@@ -143,8 +143,8 @@ def test_broadcast_src_rank_exact[
     var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out = InlineArray[BF16Ptr, tp](uninitialized=True)
     for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        out[r] = alloc[Scalar[DType.bfloat16]](n)
+        raw[r] = alloc[BFloat16](n)
+        out[r] = alloc[BFloat16](n)
     fill_rank_bf16[tp](raw, n)
     var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
     var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n)
@@ -188,8 +188,8 @@ def accuracy_allreduce[tp: Int](
     var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out = InlineArray[BF16Ptr, tp](uninitialized=True)
     for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        out[r] = alloc[Scalar[DType.bfloat16]](n)
+        raw[r] = alloc[BFloat16](n)
+        out[r] = alloc[BFloat16](n)
         hash_fill(raw[r], n, r)
     var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)
     var dst = RankBuffers[DType.bfloat16, tp, MutExternalOrigin](count=n)
@@ -245,9 +245,9 @@ def accuracy_crosspath[tp: Int](n: Int, label: String):
     var out_inline = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out_parallel = InlineArray[BF16Ptr, tp](uninitialized=True)
     for r in range(tp):
-        raw[r] = alloc[Scalar[DType.bfloat16]](n)
-        out_inline[r] = alloc[Scalar[DType.bfloat16]](n)
-        out_parallel[r] = alloc[Scalar[DType.bfloat16]](n)
+        raw[r] = alloc[BFloat16](n)
+        out_inline[r] = alloc[BFloat16](n)
+        out_parallel[r] = alloc[BFloat16](n)
         hash_fill(raw[r], n, r)
 
     var src = RankBuffers[DType.bfloat16, tp, ImmutExt](count=n)

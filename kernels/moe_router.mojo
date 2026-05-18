@@ -49,7 +49,7 @@ def insert_candidate[top_k: Int](
 @fieldwise_init
 struct RouterShardedKernel[
     hidden: Int, experts_per_rank: Int, top_k: Int,
-    rms_eps: Scalar[DType.float32],
+    rms_eps: Float32,
 ](OutputPartitionedKernel):
     var x: BF16Ptr
     var router_proj: BF16Ptr
@@ -65,7 +65,7 @@ struct RouterShardedKernel[
         comptime PU = pick_port_unroll[W, Self.hidden]()
         comptime STRIDE = PU * W
         comptime sqrt_n = sqrt[DType.float32, 1](Float32(Self.hidden))
-        comptime n_eps = Scalar[DType.float32](
+        comptime n_eps = Float32(
             Float32(Self.hidden) * Self.rms_eps)
         comptime sentinel = Float32(-1.0e30)
 
@@ -114,12 +114,12 @@ comptime ROUTER_INLINE_TOKENS = 16
 def dispatch_router_sharded[
     P: BurstThreadPool, //,
     hidden: Int, experts_per_rank: Int, top_k: Int, tp: Int,
-    rms_eps: Scalar[DType.float32], max_worker_count: Int = 128,
+    rms_eps: Float32, max_worker_count: Int = 128,
 ](
-    x: Binding[Scalar[DType.bfloat16], tp],
-    router_proj: Binding[Scalar[DType.bfloat16], tp],
-    router_scale: Binding[Scalar[DType.bfloat16], tp],
-    scaled_scratch: Binding[Scalar[DType.float32], tp],
+    x: Binding[BFloat16, tp],
+    router_proj: Binding[BFloat16, tp],
+    router_scale: Binding[BFloat16, tp],
+    scaled_scratch: Binding[Float32, tp],
     cands_out: Binding[RouterCandidate, tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
@@ -158,8 +158,8 @@ def dispatch_router_sharded[
 def merge_router_candidates[tp: Int, top_k: Int](
     cands_per_rank: Binding[RouterCandidate, tp],
     per_expert_scale: BF16Ptr,
-    route_idx_per_rank: Binding[Scalar[DType.int32], tp],
-    route_w_per_rank: Binding[Scalar[DType.float32], tp],
+    route_idx_per_rank: Binding[Int32, tp],
+    route_w_per_rank: Binding[Float32, tp],
     seq_len: Int,
 ):
     comptime sentinel = Float32(-1.0e30)
@@ -193,9 +193,9 @@ def merge_router_candidates[tp: Int, top_k: Int](
 
 
 def build_expert_schedules[tp: Int, experts_per_rank: Int, top_k: Int](
-    route_idx: Binding[Scalar[DType.int32], tp],
-    route_w: Binding[Scalar[DType.float32], tp],
-    expert_offset: Binding[Scalar[DType.int32], tp],
+    route_idx: Binding[Int32, tp],
+    route_w: Binding[Float32, tp],
+    expert_offset: Binding[Int32, tp],
     routes: Binding[SparseRoute, tp],
     seq_len: Int,
 ):

@@ -3,8 +3,8 @@ from std.memory import UnsafePointer
 from kernels.helpers import Binding
 
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime BF16Bind[tp: Int] = Binding[Scalar[DType.bfloat16], tp]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime BF16Bind[tp: Int] = Binding[BFloat16, tp]
 
 
 @fieldwise_init

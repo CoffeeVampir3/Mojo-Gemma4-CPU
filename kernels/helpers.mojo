@@ -5,9 +5,9 @@ from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr  = UnsafePointer[Scalar[DType.float32],  MutAnyOrigin]
-comptime I32Ptr  = UnsafePointer[Scalar[DType.int32],    MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr  = UnsafePointer[Float32,  MutAnyOrigin]
+comptime I32Ptr  = UnsafePointer[Int32,    MutAnyOrigin]
 comptime W  = simd_width_of[DType.float32]()
 comptime BW = simd_width_of[DType.bfloat16]()
 

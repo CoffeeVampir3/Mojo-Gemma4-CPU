@@ -53,7 +53,7 @@ def quantize_i8[width: Int](
 
 
 @always_inline
-def quantize_i8_scalar(v: Float32, inv_scale: Float32) -> Scalar[DType.int8]:
+def quantize_i8_scalar(v: Float32, inv_scale: Float32) -> Int8:
     """Scalar absmax quantize f32 → i8."""
     var q = roundeven[DType.float32, 1](v * inv_scale)
     return min(max(q, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()

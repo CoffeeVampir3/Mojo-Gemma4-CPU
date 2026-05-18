@@ -31,7 +31,7 @@ def vpdpbusd[width: Int](
 
 @always_inline
 def act_broadcast_bytes(
-    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    act_row: UnsafePointer[Int8, MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.uint8, WIDTH * VNNI_BLK]:
     var b4 = (act_row + k_pos).bitcast[UInt8]().load[width=VNNI_BLK]() ^ SIMD[DType.uint8, VNNI_BLK](0x80)
@@ -45,11 +45,11 @@ def act_broadcast_bytes(
 @always_inline
 def dot_current(
     acc: SIMD[DType.int32, WIDTH],
-    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    act_row: UnsafePointer[Int8, MutAnyOrigin],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.int32, WIDTH]:
-    var w = wpacked.bitcast[Scalar[DType.int8]]().load[width=WIDTH * VNNI_BLK]()
+    var w = wpacked.bitcast[Int8]().load[width=WIDTH * VNNI_BLK]()
     return vpdpbusd[WIDTH](acc, act_broadcast_bytes(act_row, k_pos), w)
 
 
@@ -59,15 +59,15 @@ def dot_hoisted(
     act_bytes: SIMD[DType.uint8, WIDTH * VNNI_BLK],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
 ) -> SIMD[DType.int32, WIDTH]:
-    var w = wpacked.bitcast[Scalar[DType.int8]]().load[width=WIDTH * VNNI_BLK]()
+    var w = wpacked.bitcast[Int8]().load[width=WIDTH * VNNI_BLK]()
     return vpdpbusd[WIDTH](acc, act_bytes, w)
 
 
 @no_inline
 def current_gemv_tile(
-    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    act_row: UnsafePointer[Int8, MutAnyOrigin],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
-    out_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    out_ptr: UnsafePointer[Int32, MutAnyOrigin],
 ):
     var acc_buf = InlineArray[SIMD[DType.int32, WIDTH], ACC_COUNT](
         fill=SIMD[DType.int32, WIDTH](0))
@@ -98,9 +98,9 @@ def current_gemv_tile(
 
 @no_inline
 def hoisted_activation_broadcast_gemv_tile(
-    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    act_row: UnsafePointer[Int8, MutAnyOrigin],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
-    out_ptr: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    out_ptr: UnsafePointer[Int32, MutAnyOrigin],
 ):
     var acc_buf = InlineArray[SIMD[DType.int32, WIDTH], ACC_COUNT](
         fill=SIMD[DType.int32, WIDTH](0))
@@ -131,13 +131,13 @@ def hoisted_activation_broadcast_gemv_tile(
 
 @always_inline
 def init_inputs(
-    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    act_row: UnsafePointer[Int8, MutAnyOrigin],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
 ):
     var act = Int32(7)
     for k in range(VNNI_K_STEP):
         act = (act * 17 + 29) % 101
-        act_row[k] = Scalar[DType.int8](Int8(act - 50))
+        act_row[k] = Int8(Int8(act - 50))
 
     var wt = Int32(11)
     for i in range(PACKED_BYTES):
@@ -147,15 +147,15 @@ def init_inputs(
 
 @no_inline
 def run_case() -> Int:
-    var act_arr = InlineArray[Scalar[DType.int8], VNNI_K_STEP](uninitialized=True)
+    var act_arr = InlineArray[Int8, VNNI_K_STEP](uninitialized=True)
     var wpacked_arr = InlineArray[UInt8, PACKED_BYTES](uninitialized=True)
-    var current_out_arr = InlineArray[Scalar[DType.int32], VNNI_N_STEP](uninitialized=True)
-    var hoisted_out_arr = InlineArray[Scalar[DType.int32], VNNI_N_STEP](uninitialized=True)
+    var current_out_arr = InlineArray[Int32, VNNI_N_STEP](uninitialized=True)
+    var hoisted_out_arr = InlineArray[Int32, VNNI_N_STEP](uninitialized=True)
 
-    var act_row = UnsafePointer(to=act_arr).bitcast[Scalar[DType.int8]]()
+    var act_row = UnsafePointer(to=act_arr).bitcast[Int8]()
     var wpacked = UnsafePointer(to=wpacked_arr).bitcast[UInt8]()
-    var current_out = UnsafePointer(to=current_out_arr).bitcast[Scalar[DType.int32]]()
-    var hoisted_out = UnsafePointer(to=hoisted_out_arr).bitcast[Scalar[DType.int32]]()
+    var current_out = UnsafePointer(to=current_out_arr).bitcast[Int32]()
+    var hoisted_out = UnsafePointer(to=hoisted_out_arr).bitcast[Int32]()
 
     init_inputs(act_row, wpacked)
     current_gemv_tile(act_row, wpacked, current_out)

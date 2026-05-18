@@ -21,8 +21,8 @@ from std.memory import UnsafePointer
 from std.sys.info import size_of, simd_width_of
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
-comptime PtrBF16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime PtrF32 = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime PtrBF16 = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
 
 
 # =============================================================================
@@ -134,7 +134,7 @@ struct Fp8E4M3Block[block: Int](Converter):
 
     @staticmethod
     def decompress_to_bf16(
-        src: UnsafePointer[Scalar[DType.float8_e4m3fn], MutAnyOrigin],
+        src: UnsafePointer[Float8_e4m3fn, MutAnyOrigin],
         aux: PtrF32,
         dst: PtrBF16,
         rows: Int, cols: Int,
@@ -166,13 +166,13 @@ struct Fp8E4M3Block[block: Int](Converter):
 
     @staticmethod
     def convert[dst_dtype: DType](
-        src: UnsafePointer[Scalar[DType.float8_e4m3fn], MutAnyOrigin],
+        src: UnsafePointer[Float8_e4m3fn, MutAnyOrigin],
         aux: PtrF32,
         dst: UnsafePointer[Scalar[dst_dtype], MutAnyOrigin],
         rows: Int, cols: Int,
     ):
-        var bf16_buf = List[Scalar[DType.bfloat16]](
-            length=rows * cols, fill=Scalar[DType.bfloat16](0))
+        var bf16_buf = List[BFloat16](
+            length=rows * cols, fill=BFloat16(0))
         var bf16 = PtrBF16(unsafe_from_address=Int(bf16_buf.unsafe_ptr()))
         Self.decompress_to_bf16(src, aux, bf16, rows, cols)
         var null_aux = PtrU8()

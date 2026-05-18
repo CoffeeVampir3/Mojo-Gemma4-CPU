@@ -29,8 +29,8 @@ comptime PORT_UNROLL = 4      # independent acc chains for the port-sat variant.
 
 @no_inline
 def accumulate_serial(
-    expert_buf: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    expert_buf: UnsafePointer[BFloat16, MutAnyOrigin],
+    dst: UnsafePointer[BFloat16, MutAnyOrigin],
 ):
     """Single-accumulator chain across experts — mirrors current kernel."""
     for i in range(0, HIDDEN, WIDTH):
@@ -42,8 +42,8 @@ def accumulate_serial(
 
 @no_inline
 def accumulate_port_sat(
-    expert_buf: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    expert_buf: UnsafePointer[BFloat16, MutAnyOrigin],
+    dst: UnsafePointer[BFloat16, MutAnyOrigin],
 ):
     """PORT_UNROLL independent accumulators; tree-merged at the tail.
 
@@ -77,29 +77,29 @@ def accumulate_port_sat(
 
 @always_inline
 def init_inputs(
-    expert_buf: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    expert_buf: UnsafePointer[BFloat16, MutAnyOrigin],
+    dst: UnsafePointer[BFloat16, MutAnyOrigin],
 ):
     var x = Int32(17)
     for e in range(LOCAL_COUNT):
         for i in range(HIDDEN):
             x = (x * 1103515245 + 12345) & 0x7FFFFFFF
             var f = Float32(x & 0xFFFF) / Float32(0x10000) - Float32(0.5)
-            (expert_buf + e * HIDDEN + i)[] = Scalar[DType.bfloat16](f)
+            (expert_buf + e * HIDDEN + i)[] = BFloat16(f)
     for i in range(HIDDEN):
-        (dst + i)[] = Scalar[DType.bfloat16](Float32(0))
+        (dst + i)[] = BFloat16(Float32(0))
 
 
 @no_inline
 def run_case() -> Float32:
-    var expert_arr = InlineArray[Scalar[DType.bfloat16], LOCAL_COUNT * HIDDEN](
+    var expert_arr = InlineArray[BFloat16, LOCAL_COUNT * HIDDEN](
         uninitialized=True)
-    var dst_serial_arr = InlineArray[Scalar[DType.bfloat16], HIDDEN](uninitialized=True)
-    var dst_portsat_arr = InlineArray[Scalar[DType.bfloat16], HIDDEN](uninitialized=True)
+    var dst_serial_arr = InlineArray[BFloat16, HIDDEN](uninitialized=True)
+    var dst_portsat_arr = InlineArray[BFloat16, HIDDEN](uninitialized=True)
 
-    var ep = UnsafePointer(to=expert_arr).bitcast[Scalar[DType.bfloat16]]()
-    var dsp = UnsafePointer(to=dst_serial_arr).bitcast[Scalar[DType.bfloat16]]()
-    var dpp = UnsafePointer(to=dst_portsat_arr).bitcast[Scalar[DType.bfloat16]]()
+    var ep = UnsafePointer(to=expert_arr).bitcast[BFloat16]()
+    var dsp = UnsafePointer(to=dst_serial_arr).bitcast[BFloat16]()
+    var dpp = UnsafePointer(to=dst_portsat_arr).bitcast[BFloat16]()
 
     init_inputs(ep, dsp)
     init_inputs(ep, dpp)

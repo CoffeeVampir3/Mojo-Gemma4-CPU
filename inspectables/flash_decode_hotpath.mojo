@@ -14,8 +14,8 @@ comptime WINDOW = 1024
 comptime NUM_POSITIONS = 64
 comptime TILE = W
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 @always_inline
@@ -65,7 +65,7 @@ def fast_exp_softmax_biased[width: Int](
 
 
 @always_inline
-def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Scalar[DType.float32]:
+def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Float32:
     comptime PU_ = pick_port_unroll[W, head_dim]()
     comptime S_ = PU_ * W
     var accs = InlineArray[SIMD[DType.float32, W], PU_](fill=SIMD[DType.float32, W](0))
@@ -78,7 +78,7 @@ def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Scalar[DType.fl
 
 
 @always_inline
-def scale_acc[head_dim: Int](acc: F32Ptr, factor: Scalar[DType.float32]):
+def scale_acc[head_dim: Int](acc: F32Ptr, factor: Float32):
     comptime PU_ = pick_port_unroll[W, head_dim]()
     comptime S_ = PU_ * W
     var f = SIMD[DType.float32, W](factor)
@@ -90,7 +90,7 @@ def scale_acc[head_dim: Int](acc: F32Ptr, factor: Scalar[DType.float32]):
 
 @always_inline
 def weighted_add[head_dim: Int](
-    acc: F32Ptr, v_row: BF16Ptr, weight: Scalar[DType.float32],
+    acc: F32Ptr, v_row: BF16Ptr, weight: Float32,
 ):
     comptime PU_ = pick_port_unroll[W, head_dim]()
     comptime S_ = PU_ * W
@@ -104,8 +104,8 @@ def weighted_add[head_dim: Int](
 
 @always_inline
 def accumulate_v_corrected[head_dim: Int](
-    v_row: BF16Ptr, weight: Scalar[DType.float32],
-    correction: Scalar[DType.float32], acc: F32Ptr,
+    v_row: BF16Ptr, weight: Float32,
+    correction: Float32, acc: F32Ptr,
 ):
     comptime PU_ = pick_port_unroll[W, head_dim]()
     comptime S_ = PU_ * W
@@ -135,10 +135,10 @@ def flash_decode_original(
 
     var acc_ptrs = InlineArray[F32Ptr, NUM_Q](uninitialized=True)
     var q_ptrs = InlineArray[BF16Ptr, NUM_Q](uninitialized=True)
-    var m = InlineArray[Scalar[DType.float32], NUM_Q](
-        fill=Scalar[DType.float32](-1e30))
-    var l = InlineArray[Scalar[DType.float32], NUM_Q](
-        fill=Scalar[DType.float32](0))
+    var m = InlineArray[Float32, NUM_Q](
+        fill=Float32(-1e30))
+    var l = InlineArray[Float32, NUM_Q](
+        fill=Float32(0))
 
     comptime for h in range(NUM_Q):
         acc_ptrs[h] = partials + h * HEAD_DIM
@@ -193,10 +193,10 @@ def flash_decode_tiled(
 
     var acc_ptrs = InlineArray[F32Ptr, NUM_Q](uninitialized=True)
     var q_ptrs = InlineArray[BF16Ptr, NUM_Q](uninitialized=True)
-    var m = InlineArray[Scalar[DType.float32], NUM_Q](
-        fill=Scalar[DType.float32](-1e30))
-    var l = InlineArray[Scalar[DType.float32], NUM_Q](
-        fill=Scalar[DType.float32](0))
+    var m = InlineArray[Float32, NUM_Q](
+        fill=Float32(-1e30))
+    var l = InlineArray[Float32, NUM_Q](
+        fill=Float32(0))
 
     comptime for h in range(NUM_Q):
         acc_ptrs[h] = partials + h * HEAD_DIM
@@ -243,18 +243,18 @@ def flash_decode_tiled(
 
 @no_inline
 def run_case() -> Int:
-    var q = alloc[Scalar[DType.bfloat16]](NUM_Q * HEAD_DIM)
-    var k = alloc[Scalar[DType.bfloat16]](WINDOW * KV_STRIDE)
-    var v = alloc[Scalar[DType.bfloat16]](WINDOW * KV_STRIDE)
+    var q = alloc[BFloat16](NUM_Q * HEAD_DIM)
+    var k = alloc[BFloat16](WINDOW * KV_STRIDE)
+    var v = alloc[BFloat16](WINDOW * KV_STRIDE)
     comptime partial_elems = NUM_Q * HEAD_DIM + NUM_Q + NUM_Q
-    var partials_a = alloc[Scalar[DType.float32]](partial_elems)
-    var partials_b = alloc[Scalar[DType.float32]](partial_elems)
+    var partials_a = alloc[Float32](partial_elems)
+    var partials_b = alloc[Float32](partial_elems)
 
     for i in range(NUM_Q * HEAD_DIM):
-        q[i] = Scalar[DType.bfloat16](Float32(Float64(i % 127 - 63) * 0.01))
+        q[i] = BFloat16(Float32(Float64(i % 127 - 63) * 0.01))
     for i in range(WINDOW * KV_STRIDE):
-        k[i] = Scalar[DType.bfloat16](Float32(Float64(i % 97 - 48) * 0.01))
-        v[i] = Scalar[DType.bfloat16](Float32(Float64(i % 83 - 41) * 0.01))
+        k[i] = BFloat16(Float32(Float64(i % 97 - 48) * 0.01))
+        v[i] = BFloat16(Float32(Float64(i % 83 - 41) * 0.01))
 
     flash_decode_original(q, k, v, partials_a, 0, 0, NUM_POSITIONS)
     flash_decode_tiled(q, k, v, partials_b, 0, 0, NUM_POSITIONS)

@@ -27,8 +27,8 @@ comptime KV_STRIDE = 512
 comptime WINDOW = 4096
 comptime MAX_WORKERS = 128
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 def arena_bases[tp: Int](
@@ -63,11 +63,11 @@ def arena_alloc_all[dtype: DType, tp: Int](
 
 def fill_pattern(ptr: BF16Ptr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32((i % 127) - 63) * 0.01)
+        ptr[i] = BFloat16(Float32((i % 127) - 63) * 0.01)
 
 
 def fill_pattern_all[tp: Int](
-    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
+    ptrs: Binding[BFloat16, tp], count: Int,
 ):
     for r in range(tp):
         fill_pattern(ptrs[r], count)
@@ -111,14 +111,14 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 head_dim=HEAD_DIM, num_q=NUM_Q,
                 gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
                 tp=tp](
-                Binding[Scalar[DType.bfloat16], tp](q, bases),
-                Binding[Scalar[DType.bfloat16], tp](k_cache, bases),
-                Binding[Scalar[DType.bfloat16], tp](v_cache, bases),
-                Binding[Scalar[DType.float32], tp](partials, bases),
+                Binding[BFloat16, tp](q, bases),
+                Binding[BFloat16, tp](k_cache, bases),
+                Binding[BFloat16, tp](v_cache, bases),
+                Binding[Float32, tp](partials, bases),
                 pos, vl, pools)
             dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
-                Binding[Scalar[DType.bfloat16], tp](output, bases),
-                Binding[Scalar[DType.float32], tp](partials, bases),
+                Binding[BFloat16, tp](output, bases),
+                Binding[Float32, tp](partials, bases),
                 nw, pools)
             keep(output[0])
 
@@ -131,14 +131,14 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                     head_dim=HEAD_DIM, num_q=NUM_Q,
                     gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
                     tp=tp](
-                    Binding[Scalar[DType.bfloat16], tp](q, bases),
-                    Binding[Scalar[DType.bfloat16], tp](k_cache, bases),
-                    Binding[Scalar[DType.bfloat16], tp](v_cache, bases),
-                    Binding[Scalar[DType.float32], tp](partials, bases),
+                    Binding[BFloat16, tp](q, bases),
+                    Binding[BFloat16, tp](k_cache, bases),
+                    Binding[BFloat16, tp](v_cache, bases),
+                    Binding[Float32, tp](partials, bases),
                     pos, vl, pools)
                 dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
-                    Binding[Scalar[DType.bfloat16], tp](output, bases),
-                    Binding[Scalar[DType.float32], tp](partials, bases),
+                    Binding[BFloat16, tp](output, bases),
+                    Binding[Float32, tp](partials, bases),
                     nw, pools)
                 elapsed += Int(perf_counter_ns()) - t0
             keep(output[0])
@@ -166,14 +166,14 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
         head_dim=HEAD_DIM, num_q=NUM_Q,
         gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
         tp=tp](
-        Binding[Scalar[DType.bfloat16], tp](q, bases),
-        Binding[Scalar[DType.bfloat16], tp](k_cache, bases),
-        Binding[Scalar[DType.bfloat16], tp](v_cache, bases),
-        Binding[Scalar[DType.float32], tp](partials, bases),
+        Binding[BFloat16, tp](q, bases),
+        Binding[BFloat16, tp](k_cache, bases),
+        Binding[BFloat16, tp](v_cache, bases),
+        Binding[Float32, tp](partials, bases),
         pos, VL, pools)
     dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
-        Binding[Scalar[DType.bfloat16], tp](output, bases),
-        Binding[Scalar[DType.float32], tp](partials, bases),
+        Binding[BFloat16, tp](output, bases),
+        Binding[Float32, tp](partials, bases),
         nw, pools)
 
     print("  output[0..3]: "
@@ -204,11 +204,11 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var partials = arena_alloc_all[DType.float32, tp](arenas, MAX_WORKERS * flash_stride)
 
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](q, bases), NUM_Q * HEAD_DIM)
+        Binding[BFloat16, tp](q, bases), NUM_Q * HEAD_DIM)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](k_cache, bases), WINDOW * KV_STRIDE)
+        Binding[BFloat16, tp](k_cache, bases), WINDOW * KV_STRIDE)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](v_cache, bases), WINDOW * KV_STRIDE)
+        Binding[BFloat16, tp](v_cache, bases), WINDOW * KV_STRIDE)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 

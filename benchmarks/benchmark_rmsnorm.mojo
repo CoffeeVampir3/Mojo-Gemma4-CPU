@@ -30,7 +30,7 @@ comptime HIDDEN = 2816
 comptime SQRT_N = sqrt[DType.float32, 1](HIDDEN)
 comptime N_EPS = HIDDEN * 1e-6
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
 def arena_alloc[dtype: DType](
@@ -65,23 +65,23 @@ def arena_alloc_all[dtype: DType, tp: Int](
 
 def fill_norm_input(ptr: BF16Ptr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32((i % 127) - 63) * 0.01)
+        ptr[i] = BFloat16(Float32((i % 127) - 63) * 0.01)
 
 
 def fill_ones(ptr: BF16Ptr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32(1.0) + Float32(i % 64) * 0.001)
+        ptr[i] = BFloat16(Float32(1.0) + Float32(i % 64) * 0.001)
 
 
 def fill_norm_input_all[tp: Int](
-    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
+    ptrs: Binding[BFloat16, tp], count: Int,
 ):
     for r in range(tp):
         fill_norm_input(ptrs[r], count)
 
 
 def fill_ones_all[tp: Int](
-    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
+    ptrs: Binding[BFloat16, tp], count: Int,
 ):
     for r in range(tp):
         fill_ones(ptrs[r], count)
@@ -287,9 +287,9 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
 
         for _ in range(WARMUP):
             dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
-                Binding[Scalar[DType.bfloat16], tp](src, bases),
-                Binding[Scalar[DType.bfloat16], tp](dst, bases),
-                Binding[Scalar[DType.bfloat16], tp](weight, bases),
+                Binding[BFloat16, tp](src, bases),
+                Binding[BFloat16, tp](dst, bases),
+                Binding[BFloat16, tp](weight, bases),
                 seq, pools)
         var best_dispatched = Int(1 << 60)
         for _ in range(TRIALS):
@@ -297,9 +297,9 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
             for _ in range(ITERS):
                 var t0 = Int(perf_counter_ns())
                 dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
-                    Binding[Scalar[DType.bfloat16], tp](src, bases),
-                    Binding[Scalar[DType.bfloat16], tp](dst, bases),
-                    Binding[Scalar[DType.bfloat16], tp](weight, bases),
+                    Binding[BFloat16, tp](src, bases),
+                    Binding[BFloat16, tp](dst, bases),
+                    Binding[BFloat16, tp](weight, bases),
                     seq, pools)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
@@ -373,10 +373,10 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
             fused_norm_residual_add[
                 hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp,
             ](
-                Binding[Scalar[DType.bfloat16], tp](partial, bases),
-                Binding[Scalar[DType.bfloat16], tp](residual, bases),
-                Binding[Scalar[DType.bfloat16], tp](res_dst, bases),
-                Binding[Scalar[DType.bfloat16], tp](weight, bases),
+                Binding[BFloat16, tp](partial, bases),
+                Binding[BFloat16, tp](residual, bases),
+                Binding[BFloat16, tp](res_dst, bases),
+                Binding[BFloat16, tp](weight, bases),
                 seq, pools)
         var best_dispatched = Int(1 << 60)
         for _ in range(TRIALS):
@@ -386,10 +386,10 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
                 fused_norm_residual_add[
                     hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp,
                 ](
-                    Binding[Scalar[DType.bfloat16], tp](partial, bases),
-                    Binding[Scalar[DType.bfloat16], tp](residual, bases),
-                    Binding[Scalar[DType.bfloat16], tp](res_dst, bases),
-                    Binding[Scalar[DType.bfloat16], tp](weight, bases),
+                    Binding[BFloat16, tp](partial, bases),
+                    Binding[BFloat16, tp](residual, bases),
+                    Binding[BFloat16, tp](res_dst, bases),
+                    Binding[BFloat16, tp](weight, bases),
                     seq, pools)
                 var t1 = Int(perf_counter_ns())
                 elapsed += t1 - t0
@@ -429,12 +429,12 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var res_dst = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
 
     fill_norm_input_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](src, bases), MAX_TOKENS * HIDDEN)
+        Binding[BFloat16, tp](src, bases), MAX_TOKENS * HIDDEN)
     fill_norm_input_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](partial, bases), MAX_TOKENS * HIDDEN)
+        Binding[BFloat16, tp](partial, bases), MAX_TOKENS * HIDDEN)
     fill_norm_input_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](residual, bases), MAX_TOKENS * HIDDEN)
-    fill_ones_all[tp](Binding[Scalar[DType.bfloat16], tp](weight, bases), HIDDEN)
+        Binding[BFloat16, tp](residual, bases), MAX_TOKENS * HIDDEN)
+    fill_ones_all[tp](Binding[BFloat16, tp](weight, bases), HIDDEN)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 

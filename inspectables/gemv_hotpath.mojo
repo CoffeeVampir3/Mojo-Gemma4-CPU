@@ -8,7 +8,7 @@ comptime W = simd_width_of[DType.float32]()
 comptime COLS = 2816
 comptime ROWS = 16
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
 @always_inline
@@ -63,14 +63,14 @@ def gemv_range(
 
 @no_inline
 def run_case() -> Int:
-    var x = alloc[Scalar[DType.bfloat16]](COLS)
-    var weight = alloc[Scalar[DType.bfloat16]](ROWS * COLS)
-    var output = alloc[Scalar[DType.bfloat16]](ROWS)
+    var x = alloc[BFloat16](COLS)
+    var weight = alloc[BFloat16](ROWS * COLS)
+    var output = alloc[BFloat16](ROWS)
 
     for i in range(COLS):
-        x[i] = Scalar[DType.bfloat16](Float32(Float64(i % 127 - 63) * 0.01))
+        x[i] = BFloat16(Float32(Float64(i % 127 - 63) * 0.01))
     for i in range(ROWS * COLS):
-        weight[i] = Scalar[DType.bfloat16](Float32(Float64(i % 97 - 48) * 0.01))
+        weight[i] = BFloat16(Float32(Float64(i % 97 - 48) * 0.01))
 
     gemv_range(x, weight, output, 0, ROWS)
 

@@ -9,9 +9,9 @@ comptime W = simd_width_of[DType.float32]()
 comptime TP = 4
 comptime COUNT = 2816
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime ImmBF16Ptr = UnsafePointer[Scalar[DType.bfloat16], ImmutOrigin(MutAnyOrigin)]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
+comptime ImmBF16Ptr = UnsafePointer[BFloat16, ImmutOrigin(MutAnyOrigin)]
 
 
 @no_inline
@@ -35,13 +35,13 @@ def run_case() -> Int:
     var srcs_storage = InlineArray[BF16Ptr, TP](uninitialized=True)
     var srcs = InlineArray[ImmBF16Ptr, TP](uninitialized=True)
     for r in range(TP):
-        srcs_storage[r] = alloc[Scalar[DType.bfloat16]](COUNT)
+        srcs_storage[r] = alloc[BFloat16](COUNT)
         for i in range(COUNT):
-            srcs_storage[r][i] = Scalar[DType.bfloat16](
+            srcs_storage[r][i] = BFloat16(
                 Float32(Float64((i + r * 7) % 97 - 48) * 0.01))
         srcs[r] = srcs_storage[r].as_immutable()
 
-    var dst = alloc[Scalar[DType.bfloat16]](COUNT)
+    var dst = alloc[BFloat16](COUNT)
 
     reduce_sources_to(srcs, dst, 0, COUNT)
 

@@ -11,8 +11,8 @@ from minimax.kernels.dispatch_args import (
 
 @always_inline
 def bf16_dot_row[hidden: Int](
-    lhs: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    rhs: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    lhs: UnsafePointer[BFloat16, MutAnyOrigin],
+    rhs: UnsafePointer[BFloat16, MutAnyOrigin],
 ) -> Float32:
     comptime width = simd_width_of[DType.float32]()
     comptime port_unroll = pick_port_unroll[width, hidden]()

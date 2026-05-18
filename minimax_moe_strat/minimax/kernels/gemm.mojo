@@ -58,7 +58,7 @@ def zero_i8_row[K: Int](dst: I8Ptr):
         (dst + k).store(z)
         k += width
     while k < K:
-        dst[k] = Scalar[DType.int8](0)
+        dst[k] = Int8(0)
         k += 1
 
 
@@ -275,7 +275,7 @@ def sparse_moe_phase1_worker[
     comptime phase1_n_tiles = fwht_blk // AMX_TILE_N
 
     var act_arr = AlignedInlineArray[
-        Scalar[DType.int8], AMX_M_STEP * K](fill=Scalar[DType.int8](0))
+        Int8, AMX_M_STEP * K](fill=Int8(0))
     var act_tile = act_arr.unsafe_ptr()
     var act_scale_arr = AlignedInlineArray[
         Float32, AMX_M_STEP](fill=Float32(0))
@@ -368,8 +368,8 @@ def sparse_moe_phase2_worker[
     comptime num_blk_per_route = intermediate // fwht_blk
 
     var act_arr = AlignedInlineArray[
-        Scalar[DType.int8], AMX_M_STEP * intermediate](
-        fill=Scalar[DType.int8](0))
+        Int8, AMX_M_STEP * intermediate](
+        fill=Int8(0))
     var act_tile = act_arr.unsafe_ptr()
     var blk_arr = AlignedInlineArray[
         Float32, AMX_M_STEP * num_blk_per_route](fill=Float32(0))
@@ -446,6 +446,6 @@ def sparse_moe_phase2_worker[
                     width=width]().cast[DType.bfloat16]())
             h += width
         while h < args.hidden_count:
-            dst[h] = Scalar[DType.bfloat16](
+            dst[h] = BFloat16(
                 args.accum[token * hidden + args.hidden_start + h])
             h += 1

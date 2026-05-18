@@ -32,8 +32,8 @@ comptime KV_DIM_FULL = 1024
 comptime MAX_POS = 4096
 comptime SLIDING_WINDOW = 1024
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 def arena_alloc[dtype: DType](
@@ -68,11 +68,11 @@ def arena_alloc_all[dtype: DType, tp: Int](
 
 def fill_pattern(ptr: BF16Ptr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32((i % 127) - 63) * 0.01)
+        ptr[i] = BFloat16(Float32((i % 127) - 63) * 0.01)
 
 
 def fill_pattern_all[tp: Int](
-    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
+    ptrs: Binding[BFloat16, tp], count: Int,
 ):
     for r in range(tp):
         fill_pattern(ptrs[r], count)
@@ -81,8 +81,8 @@ def fill_pattern_all[tp: Int](
 def init_sliding_tables_all[tp: Int](
     cos_sl: F32Ptr, sin_sl: F32Ptr, bases: ArenaBases[tp],
 ):
-    var cos = Binding[Scalar[DType.float32], tp](cos_sl, bases)
-    var sin = Binding[Scalar[DType.float32], tp](sin_sl, bases)
+    var cos = Binding[Float32, tp](cos_sl, bases)
+    var sin = Binding[Float32, tp](sin_sl, bases)
     for r in range(tp):
         init_rope_table[HALF_SLIDING, MAX_POS](cos[r], sin[r], 10000.0)
 
@@ -91,8 +91,8 @@ def init_full_tables_all[tp: Int](
     cos_fl: F32Ptr, sin_fl: F32Ptr, bases: ArenaBases[tp],
 ):
     comptime LOCAL_ROWS = MAX_POS // tp
-    var cos = Binding[Scalar[DType.float32], tp](cos_fl, bases)
-    var sin = Binding[Scalar[DType.float32], tp](sin_fl, bases)
+    var cos = Binding[Float32, tp](cos_fl, bases)
+    var sin = Binding[Float32, tp](sin_fl, bases)
     for r in range(tp):
         init_rope_table_partial_strided[HALF_FULL, LOCAL_ROWS](
             cos[r], sin[r], 1000000.0, HEAD_DIM_FULL, r, tp)
@@ -210,13 +210,13 @@ def measure_sliding_cache_write[
     comptime NUM_Q = Q_ROWS // HEAD_DIM_SLIDING
     comptime NUM_KV = KV_ROWS // HEAD_DIM_SLIDING
     comptime POS = 513
-    var qs = Binding[Scalar[DType.bfloat16], tp](q, bases)
-    var ks = Binding[Scalar[DType.bfloat16], tp](k_src, bases)
-    var vs = Binding[Scalar[DType.bfloat16], tp](v_src, bases)
-    var kc = Binding[Scalar[DType.bfloat16], tp](k_cache, bases)
-    var vc = Binding[Scalar[DType.bfloat16], tp](v_cache, bases)
-    var cos = Binding[Scalar[DType.float32], tp](cos_sl, bases)
-    var sin = Binding[Scalar[DType.float32], tp](sin_sl, bases)
+    var qs = Binding[BFloat16, tp](q, bases)
+    var ks = Binding[BFloat16, tp](k_src, bases)
+    var vs = Binding[BFloat16, tp](v_src, bases)
+    var kc = Binding[BFloat16, tp](k_cache, bases)
+    var vc = Binding[BFloat16, tp](v_cache, bases)
+    var cos = Binding[Float32, tp](cos_sl, bases)
+    var sin = Binding[Float32, tp](sin_sl, bases)
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
@@ -260,16 +260,16 @@ def measure_full_cache_write[
     comptime POS = 513
     var owner = POS % tp
     var owner_bases = ArenaBases[tp].fill(bases[owner])
-    var full_cos = Binding[Scalar[DType.float32], tp](cos_fl, bases)[owner]
-    var full_sin = Binding[Scalar[DType.float32], tp](sin_fl, bases)[owner]
+    var full_cos = Binding[Float32, tp](cos_fl, bases)[owner]
+    var full_sin = Binding[Float32, tp](sin_fl, bases)[owner]
 
-    var qs = Binding[Scalar[DType.bfloat16], tp](q, bases)
-    var ks = Binding[Scalar[DType.bfloat16], tp](k_src, bases)
-    var vs = Binding[Scalar[DType.bfloat16], tp](v_src, bases)
-    var kc = Binding[Scalar[DType.bfloat16], tp](k_cache, bases)
-    var vc = Binding[Scalar[DType.bfloat16], tp](v_cache, bases)
-    var cos = Binding[Scalar[DType.float32], tp](full_cos, owner_bases)
-    var sin = Binding[Scalar[DType.float32], tp](full_sin, owner_bases)
+    var qs = Binding[BFloat16, tp](q, bases)
+    var ks = Binding[BFloat16, tp](k_src, bases)
+    var vs = Binding[BFloat16, tp](v_src, bases)
+    var kc = Binding[BFloat16, tp](k_cache, bases)
+    var vc = Binding[BFloat16, tp](v_cache, bases)
+    var cos = Binding[Float32, tp](full_cos, owner_bases)
+    var sin = Binding[Float32, tp](full_sin, owner_bases)
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
@@ -362,19 +362,19 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var full_v_cache = arena_alloc_all[DType.bfloat16, tp](
         arenas, MAX_POS * KV_DIM_FULL)
 
-    fill_pattern_all[tp](Binding[Scalar[DType.bfloat16], tp](data, bases), MAX_DATA)
+    fill_pattern_all[tp](Binding[BFloat16, tp](data, bases), MAX_DATA)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](sliding_q, bases), SL_Q_ROWS)
+        Binding[BFloat16, tp](sliding_q, bases), SL_Q_ROWS)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](sliding_k, bases), SL_KV_ROWS)
+        Binding[BFloat16, tp](sliding_k, bases), SL_KV_ROWS)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](sliding_v, bases), SL_KV_ROWS)
+        Binding[BFloat16, tp](sliding_v, bases), SL_KV_ROWS)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](full_q, bases), FL_Q_ROWS)
+        Binding[BFloat16, tp](full_q, bases), FL_Q_ROWS)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](full_k, bases), KV_DIM_FULL)
+        Binding[BFloat16, tp](full_k, bases), KV_DIM_FULL)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](full_v, bases), KV_DIM_FULL)
+        Binding[BFloat16, tp](full_v, bases), KV_DIM_FULL)
     init_sliding_tables_all[tp](cos_sl, sin_sl, bases)
     init_full_tables_all[tp](cos_fl, sin_fl, bases)
 

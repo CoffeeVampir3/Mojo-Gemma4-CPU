@@ -28,7 +28,7 @@ comptime KV_SLIDING = 2048
 comptime Q_FULL = 8192
 comptime KV_FULL = 1024
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 comptime FW = simd_width_of[DType.float32]()
 
 
@@ -64,11 +64,11 @@ def arena_alloc_all[dtype: DType, tp: Int](
 
 def fill_pattern(ptr: BF16Ptr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32((i % 253) - 126) * 0.005)
+        ptr[i] = BFloat16(Float32((i % 253) - 126) * 0.005)
 
 
 def fill_pattern_all[tp: Int](
-    ptrs: Binding[Scalar[DType.bfloat16], tp], count: Int,
+    ptrs: Binding[BFloat16, tp], count: Int,
 ):
     for r in range(tp):
         fill_pattern(ptrs[r], count)
@@ -244,9 +244,9 @@ def measure_dispatch_gemv[
     mut pools: HeapMoveArray[P], x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
     bases: ArenaBases[tp],
 ) -> Int:
-    var xs = Binding[Scalar[DType.bfloat16], tp](x, bases)
-    var ws = Binding[Scalar[DType.bfloat16], tp](weight, bases)
-    var outs = Binding[Scalar[DType.bfloat16], tp](output, bases)
+    var xs = Binding[BFloat16, tp](x, bases)
+    var ws = Binding[BFloat16, tp](weight, bases)
+    var outs = Binding[BFloat16, tp](output, bases)
 
     for _ in range(WARMUP):
         dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
@@ -320,13 +320,13 @@ def section_chained_qkv[P: BurstThreadPool, //, tp: Int](
 
     comptime Q_R = Q_SLIDING // tp
     comptime KV_R = KV_SLIDING // tp
-    var xs = Binding[Scalar[DType.bfloat16], tp](x, bases)
-    var qw = Binding[Scalar[DType.bfloat16], tp](q_weight, bases)
-    var kw = Binding[Scalar[DType.bfloat16], tp](k_weight, bases)
-    var vw = Binding[Scalar[DType.bfloat16], tp](v_weight, bases)
-    var qo = Binding[Scalar[DType.bfloat16], tp](q_out, bases)
-    var ko = Binding[Scalar[DType.bfloat16], tp](k_out, bases)
-    var vo = Binding[Scalar[DType.bfloat16], tp](v_out, bases)
+    var xs = Binding[BFloat16, tp](x, bases)
+    var qw = Binding[BFloat16, tp](q_weight, bases)
+    var kw = Binding[BFloat16, tp](k_weight, bases)
+    var vw = Binding[BFloat16, tp](v_weight, bases)
+    var qo = Binding[BFloat16, tp](q_out, bases)
+    var ko = Binding[BFloat16, tp](k_out, bases)
+    var vo = Binding[BFloat16, tp](v_out, bases)
 
     for _ in range(WARMUP):
         dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
@@ -386,9 +386,9 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var weight = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_WEIGHT_ELEMS)
     var output = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_ROWS)
 
-    fill_pattern_all[tp](Binding[Scalar[DType.bfloat16], tp](x, bases), HIDDEN)
+    fill_pattern_all[tp](Binding[BFloat16, tp](x, bases), HIDDEN)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](weight, bases), MAX_WEIGHT_ELEMS)
+        Binding[BFloat16, tp](weight, bases), MAX_WEIGHT_ELEMS)
 
     var cap = pools[0].get_capacity()
     print("pool capacity: " + String(cap) + " workers")
@@ -408,11 +408,11 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var k_out = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R)
     var v_out = arena_alloc_all[DType.bfloat16, tp](arenas, KV_R)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](q_weight, bases), Q_R * HIDDEN)
+        Binding[BFloat16, tp](q_weight, bases), Q_R * HIDDEN)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](k_weight, bases), KV_R * HIDDEN)
+        Binding[BFloat16, tp](k_weight, bases), KV_R * HIDDEN)
     fill_pattern_all[tp](
-        Binding[Scalar[DType.bfloat16], tp](v_weight, bases), KV_R * HIDDEN)
+        Binding[BFloat16, tp](v_weight, bases), KV_R * HIDDEN)
 
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())

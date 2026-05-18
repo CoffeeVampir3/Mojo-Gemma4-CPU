@@ -9,8 +9,8 @@ comptime PAIR_STRIDE = 128
 comptime NUM_HEADS = 16
 comptime HEAD_DIM = 256
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 @always_inline
@@ -35,15 +35,15 @@ def rope_token(data: BF16Ptr, cos_row: F32Ptr, sin_row: F32Ptr):
 
 @no_inline
 def run_case() -> Int:
-    var data = alloc[Scalar[DType.bfloat16]](NUM_HEADS * HEAD_DIM)
-    var cos_row = alloc[Scalar[DType.float32]](HALF)
-    var sin_row = alloc[Scalar[DType.float32]](HALF)
+    var data = alloc[BFloat16](NUM_HEADS * HEAD_DIM)
+    var cos_row = alloc[Float32](HALF)
+    var sin_row = alloc[Float32](HALF)
 
     for i in range(NUM_HEADS * HEAD_DIM):
-        data[i] = Scalar[DType.bfloat16](Float32(Float64(i % 127 - 63) * 0.01))
+        data[i] = BFloat16(Float32(Float64(i % 127 - 63) * 0.01))
     for i in range(HALF):
-        cos_row[i] = Scalar[DType.float32](Float64(i % 50) * 0.02)
-        sin_row[i] = Scalar[DType.float32](Float64(i % 50) * 0.01)
+        cos_row[i] = Float32(Float64(i % 50) * 0.02)
+        sin_row[i] = Float32(Float64(i % 50) * 0.01)
 
     rope_token(data, cos_row, sin_row)
 

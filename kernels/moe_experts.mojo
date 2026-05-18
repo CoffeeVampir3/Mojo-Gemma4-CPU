@@ -199,12 +199,12 @@ def dispatch_phase1_gate_up[
     hidden: Int, gate_up_fused: Int, intermediate: Int,
     experts_per_rank: Int, tp: Int, max_worker_count: Int = 128,
 ](
-    x_normed: Binding[Scalar[DType.bfloat16], tp],
-    expert_offset: Binding[Scalar[DType.int32], tp],
+    x_normed: Binding[BFloat16, tp],
+    expert_offset: Binding[Int32, tp],
     routes: Binding[SparseRoute, tp],
-    experts_gate_up: Binding[Scalar[DType.bfloat16], tp],
-    gate_scratch: Binding[Scalar[DType.float32], tp],
-    hidden_bucket: Binding[Scalar[DType.bfloat16], tp],
+    experts_gate_up: Binding[BFloat16, tp],
+    gate_scratch: Binding[Float32, tp],
+    hidden_bucket: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime Kernel = Phase1GateUpKernel[
@@ -360,12 +360,12 @@ def dispatch_phase2_down[
     hidden: Int, intermediate: Int, experts_per_rank: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
-    expert_offset: Binding[Scalar[DType.int32], tp],
+    expert_offset: Binding[Int32, tp],
     routes: Binding[SparseRoute, tp],
-    hidden_bucket: Binding[Scalar[DType.bfloat16], tp],
-    experts_down: Binding[Scalar[DType.bfloat16], tp],
-    moe_accum: Binding[Scalar[DType.float32], tp],
-    moe_partial: Binding[Scalar[DType.bfloat16], tp],
+    hidden_bucket: Binding[BFloat16, tp],
+    experts_down: Binding[BFloat16, tp],
+    moe_accum: Binding[Float32, tp],
+    moe_partial: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):

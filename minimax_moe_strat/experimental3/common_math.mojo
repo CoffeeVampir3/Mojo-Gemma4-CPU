@@ -9,8 +9,8 @@ from simd_math.matrixops import pick_port_unroll, tree_reduce_accs
 
 
 comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime I8Ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime I8Ptr = UnsafePointer[Int8, MutAnyOrigin]
 comptime U8Ptr = UnsafePointer[UInt8, MutAnyOrigin]
 
 

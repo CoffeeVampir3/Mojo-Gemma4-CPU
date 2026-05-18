@@ -24,7 +24,7 @@ comptime ITERS = 20
 comptime MAX_ELEMS = 32 * 1024 * 1024
 comptime BUF_ELEMS = 2816 * 4096
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
 def arena_alloc[dtype: DType](
@@ -39,7 +39,7 @@ def arena_alloc[dtype: DType](
 
 def fill_pattern(ptr: BF16Ptr, count: Int):
     for i in range(count):
-        ptr[i] = Scalar[DType.bfloat16](Float32(i % 256))
+        ptr[i] = BFloat16(Float32(i % 256))
 
 
 def fmt_bw(total_bytes: Int, ns: Int) -> String:

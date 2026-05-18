@@ -8,34 +8,34 @@ comptime W = simd_width_of[DType.float32]()
 
 @no_inline
 def cast_only(
-    src: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    src: UnsafePointer[Float32, MutAnyOrigin],
 ) -> SIMD[DType.bfloat16, W]:
     return src.load[width=W]().cast[DType.bfloat16]()
 
 
 @no_inline
 def cast_and_store(
-    src: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    src: UnsafePointer[Float32, MutAnyOrigin],
+    dst: UnsafePointer[BFloat16, MutAnyOrigin],
 ):
     dst.store(src.load[width=W]().cast[DType.bfloat16]())
 
 
 @no_inline
 def manual_trunc_store(
-    src: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    src: UnsafePointer[Float32, MutAnyOrigin],
+    dst: UnsafePointer[BFloat16, MutAnyOrigin],
 ):
     var bits = src.load[width=W]().to_bits() >> 16
     var narrow = bits.cast[DType.uint16]()
-    dst.bitcast[Scalar[DType.uint16]]().store(narrow)
+    dst.bitcast[UInt16]().store(narrow)
 
 
 def main():
-    var src = alloc[Scalar[DType.float32]](W)
-    var dst = alloc[Scalar[DType.bfloat16]](W)
+    var src = alloc[Float32](W)
+    var dst = alloc[BFloat16](W)
     for i in range(W):
-        src[i] = Scalar[DType.float32](Float64(i) * 0.1)
+        src[i] = Float32(Float64(i) * 0.1)
     var r = cast_only(src)
     cast_and_store(src, dst)
     manual_trunc_store(src, dst)

@@ -9,7 +9,7 @@ from simd_math import roundeven
 @always_inline
 def quantize_i8_chunks[cols: Int, width: Int](
     src: UnsafePointer[Float32, MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    dst: UnsafePointer[Int8, MutAnyOrigin],
     quant_scale: SIMD[DType.float32, width],
 ):
     comptime lo = SIMD[DType.float32, width](-128.0)
@@ -25,7 +25,7 @@ def quantize_i8_chunks[cols: Int, width: Int](
 @always_inline
 def absmax_quantize_i8[cols: Int](
     src: UnsafePointer[Float32, MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    dst: UnsafePointer[Int8, MutAnyOrigin],
 ) -> Float32:
     """Compute absmax of f32 buffer, quantize to i8 with dynamic scale.
 
@@ -51,7 +51,7 @@ def absmax_quantize_i8[cols: Int](
 @always_inline
 def fixed_quantize_i8[cols: Int](
     src: UnsafePointer[Float32, MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    dst: UnsafePointer[Int8, MutAnyOrigin],
     quant_inv: Float32,
 ):
     """Quantize f32 buffer to i8 with pre-computed scale (127/S)."""

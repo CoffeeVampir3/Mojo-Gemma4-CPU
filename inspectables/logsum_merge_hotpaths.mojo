@@ -29,8 +29,8 @@ comptime M_OFF = NUM_Q * HEAD_DIM
 comptime L_OFF = M_OFF + NUM_Q
 comptime PARTIAL_STRIDE = ((M_OFF + NUM_Q + NUM_Q) * 4 + 63) // 64 * 16
 
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
 @always_inline
@@ -71,19 +71,19 @@ def merge_accumulate[head_dim: Int, num_q: Int](
     num_sources: Int,
     h: Int,
     mut acc: InlineArray[SIMD[DType.float32, W], head_dim // W],
-) -> Tuple[Scalar[DType.float32], Scalar[DType.float32]]:
+) -> Tuple[Float32, Float32]:
     comptime m_off = num_q * head_dim
     comptime l_off = m_off + num_q
     comptime PU = pick_port_unroll[W, head_dim]()
     comptime STRIDE = PU * W
 
-    var global_m = Scalar[DType.float32](-1e30)
+    var global_m = Float32(-1e30)
     for s in range(num_sources):
         var sm = (base + s * stride + m_off + h)[]
         if sm > global_m:
             global_m = sm
 
-    var global_l = Scalar[DType.float32](0)
+    var global_l = Float32(0)
     var first = True
 
     var batch_start = 0
@@ -153,7 +153,7 @@ def finalize_head[head_dim: Int, num_q: Int](
                 (out + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
         return
 
-    var inv_l = SIMD[DType.float32, W](Scalar[DType.float32](1.0) / global_l)
+    var inv_l = SIMD[DType.float32, W](Float32(1.0) / global_l)
     for i in range(head_dim // STRIDE):
         comptime for p in range(PU):
             (out + i * STRIDE + p * W).store(
@@ -235,17 +235,17 @@ def fill_partials(buf: F32Ptr, stride: Int, num_sources: Int):
     for s in range(num_sources):
         var sp = buf + s * stride
         for i in range(M_OFF):
-            sp[i] = Scalar[DType.float32](Float64((i + s * 11) % 127 - 63) * 0.001)
+            sp[i] = Float32(Float64((i + s * 11) % 127 - 63) * 0.001)
         for h in range(NUM_Q):
-            (sp + M_OFF + h)[] = Scalar[DType.float32](Float64((s + h) % 9) * 0.25)
-            (sp + L_OFF + h)[] = Scalar[DType.float32](1.0)
+            (sp + M_OFF + h)[] = Float32(Float64((s + h) % 9) * 0.25)
+            (sp + L_OFF + h)[] = Float32(1.0)
 
 
 @no_inline
 def run_case() -> Int:
-    var partials = alloc[Scalar[DType.float32]](NUM_SOURCES * PARTIAL_STRIDE)
-    var output_bf16 = alloc[Scalar[DType.bfloat16]](NUM_Q * HEAD_DIM)
-    var output_f32 = alloc[Scalar[DType.float32]](PARTIAL_STRIDE)
+    var partials = alloc[Float32](NUM_SOURCES * PARTIAL_STRIDE)
+    var output_bf16 = alloc[BFloat16](NUM_Q * HEAD_DIM)
+    var output_f32 = alloc[Float32](PARTIAL_STRIDE)
 
     fill_partials(partials, PARTIAL_STRIDE, NUM_SOURCES)
     probe_finalize_bf16(output_bf16, partials, PARTIAL_STRIDE, NUM_SOURCES, 0)

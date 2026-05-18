@@ -57,11 +57,11 @@ def bcast_insert[width: Int](
 def use_join_chain(
     src: UnsafePointer[UInt8, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    dst: UnsafePointer[Int32, MutAnyOrigin],
 ):
     var b4 = src.load[width=4]()
     var bcast = bcast_join_chain[WIDTH](b4)
-    var w = weights.bitcast[Scalar[DType.int8]]().load[width=BCAST_BYTES]()
+    var w = weights.bitcast[Int8]().load[width=BCAST_BYTES]()
     var acc = vpdpbusd[WIDTH](SIMD[DType.int32, WIDTH](0), bcast, w)
     dst.store(acc)
 
@@ -70,11 +70,11 @@ def use_join_chain(
 def use_insert(
     src: UnsafePointer[UInt8, MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    dst: UnsafePointer[Int32, MutAnyOrigin],
 ):
     var b4 = src.load[width=4]()
     var bcast = bcast_insert[WIDTH](b4)
-    var w = weights.bitcast[Scalar[DType.int8]]().load[width=BCAST_BYTES]()
+    var w = weights.bitcast[Int8]().load[width=BCAST_BYTES]()
     var acc = vpdpbusd[WIDTH](SIMD[DType.int32, WIDTH](0), bcast, w)
     dst.store(acc)
 
@@ -83,10 +83,10 @@ def use_insert(
 def run_case() -> Int:
     var src = InlineArray[UInt8, 4](fill=UInt8(0))
     var weights = InlineArray[UInt8, BCAST_BYTES](fill=UInt8(0))
-    var out_a = InlineArray[Scalar[DType.int32], WIDTH](
-        fill=Scalar[DType.int32](0))
-    var out_c = InlineArray[Scalar[DType.int32], WIDTH](
-        fill=Scalar[DType.int32](0))
+    var out_a = InlineArray[Int32, WIDTH](
+        fill=Int32(0))
+    var out_c = InlineArray[Int32, WIDTH](
+        fill=Int32(0))
 
     var s = Int32(7)
     for i in range(4):
@@ -101,9 +101,9 @@ def run_case() -> Int:
     var weights_p = UnsafePointer(to=weights).bitcast[UInt8]()
 
     use_join_chain(src_p, weights_p,
-        UnsafePointer(to=out_a).bitcast[Scalar[DType.int32]]())
+        UnsafePointer(to=out_a).bitcast[Int32]())
     use_insert(src_p, weights_p,
-        UnsafePointer(to=out_c).bitcast[Scalar[DType.int32]]())
+        UnsafePointer(to=out_c).bitcast[Int32]())
 
     var checksum = Int(0)
     for i in range(WIDTH):

@@ -10,7 +10,7 @@ from simd_math.ops import sqrt
 comptime W = simd_width_of[DType.float32]()
 comptime HIDDEN = 2816
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
 @always_inline
@@ -37,7 +37,7 @@ def tree_reduce_accs[T: DType, width: Int, port_unroll: Int, //](
 
 
 @always_inline
-def rms_reduce_row(src: BF16Ptr) -> Scalar[DType.float32]:
+def rms_reduce_row(src: BF16Ptr) -> Float32:
     comptime PU = pick_port_unroll[W, HIDDEN]()
     comptime STRIDE = PU * W
     var accs = InlineArray[SIMD[DType.float32, W], PU](fill=SIMD[DType.float32, W](0))
@@ -51,7 +51,7 @@ def rms_reduce_row(src: BF16Ptr) -> Scalar[DType.float32]:
 @always_inline
 def rms_normalize_row(
     src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
-    inv_rms: Scalar[DType.float32],
+    inv_rms: Float32,
 ):
     def step[width: Int](idx: Int) {read}:
         var x = (src + idx).load[width=width]().cast[DType.float32]()
@@ -75,13 +75,13 @@ def rms_norm_row(src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr):
 
 @no_inline
 def run_case() -> Int:
-    var src = alloc[Scalar[DType.bfloat16]](HIDDEN)
-    var dst = alloc[Scalar[DType.bfloat16]](HIDDEN)
-    var weight = alloc[Scalar[DType.bfloat16]](HIDDEN)
+    var src = alloc[BFloat16](HIDDEN)
+    var dst = alloc[BFloat16](HIDDEN)
+    var weight = alloc[BFloat16](HIDDEN)
 
     for i in range(HIDDEN):
-        src[i] = Scalar[DType.bfloat16](Float32(Float64(i % 127 - 63) * 0.01))
-        weight[i] = Scalar[DType.bfloat16](Float32(Float64(i % 53 + 1) * 0.02))
+        src[i] = BFloat16(Float32(Float64(i % 127 - 63) * 0.01))
+        weight[i] = BFloat16(Float32(Float64(i % 53 + 1) * 0.02))
 
     rms_norm_row(src, dst, weight)
 

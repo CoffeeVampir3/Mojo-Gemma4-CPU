@@ -7,8 +7,8 @@ from simd_math import pick_port_unroll, fast_exp_softmax_biased
 
 
 comptime W = simd_width_of[DType.float32]()
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
 trait MergeStrategy:
@@ -17,7 +17,7 @@ trait MergeStrategy:
         dst: BF16Ptr,
         sources: InlineArray[F32Ptr, ns],
         h: Int,
-        global_m: Scalar[DType.float32],
+        global_m: Float32,
         m_off: Int,
         l_off: Int,
     ): ...
@@ -29,7 +29,7 @@ struct Unrolled(MergeStrategy):
         dst: BF16Ptr,
         sources: InlineArray[F32Ptr, ns],
         h: Int,
-        global_m: Scalar[DType.float32],
+        global_m: Float32,
         m_off: Int,
         l_off: Int,
     ):
@@ -53,7 +53,7 @@ struct Unrolled(MergeStrategy):
                     (dst + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
             return
 
-        var inv_l = Scalar[DType.float32](1.0) / global_l
+        var inv_l = Float32(1.0) / global_l
         for i in range(hd // STRIDE):
             comptime for p in range(PU):
                 var accs = InlineArray[SIMD[DType.float32, W], ns](
@@ -74,14 +74,14 @@ struct Batched(MergeStrategy):
         dst: BF16Ptr,
         sources: InlineArray[F32Ptr, ns],
         h: Int,
-        global_m: Scalar[DType.float32],
+        global_m: Float32,
         m_off: Int,
         l_off: Int,
     ):
         comptime PU = pick_port_unroll[W, hd]()
         comptime STRIDE = PU * W
 
-        var global_l = Scalar[DType.float32](0)
+        var global_l = Float32(0)
         var batch_start = 0
         while batch_start < ns:
             var batch_end = min(batch_start + W, ns)
@@ -103,8 +103,8 @@ struct Batched(MergeStrategy):
                     (dst + i * STRIDE + p * W).store(SIMD[DType.bfloat16, W](0))
             return
 
-        var inv_l = Scalar[DType.float32](1.0) / global_l
-        var dst_f32 = dst.bitcast[Scalar[DType.float32]]().as_any_origin()
+        var inv_l = Float32(1.0) / global_l
+        var dst_f32 = dst.bitcast[Float32]().as_any_origin()
         var first = True
 
         batch_start = 0
@@ -162,7 +162,7 @@ def merge_partials[
     for local_h in range(num_q_out):
         var h = head_offset + local_h
 
-        var global_m = Scalar[DType.float32](-1e30)
+        var global_m = Float32(-1e30)
         comptime for s in range(num_sources):
             var sm = (sources[s] + m_off + h)[]
             if sm > global_m:
@@ -182,15 +182,15 @@ def main():
 
     var sources = InlineArray[F32Ptr, NS](uninitialized=True)
     for s in range(NS):
-        sources[s] = alloc[Scalar[DType.float32]](PARTIAL_ELEMS)
+        sources[s] = alloc[Float32](PARTIAL_ELEMS)
         for i in range(M_OFF):
-            sources[s][i] = Scalar[DType.float32](Float64(i % 97 - 48) * 0.01)
+            sources[s][i] = Float32(Float64(i % 97 - 48) * 0.01)
         for h in range(NUM_Q):
-            (sources[s] + M_OFF + h)[] = Scalar[DType.float32](Float64(s * 3 + h) * 0.1)
-            (sources[s] + L_OFF + h)[] = Scalar[DType.float32](Float64(h + 1) * 0.5)
+            (sources[s] + M_OFF + h)[] = Float32(Float64(s * 3 + h) * 0.1)
+            (sources[s] + L_OFF + h)[] = Float32(Float64(h + 1) * 0.5)
 
-    var out_a = alloc[Scalar[DType.bfloat16]](NUM_Q * HEAD_DIM)
-    var out_b = alloc[Scalar[DType.bfloat16]](NUM_Q * HEAD_DIM)
+    var out_a = alloc[BFloat16](NUM_Q * HEAD_DIM)
+    var out_b = alloc[BFloat16](NUM_Q * HEAD_DIM)
 
     merge_partials[HEAD_DIM, NUM_Q, NUM_Q, NS, Unrolled](
         out_a, sources, PARTIAL_ELEMS)

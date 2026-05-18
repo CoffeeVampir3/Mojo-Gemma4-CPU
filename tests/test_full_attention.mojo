@@ -66,11 +66,11 @@ def run_case[
     q_origin: MutOrigin, k_origin: MutOrigin, v_origin: MutOrigin,
     out_origin: MutOrigin, partials_origin: MutOrigin,
 ](
-    q: UnsafePointer[Scalar[DType.bfloat16], q_origin],
-    k: UnsafePointer[Scalar[DType.bfloat16], k_origin],
-    v: UnsafePointer[Scalar[DType.bfloat16], v_origin],
-    output: UnsafePointer[Scalar[DType.bfloat16], out_origin],
-    partials: UnsafePointer[Scalar[DType.float32], partials_origin],
+    q: UnsafePointer[BFloat16, q_origin],
+    k: UnsafePointer[BFloat16, k_origin],
+    v: UnsafePointer[BFloat16, v_origin],
+    output: UnsafePointer[BFloat16, out_origin],
+    partials: UnsafePointer[Float32, partials_origin],
     valid: InlineArray[Int, TP],
     expected_kv0: Float32,
     expected_kv1: Float32,
@@ -84,22 +84,22 @@ def run_case[
         head_dim=HEAD_DIM, num_q=GLOBAL_Q,
         gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=TP,
     ](
-        Binding[Scalar[DType.bfloat16], TP](
+        Binding[BFloat16, TP](
             q.as_any_origin(), rank_bases(GLOBAL_Q * HEAD_DIM * 2)),
-        Binding[Scalar[DType.bfloat16], TP](
+        Binding[BFloat16, TP](
             k.as_any_origin(), rank_bases(KV_STRIDE * 2)),
-        Binding[Scalar[DType.bfloat16], TP](
+        Binding[BFloat16, TP](
             v.as_any_origin(), rank_bases(KV_STRIDE * 2)),
-        Binding[Scalar[DType.float32], TP](
+        Binding[Float32, TP](
             partials.as_any_origin(), rank_bases(PSTRIDE * 4)),
         valid, pools)
 
     dispatch_merge_context_flash_partials[
         head_dim=HEAD_DIM, num_q=GLOBAL_Q, local_num_q=LOCAL_Q, tp=TP,
     ](
-        Binding[Scalar[DType.bfloat16], TP](
+        Binding[BFloat16, TP](
             output.as_any_origin(), rank_bases(LOCAL_Q * HEAD_DIM * 2)),
-        Binding[Scalar[DType.float32], TP](
+        Binding[Float32, TP](
             partials.as_any_origin(), rank_bases(PSTRIDE * 4)),
         nws, pools)
 
@@ -117,23 +117,23 @@ def run_case[
 
 
 def main():
-    var q = alloc[Scalar[DType.bfloat16]](TP * GLOBAL_Q * HEAD_DIM)
-    var k = alloc[Scalar[DType.bfloat16]](TP * KV_STRIDE)
-    var v = alloc[Scalar[DType.bfloat16]](TP * KV_STRIDE)
-    var output = alloc[Scalar[DType.bfloat16]](TP * LOCAL_Q * HEAD_DIM)
-    var partials = alloc[Scalar[DType.float32]](TP * PSTRIDE)
+    var q = alloc[BFloat16](TP * GLOBAL_Q * HEAD_DIM)
+    var k = alloc[BFloat16](TP * KV_STRIDE)
+    var v = alloc[BFloat16](TP * KV_STRIDE)
+    var output = alloc[BFloat16](TP * LOCAL_Q * HEAD_DIM)
+    var partials = alloc[Float32](TP * PSTRIDE)
 
     for r in range(TP):
         var q_base = r * GLOBAL_Q * HEAD_DIM
         for i in range(GLOBAL_Q * HEAD_DIM):
-            q[q_base + i] = Scalar[DType.bfloat16](Float32(r * 10 + i % 7))
+            q[q_base + i] = BFloat16(Float32(r * 10 + i % 7))
 
         var kv_base = r * KV_STRIDE
         for i in range(KV_STRIDE):
-            k[kv_base + i] = Scalar[DType.bfloat16](0)
+            k[kv_base + i] = BFloat16(0)
         for i in range(HEAD_DIM):
-            v[kv_base + i] = Scalar[DType.bfloat16](Float32(10 + r))
-            v[kv_base + HEAD_DIM + i] = Scalar[DType.bfloat16](Float32(50 + r))
+            v[kv_base + i] = BFloat16(Float32(10 + r))
+            v[kv_base + HEAD_DIM + i] = BFloat16(Float32(50 + r))
 
     var valid_first = InlineArray[Int, TP](fill=0)
     valid_first[0] = 1

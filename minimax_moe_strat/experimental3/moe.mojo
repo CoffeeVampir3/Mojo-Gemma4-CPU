@@ -40,11 +40,11 @@ def router_topk_kernel[num_experts: Int, k: Int](args: RouterTopkArgs[k]):
 
 
 def moe_combine[hidden: Int](
-    moe_out: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    moe_norm_w: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dense_normed: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    combine_norm_w: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    x_main: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    moe_out: UnsafePointer[BFloat16, MutAnyOrigin],
+    moe_norm_w: UnsafePointer[BFloat16, MutAnyOrigin],
+    dense_normed: UnsafePointer[BFloat16, MutAnyOrigin],
+    combine_norm_w: UnsafePointer[BFloat16, MutAnyOrigin],
+    x_main: UnsafePointer[BFloat16, MutAnyOrigin],
     layer_scalar: Float32,
     eps: Float32,
 ):

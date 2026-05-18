@@ -13,7 +13,7 @@ from .helpers import (
 
 
 @always_inline
-def rms_reduce_row[hidden: Int](src: BF16Ptr) -> Scalar[DType.float32]:
+def rms_reduce_row[hidden: Int](src: BF16Ptr) -> Float32:
     comptime PU = pick_port_unroll[W, hidden]()
     comptime STRIDE = PU * W
     var accs = InlineArray[SIMD[DType.float32, W], PU](fill=SIMD[DType.float32, W](0))
@@ -27,7 +27,7 @@ def rms_reduce_row[hidden: Int](src: BF16Ptr) -> Scalar[DType.float32]:
 @always_inline
 def rms_normalize_row[hidden: Int, scaled: Bool = True](
     src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
-    inv_rms: Scalar[DType.float32],
+    inv_rms: Float32,
 ):
     def step[width: Int](idx: Int) {read}:
         var x = (src + idx).load[width=width]().cast[DType.float32]()
@@ -44,7 +44,7 @@ def rms_normalize_row[hidden: Int, scaled: Bool = True](
 
 @always_inline
 def rms_norm_row[
-    hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
     scaled: Bool = True,
 ](
     src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
@@ -56,7 +56,7 @@ def rms_norm_row[
 
 @always_inline
 def norm_residual_add_row[
-    hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
 ](
     src: BF16Ptr, residual: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
 ):
@@ -75,7 +75,7 @@ def norm_residual_add_row[
 
 @fieldwise_init
 struct RmsNormTokenKernel[
-    hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
     scaled: Bool = True,
 ](OutputPartitionedKernel):
     var src: BF16Ptr
@@ -99,7 +99,7 @@ struct RmsNormTokenKernel[
 
 @fieldwise_init
 struct NormResidualAddTokenKernel[
-    hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
 ](OutputPartitionedKernel):
     var src: BF16Ptr
     var residual: BF16Ptr
@@ -126,12 +126,12 @@ comptime NORM_INLINE_TOKENS = 16
 
 def dispatch_rms_norm[
     P: BurstThreadPool, //,
-    hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
     tp: Int, scaled: Bool = True, max_worker_count: Int = 128,
 ](
-    src: Binding[Scalar[DType.bfloat16], tp],
-    dst: Binding[Scalar[DType.bfloat16], tp],
-    weight: Binding[Scalar[DType.bfloat16], tp],
+    src: Binding[BFloat16, tp],
+    dst: Binding[BFloat16, tp],
+    weight: Binding[BFloat16, tp],
     count: Int,
     mut pools: HeapMoveArray[P],
 ):
@@ -159,7 +159,7 @@ def dispatch_rms_norm[
 
 @fieldwise_init
 struct ScaledNormKernel[
-    hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
     scaled: Bool, numer: Int, denom: Int,
 ](OutputPartitionedKernel):
     var src: BF16Ptr
@@ -185,17 +185,17 @@ struct ScaledNormKernel[
 
 def dispatch_rms_norm_qkv_heads[
     P: BurstThreadPool, //,
-    head_dim: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    head_dim: Int, sqrt_n: Float32, n_eps: Float32,
     num_q: Int, num_kv: Int, tp: Int, max_worker_count: Int = 128,
 ](
-    q_src: Binding[Scalar[DType.bfloat16], tp],
-    q_dst: Binding[Scalar[DType.bfloat16], tp],
-    k_src: Binding[Scalar[DType.bfloat16], tp],
-    k_dst: Binding[Scalar[DType.bfloat16], tp],
-    v_src: Binding[Scalar[DType.bfloat16], tp],
-    v_dst: Binding[Scalar[DType.bfloat16], tp],
-    q_weight: Binding[Scalar[DType.bfloat16], tp],
-    k_weight: Binding[Scalar[DType.bfloat16], tp],
+    q_src: Binding[BFloat16, tp],
+    q_dst: Binding[BFloat16, tp],
+    k_src: Binding[BFloat16, tp],
+    k_dst: Binding[BFloat16, tp],
+    v_src: Binding[BFloat16, tp],
+    v_dst: Binding[BFloat16, tp],
+    q_weight: Binding[BFloat16, tp],
+    k_weight: Binding[BFloat16, tp],
     mut pools: HeapMoveArray[P],
 ):
     comptime total = num_q + num_kv + num_kv
@@ -236,13 +236,13 @@ def dispatch_rms_norm_qkv_heads[
 
 def fused_norm_residual_add[
     P: BurstThreadPool, //,
-    hidden: Int, sqrt_n: Scalar[DType.float32], n_eps: Scalar[DType.float32],
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
     tp: Int, max_worker_count: Int = 128,
 ](
-    src: Binding[Scalar[DType.bfloat16], tp],
-    residual: Binding[Scalar[DType.bfloat16], tp],
-    dst: Binding[Scalar[DType.bfloat16], tp],
-    weight: Binding[Scalar[DType.bfloat16], tp],
+    src: Binding[BFloat16, tp],
+    residual: Binding[BFloat16, tp],
+    dst: Binding[BFloat16, tp],
+    weight: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):

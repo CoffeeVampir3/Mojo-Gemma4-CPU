@@ -52,33 +52,33 @@ def dtype_byte_size(dtype: DType) -> Int:
     if dtype == DType.bool:
         return size_of[Scalar[DType.bool]]()
     if dtype == DType.uint8:
-        return size_of[Scalar[DType.uint8]]()
+        return size_of[UInt8]()
     if dtype == DType.int8:
-        return size_of[Scalar[DType.int8]]()
+        return size_of[Int8]()
     if dtype == DType.int16:
-        return size_of[Scalar[DType.int16]]()
+        return size_of[Int16]()
     if dtype == DType.uint16:
-        return size_of[Scalar[DType.uint16]]()
+        return size_of[UInt16]()
     if dtype == DType.float16:
-        return size_of[Scalar[DType.float16]]()
+        return size_of[Float16]()
     if dtype == DType.bfloat16:
-        return size_of[Scalar[DType.bfloat16]]()
+        return size_of[BFloat16]()
     if dtype == DType.int32:
-        return size_of[Scalar[DType.int32]]()
+        return size_of[Int32]()
     if dtype == DType.uint32:
-        return size_of[Scalar[DType.uint32]]()
+        return size_of[UInt32]()
     if dtype == DType.float32:
-        return size_of[Scalar[DType.float32]]()
+        return size_of[Float32]()
     if dtype == DType.float64:
-        return size_of[Scalar[DType.float64]]()
+        return size_of[Float64]()
     if dtype == DType.float8_e4m3fn:
-        return size_of[Scalar[DType.float8_e4m3fn]]()
+        return size_of[Float8_e4m3fn]()
     if dtype == DType.float8_e5m2:
-        return size_of[Scalar[DType.float8_e5m2]]()
+        return size_of[Float8_e5m2]()
     if dtype == DType.int64:
-        return size_of[Scalar[DType.int64]]()
+        return size_of[Int64]()
     if dtype == DType.uint64:
-        return size_of[Scalar[DType.uint64]]()
+        return size_of[UInt64]()
     return -1
 
 def checked_numel(shape: List[Int]) -> Optional[Int]:

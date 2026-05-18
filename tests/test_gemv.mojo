@@ -58,13 +58,13 @@ def check_bf16(got: Float32, expected: Float32, msg: String):
 
 
 def test_gemv_softcap():
-    var x = alloc[Scalar[DType.bfloat16]](W)
-    var weight = alloc[Scalar[DType.bfloat16]](ROWS * W)
-    var output = alloc[Scalar[DType.bfloat16]](ROWS)
+    var x = alloc[BFloat16](W)
+    var weight = alloc[BFloat16](ROWS * W)
+    var output = alloc[BFloat16](ROWS)
 
     for i in range(W):
-        x[i] = Scalar[DType.bfloat16](Float32(0.0))
-    x[0] = Scalar[DType.bfloat16](Float32(1.0))
+        x[i] = BFloat16(Float32(0.0))
+    x[0] = BFloat16(Float32(1.0))
 
     var raw = InlineArray[Float32, ROWS](uninitialized=True)
     raw[0] = Float32(0.0)
@@ -76,17 +76,17 @@ def test_gemv_softcap():
 
     for row in range(ROWS):
         for col in range(W):
-            weight[row * W + col] = Scalar[DType.bfloat16](Float32(0.0))
-        weight[row * W] = Scalar[DType.bfloat16](raw[row])
+            weight[row * W + col] = BFloat16(Float32(0.0))
+        weight[row * W] = BFloat16(raw[row])
 
     var pools = HeapMoveArray[TestPool](1)
     pools.push(TestPool(3, 0))
     dispatch_gemv_softcap[
         rows=ROWS, cols=W, tp=1, cap=30.0,
     ](
-        Binding[Scalar[DType.bfloat16], 1](x.as_any_origin(), BASES),
-        Binding[Scalar[DType.bfloat16], 1](weight.as_any_origin(), BASES),
-        Binding[Scalar[DType.bfloat16], 1](output.as_any_origin(), BASES),
+        Binding[BFloat16, 1](x.as_any_origin(), BASES),
+        Binding[BFloat16, 1](weight.as_any_origin(), BASES),
+        Binding[BFloat16, 1](output.as_any_origin(), BASES),
         pools,
     )
 

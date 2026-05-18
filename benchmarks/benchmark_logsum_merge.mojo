@@ -22,8 +22,8 @@ comptime ITERS = 100
 comptime MAX_SOURCES = 128
 comptime FORCE_INLINE = 1 << 30
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 @fieldwise_init
@@ -33,7 +33,7 @@ struct NoopKernel(OutputPartitionedKernel):
     var end: Int
 
     def execute(mut self):
-        self.dst[self.start] = Scalar[DType.float32](0)
+        self.dst[self.start] = Float32(0)
 
     @always_inline
     def set_partition(mut self, worker_id: Int, start: Int, end: Int):
@@ -85,14 +85,14 @@ def fill_partials[head_dim: Int, num_q: Int](
     for s in range(num_sources):
         var sp = buf + s * stride
         for i in range(num_q * head_dim):
-            sp[i] = Scalar[DType.float32]((i % 127) - 63) * 0.001
+            sp[i] = Float32((i % 127) - 63) * 0.001
         for h in range(num_q):
-            (sp + m_off + h)[] = Scalar[DType.float32](s % 5) * 0.5 - 1.0
-            (sp + l_off + h)[] = Scalar[DType.float32](1.0)
+            (sp + m_off + h)[] = Float32(s % 5) * 0.5 - 1.0
+            (sp + l_off + h)[] = Float32(1.0)
 
 
 def fill_partials_all[head_dim: Int, num_q: Int, tp: Int](
-    ptrs: Binding[Scalar[DType.float32], tp],
+    ptrs: Binding[Float32, tp],
     stride: Int, num_sources: Int,
 ):
     for r in range(tp):
@@ -121,8 +121,8 @@ def measure_finalize[
     warm_pool(scratch, pools[0])
     for _ in range(WARMUP):
         dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-            Binding[Scalar[DType.bfloat16], tp](output, bases),
-            Binding[Scalar[DType.float32], tp](partials, bases),
+            Binding[BFloat16, tp](output, bases),
+            Binding[Float32, tp](partials, bases),
             source_counts[tp](num_sources), pools,
             inline_max_bytes=0)
         keep(output[0])
@@ -133,8 +133,8 @@ def measure_finalize[
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-                Binding[Scalar[DType.bfloat16], tp](output, bases),
-                Binding[Scalar[DType.float32], tp](partials, bases),
+                Binding[BFloat16, tp](output, bases),
+                Binding[Float32, tp](partials, bases),
                 source_counts[tp](num_sources), pools,
                 inline_max_bytes=0)
             keep(output[0])
@@ -154,8 +154,8 @@ def measure_finalize_inline[
     warm_pool(scratch, pools[0])
     for _ in range(WARMUP):
         dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-            Binding[Scalar[DType.bfloat16], tp](output, bases),
-            Binding[Scalar[DType.float32], tp](partials, bases),
+            Binding[BFloat16, tp](output, bases),
+            Binding[Float32, tp](partials, bases),
             source_counts[tp](num_sources), pools,
             inline_max_bytes=FORCE_INLINE)
         keep(output[0])
@@ -166,8 +166,8 @@ def measure_finalize_inline[
         for _ in range(ITERS):
             var t0 = Int(perf_counter_ns())
             dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-                Binding[Scalar[DType.bfloat16], tp](output, bases),
-                Binding[Scalar[DType.float32], tp](partials, bases),
+                Binding[BFloat16, tp](output, bases),
+                Binding[Float32, tp](partials, bases),
                 source_counts[tp](num_sources), pools,
                 inline_max_bytes=FORCE_INLINE)
             keep(output[0])
@@ -191,7 +191,7 @@ def run_config[
     var scratch = arena_alloc[DType.float32](arenas[0], pools[0].get_capacity())
 
     fill_partials_all[head_dim, num_q, tp](
-        Binding[Scalar[DType.float32], tp](partials, bases),
+        Binding[Float32, tp](partials, bases),
         stride, MAX_SOURCES)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())

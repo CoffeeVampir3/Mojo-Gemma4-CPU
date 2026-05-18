@@ -694,8 +694,8 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 residual_add=True](
                 residual_ptrs, seq_len, self.main_pools, main_ptrs)
 
-    def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
-        return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
+    def token_buffer(mut self) -> UnsafePointer[Int32, MutAnyOrigin]:
+        return UnsafePointer[Int32, MutAnyOrigin](
             unsafe_from_address=self.topos[0].arena.scratch_base())
 
     @staticmethod
@@ -894,11 +894,11 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         candidates_lease^.release()
 
         var expert_qi_lease = self.scratch.borrow[
-            Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
+            Int8, C.TOP_K * C.MOE_INTERMEDIATE]()
         var expert_blk_scale_lease = self.scratch.borrow[
             Float32, C.TOP_K * MOE_DOWN_NUM_BLK]()
         var expert_out_lease = self.scratch.borrow[
-            Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
+            BFloat16, C.TOP_K * C.HIDDEN]()
         var local_count_lease = self.scratch.borrow[Int32, 1]()
 
         @parameter
@@ -1074,7 +1074,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var routes_lease = self.scratch.borrow[
             SparseRoute, PREFILL_CHUNK_SIZE * C.TOP_K]()
         var expert_qi_lease = self.scratch.borrow[
-            Scalar[DType.int8],
+            Int8,
             PREFILL_CHUNK_SIZE * C.TOP_K * C.MOE_INTERMEDIATE]()
         var expert_blk_scale_lease = self.scratch.borrow[
             Float32, PREFILL_CHUNK_SIZE * C.TOP_K * MOE_DOWN_NUM_BLK]()
@@ -1317,8 +1317,8 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # =============================================================
 
             comptime QKV_LOCAL = S.QKV_LOCAL
-            var qkv_lease = self.scratch.borrow[Scalar[DType.bfloat16], PREFILL_CHUNK_SIZE * QKV_LOCAL]()
-            var attn_i8_lease = self.scratch.borrow[Scalar[DType.int8], PREFILL_CHUNK_SIZE * C.HIDDEN]()
+            var qkv_lease = self.scratch.borrow[BFloat16, PREFILL_CHUNK_SIZE * QKV_LOCAL]()
+            var attn_i8_lease = self.scratch.borrow[Int8, PREFILL_CHUNK_SIZE * C.HIDDEN]()
             var attn_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
             var attn_quant_jobs = InlineArray[
@@ -1373,7 +1373,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 for r in range(Self.tp):
                     var sb = topos[r].arena.scratch_base()
                     var qkv_ptr = qkv_lease.as_ptr[
-                        Scalar[DType.bfloat16]](sb, row * QKV_LOCAL)
+                        BFloat16](sb, row * QKV_LOCAL)
                     q_ss += rms_reduce_bf16[Q_LOCAL](qkv_ptr)
                     k_ss += rms_reduce_bf16[KV_LOCAL](qkv_ptr + Q_LOCAL)
                 inv_rms_q_arr[row] = inv_rms_from_sum_sq(q_ss, C.Q_DIM, EPS)
@@ -1385,7 +1385,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 var lb = topo.layers.base(topo.arena.base, layer_idx)
                 var layer = topo.layers.proto
                 var sb = topo.arena.scratch_base()
-                var qkv_ptr = qkv_lease.as_ptr[Scalar[DType.bfloat16]](sb)
+                var qkv_ptr = qkv_lease.as_ptr[BFloat16](sb)
                 return kv_write_dispatch[
                     C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE,
                     C.MAX_SEQ_LEN, KV_PER_RANK, QKV_LOCAL,
@@ -1399,10 +1399,10 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     start_pos, seq_len, pool)
             sample.add(self.profile.phase("kv_write"), timed_tp_parallel[Self.tp,do_kv_write](topos, self.main_pools))
 
-            var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], PREFILL_CHUNK_SIZE * Q_LOCAL]()
+            var attn_qi_lease = self.scratch.borrow[Int8, PREFILL_CHUNK_SIZE * Q_LOCAL]()
             var attn_head_sc_lease = self.scratch.borrow[Float32, PREFILL_CHUNK_SIZE * HEADS_PER_RANK]()
             var q_i8_lease = self.scratch.borrow[
-                Scalar[DType.int8], PREFILL_CHUNK_SIZE * KV_PER_RANK * HPG * C.HEAD_DIM]()
+                Int8, PREFILL_CHUNK_SIZE * KV_PER_RANK * HPG * C.HEAD_DIM]()
             var qi_biases_lease = self.scratch.borrow[
                 Float32, PREFILL_CHUNK_SIZE * KV_PER_RANK * HPG]()
             var q_scales_lease = self.scratch.borrow[
@@ -1417,7 +1417,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 var lb = topo_r.layers.base(topo_r.arena.base, layer_idx)
                 var layer = topo_r.layers.proto
                 var sb = topo_r.arena.scratch_base()
-                var qkv_ptr = qkv_lease.as_ptr[Scalar[DType.bfloat16]](sb)
+                var qkv_ptr = qkv_lease.as_ptr[BFloat16](sb)
                 q_prep_batch_dispatch[
                     C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE,
                     HPG, KV_PER_RANK, QKV_LOCAL, ROPE_HALF](
@@ -1426,7 +1426,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     topo_r.rope.cos.bound_row(topo_r.arena.base, 0).as_ptr[DType.float32](),
                     topo_r.rope.sin.bound_row(topo_r.arena.base, 0).as_ptr[DType.float32](),
                     UnsafePointer(to=inv_rms_q_arr[0]).bitcast[Float32]().as_any_origin(),
-                    q_i8_lease.as_ptr[Scalar[DType.int8]](sb),
+                    q_i8_lease.as_ptr[Int8](sb),
                     qi_biases_lease.as_ptr[Float32](sb),
                     q_scales_lease.as_ptr[Float32](sb),
                     start_pos, seq_len)
@@ -1483,12 +1483,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     return prefill_attn_dispatch[
                         C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
                         C.NUM_HEADS, Q_LOCAL, HEADS_PER_RANK](
-                        q_i8_lease.as_ptr[Scalar[DType.int8]](sb),
+                        q_i8_lease.as_ptr[Int8](sb),
                         qi_biases_lease.as_ptr[Float32](sb),
                         q_scales_lease.as_ptr[Float32](sb),
                         topo.arena.base + topo.kv_cache_off + layer_idx * topo.kv_cache_stride,
                         start_pos, seq_len,
-                        attn_qi_lease.as_ptr[Scalar[DType.int8]](sb),
+                        attn_qi_lease.as_ptr[Int8](sb),
                         attn_head_sc_lease.as_ptr[Float32](sb),
                         pool)
                 sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_prefill_attn](topos, self.main_pools))
@@ -1531,9 +1531,9 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # leases used by the MoE dispatch sit at the bottom; transient
             # scratch (moe_work, only needed during the dual-norm dispatch) is
             # borrowed last so it can be released first.
-            var moe_i8_lease = self.scratch.borrow[Scalar[DType.int8], PREFILL_CHUNK_SIZE * C.HIDDEN]()
+            var moe_i8_lease = self.scratch.borrow[Int8, PREFILL_CHUNK_SIZE * C.HIDDEN]()
             var moe_scale_lease = self.scratch.borrow[Float32, PREFILL_CHUNK_SIZE]()
-            var normed_bf16_lease = self.scratch.borrow[Scalar[DType.bfloat16], PREFILL_CHUNK_SIZE * C.HIDDEN]()
+            var normed_bf16_lease = self.scratch.borrow[BFloat16, PREFILL_CHUNK_SIZE * C.HIDDEN]()
             var moe_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
             var dual_norm_jobs = InlineArray[
@@ -1587,12 +1587,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             return Int32(-1)
 
         # --- Final norm + row-sharded LM head ---
-        var lm_act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
+        var lm_act_i8_lease = self.scratch.borrow[Int8, C.HIDDEN]()
         var lm_act_blk_scale_lease = self.scratch.borrow[Float32, VOCAB_NUM_BLOCKS]()
         var lm_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
         var t_final0 = Int(perf_counter_ns())
         comptime last_row_shape = Shape[C.MAX_SEQ_LEN, C.HIDDEN]
-        var last_row_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+        var last_row_ptr = UnsafePointer[BFloat16, MutAnyOrigin](
             unsafe_from_address=host.arena.base + host.activations.x_main.offset
                 + (seq_len - 1) * C.HIDDEN * 2)
         var last_row_view = DynamicView[BF16, last_row_shape](last_row_ptr, 1)
@@ -1615,7 +1615,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var lm_scale_ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
             var sb_r = topos[r].arena.scratch_base()
-            lm_act_ptrs[r] = Int(lm_act_i8_lease.as_ptr[Scalar[DType.int8]](sb_r))
+            lm_act_ptrs[r] = Int(lm_act_i8_lease.as_ptr[Int8](sb_r))
             lm_scale_ptrs[r] = Int(lm_act_blk_scale_lease.as_ptr[Float32](sb_r))
 
         var t_lm_bcast0 = Int(perf_counter_ns())
@@ -1625,7 +1625,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             lm_scale_ptrs[0], lm_scale_ptrs, 1, self.main_pools)
         sample.add(self.profile.phase("lm_act_bcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_lm_bcast0))
 
-        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], VOCAB_LOCAL]()
+        var logit_lease = self.scratch.borrow[BFloat16, VOCAB_LOCAL]()
 
         @parameter
         def do_lm_head[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
@@ -1645,7 +1645,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var logit_ptrs = InlineArray[BF16Ptr, Self.tp](uninitialized=True)
         for r in range(Self.tp):
             var sb_r = topos[r].arena.scratch_base()
-            logit_ptrs[r] = logit_lease.as_ptr[Scalar[DType.bfloat16]](sb_r)
+            logit_ptrs[r] = logit_lease.as_ptr[BFloat16](sb_r)
         var best_idx = sample_sharded_topk_minp_temperature[
             Self.tp, VOCAB_LOCAL, MAX_SAMPLING_TOP_K](
             logit_ptrs,

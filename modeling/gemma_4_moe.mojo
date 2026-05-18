@@ -272,17 +272,17 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
 
     var q_band: ScratchPhase["gemv_qkv", "o_proj"]
     var q: ScratchBuffer[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.q_rows,
+        BFloat16, C.MAX_SEQ_LEN * Self.q_rows,
     ]
 
     var kv_band: ScratchPhase["gemv_qkv", "rope_cache_write"]
     var kv: ScratchBuffer[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.kv_rows * 2,
+        BFloat16, C.MAX_SEQ_LEN * Self.kv_rows * 2,
     ]
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Scalar[DType.float32], Self.max_worker_count * Self.FlashK.PARTIAL_STRIDE,
+        Float32, Self.max_worker_count * Self.FlashK.PARTIAL_STRIDE,
     ]
 
 
@@ -309,22 +309,22 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
 
     var q_band: ScratchPhase["gemv_q", "flash"]
     var q: ScratchBuffer[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.q_rows,
+        BFloat16, C.MAX_SEQ_LEN * Self.q_rows,
     ]
 
     var kv_band: ScratchPhase["gemv_kv", "rope_cache_write"]
     var kv: ScratchBuffer[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.k_rows * 2,
+        BFloat16, C.MAX_SEQ_LEN * Self.k_rows * 2,
     ]
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Scalar[DType.float32], Self.max_worker_count * Self.FullK.PARTIAL_STRIDE,
+        Float32, Self.max_worker_count * Self.FullK.PARTIAL_STRIDE,
     ]
 
     var q_local_band: ScratchPhase["merge_partials", "o_proj"]
     var q_local: ScratchBuffer[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Self.local_q_rows,
+        BFloat16, C.MAX_SEQ_LEN * Self.local_q_rows,
     ]
 
 
@@ -346,13 +346,13 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
 
     var ffn_gate_band: ScratchPhase["gemv_gate", "gemv_dense"]
     var ffn_gate: ScratchBuffer[
-        Scalar[DType.bfloat16],
+        BFloat16,
         C.MAX_SEQ_LEN * Self.intermediate_per_rank,
     ]
 
     var ffn_up_band: ScratchPhase["gemv_up", "gelu_gate_up"]
     var ffn_up: ScratchBuffer[
-        Scalar[DType.bfloat16],
+        BFloat16,
         C.MAX_SEQ_LEN * Self.intermediate_per_rank,
     ]
 
@@ -360,7 +360,7 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
         "router_sharded", "router_sharded",
     ]
     var moe_router_scaled: ScratchBuffer[
-        Scalar[DType.float32], Self.max_worker_count * C.HIDDEN,
+        Float32, Self.max_worker_count * C.HIDDEN,
     ]
 
     var router_cands: ScratchPhase["router_sharded", "merge_cands"]
@@ -368,28 +368,28 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
 
     var router_products: ScratchPhase["merge_cands", "build_schedules"]
     var moe_route_idx: ScratchBuffer[
-        Scalar[DType.int32], C.MAX_SEQ_LEN * C.TOP_K,
+        Int32, C.MAX_SEQ_LEN * C.TOP_K,
     ]
     var moe_route_w: ScratchBuffer[
-        Scalar[DType.float32], C.MAX_SEQ_LEN * C.TOP_K,
+        Float32, C.MAX_SEQ_LEN * C.TOP_K,
     ]
 
     var expert_input: ScratchPhase["moe_rms_norm", "phase1_gate_up"]
     var moe_x_normed: ScratchBuffer[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN,
+        BFloat16, C.MAX_SEQ_LEN * C.HIDDEN,
     ]
 
     var schedule_products: ScratchPhase[
         "build_schedules", "phase2_down",
     ]
     var moe_expert_offset: ScratchBuffer[
-        Scalar[DType.int32], Self.experts_per_rank + 1,
+        Int32, Self.experts_per_rank + 1,
     ]
     var moe_routes: ScratchBuffer[SparseRoute, C.MAX_SEQ_LEN * C.TOP_K]
 
     var hidden_bucket: ScratchPhase["phase1_gate_up", "phase2_down"]
     var moe_hidden_bucket: ScratchBuffer[
-        Scalar[DType.bfloat16],
+        BFloat16,
         C.MAX_SEQ_LEN * C.TOP_K * C.MOE_INTERMEDIATE,
     ]
 
@@ -397,7 +397,7 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
         "phase1_gate_up", "phase1_gate_up",
     ]
     var moe_gate_scratch: ScratchBuffer[
-        Scalar[DType.float32],
+        Float32,
         Self.max_worker_count * Phase1GateUpKernel[
             C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
             Self.experts_per_rank,
@@ -406,12 +406,12 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
 
     var phase2_accum: ScratchPhase["phase2_down", "phase2_down"]
     var moe_accum: ScratchBuffer[
-        Scalar[DType.float32], C.MAX_SEQ_LEN * C.HIDDEN,
+        Float32, C.MAX_SEQ_LEN * C.HIDDEN,
     ]
 
     var dense_band: ScratchPhase["gemv_dense", "post_norm_3"]
     var ffn_dense_out: ScratchBuffer[
-        Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN,
+        BFloat16, C.MAX_SEQ_LEN * C.HIDDEN,
     ]
 
 
@@ -426,7 +426,7 @@ struct Gemma4HeadScratch[degree: Int](
 
     var logits_band: ScratchPhase["gemv_logits", "returned_to_caller"]
     var logits: ScratchBuffer[
-        Scalar[DType.bfloat16], Self.vocab_per_rank,
+        BFloat16, Self.vocab_per_rank,
     ]
 
 
@@ -751,7 +751,7 @@ def dispatch_moe[
     comptime experts_per_rank = C.NUM_EXPERTS // degree
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
-    comptime rms_eps = Scalar[DType.float32](C.RMS_NORM_EPS)
+    comptime rms_eps = Float32(C.RMS_NORM_EPS)
     comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
 
     var per_expert_scale_ptr = body.router_pes.at(ctx.layer_base)
@@ -924,7 +924,7 @@ struct Gemma4[
             var arena_base = self.arena_bases[rank]
             for i in range(C.NUM_LAYERS):
                 var entry = LAYER_SCHEDULE[i]
-                var p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+                var p: UnsafePointer[BFloat16, MutAnyOrigin]
                 if entry.kind == LayerKind.FULL:
                     var lb = layout.full.base(arena_base, entry.local_idx)
                     p = layout.full.proto.body.router_scale.at(lb)

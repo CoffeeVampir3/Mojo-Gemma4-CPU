@@ -36,10 +36,10 @@ struct FullAttentionKernel[
 
         var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
         var q_ptrs = InlineArray[BF16Ptr, Self.num_q](uninitialized=True)
-        var m = InlineArray[Scalar[DType.float32], Self.num_q](
-            fill=Scalar[DType.float32](-1e30))
-        var l = InlineArray[Scalar[DType.float32], Self.num_q](
-            fill=Scalar[DType.float32](0))
+        var m = InlineArray[Float32, Self.num_q](
+            fill=Float32(-1e30))
+        var l = InlineArray[Float32, Self.num_q](
+            fill=Float32(0))
 
         comptime for h in range(Self.num_q):
             acc_ptrs[h] = my_partial + h * Self.head_dim
@@ -93,10 +93,10 @@ def dispatch_full_attention[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, tp: Int, max_worker_count: Int = 128,
 ](
-    q: Binding[Scalar[DType.bfloat16], tp],
-    k_base: Binding[Scalar[DType.bfloat16], tp],
-    v_base: Binding[Scalar[DType.bfloat16], tp],
-    worker_partials: Binding[Scalar[DType.float32], tp],
+    q: Binding[BFloat16, tp],
+    k_base: Binding[BFloat16, tp],
+    v_base: Binding[BFloat16, tp],
+    worker_partials: Binding[Float32, tp],
     valid_len: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],
 ) -> InlineArray[Int, tp]:

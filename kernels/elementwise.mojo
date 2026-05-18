@@ -50,9 +50,9 @@ def dispatch_gelu_gate_up[
     P: BurstThreadPool, //,
     intermediate: Int, tp: Int, max_worker_count: Int = 128,
 ](
-    gate: Binding[Scalar[DType.bfloat16], tp],
-    up: Binding[Scalar[DType.bfloat16], tp],
-    dst: Binding[Scalar[DType.bfloat16], tp],
+    gate: Binding[BFloat16, tp],
+    up: Binding[BFloat16, tp],
+    dst: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
@@ -80,7 +80,7 @@ def dispatch_gelu_gate_up[
 
 @always_inline
 def scalar_mul_row[hidden: Int](
-    src: BF16Ptr, dst: BF16Ptr, scalar: Scalar[DType.float32],
+    src: BF16Ptr, dst: BF16Ptr, scalar: Float32,
 ):
     def step[width: Int](idx: Int) {read}:
         var x = (src + idx).load[width=width]().cast[DType.float32]()
@@ -94,7 +94,7 @@ def scalar_mul_row[hidden: Int](
 struct ScalarMulTokenKernel[hidden: Int](OutputPartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
-    var scalar: Scalar[DType.float32]
+    var scalar: Float32
     var start: Int
     var end: Int
 
@@ -117,9 +117,9 @@ def dispatch_scalar_mul[
     P: BurstThreadPool, //,
     hidden: Int, tp: Int, max_worker_count: Int = 128,
 ](
-    src: Binding[Scalar[DType.bfloat16], tp],
-    dst: Binding[Scalar[DType.bfloat16], tp],
-    scalar: Scalar[DType.float32],
+    src: Binding[BFloat16, tp],
+    dst: Binding[BFloat16, tp],
+    scalar: Float32,
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):

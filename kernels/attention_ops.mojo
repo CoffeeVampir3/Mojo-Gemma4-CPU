@@ -5,7 +5,7 @@ from .helpers import BF16Ptr, F32Ptr, W
 
 
 @always_inline
-def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Scalar[DType.float32]:
+def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Float32:
     comptime PU = pick_port_unroll[W, head_dim]()
     comptime STRIDE = PU * W
     var accs = InlineArray[SIMD[DType.float32, W], PU](fill=SIMD[DType.float32, W](0))
@@ -19,7 +19,7 @@ def score_position[head_dim: Int](q: BF16Ptr, k_row: BF16Ptr) -> Scalar[DType.fl
 
 @always_inline
 def accumulate_v[head_dim: Int](
-    v_row: BF16Ptr, weight: Scalar[DType.float32], acc: F32Ptr,
+    v_row: BF16Ptr, weight: Float32, acc: F32Ptr,
 ):
     comptime PU = pick_port_unroll[W, head_dim]()
     comptime STRIDE = PU * W
@@ -32,7 +32,7 @@ def accumulate_v[head_dim: Int](
 
 
 @always_inline
-def scale_acc[head_dim: Int](acc: F32Ptr, factor: Scalar[DType.float32]):
+def scale_acc[head_dim: Int](acc: F32Ptr, factor: Float32):
     comptime PU = pick_port_unroll[W, head_dim]()
     comptime STRIDE = PU * W
     var f = SIMD[DType.float32, W](factor)

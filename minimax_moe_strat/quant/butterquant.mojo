@@ -33,8 +33,8 @@ from quant.source_format import Converter
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
 comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
-comptime PtrBF16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
+comptime PtrBF16 = UnsafePointer[BFloat16, MutAnyOrigin]
+comptime PtrI8 = UnsafePointer[Int8, MutAnyOrigin]
 comptime WIDTH = simd_width_of[DType.float32]()
 comptime DEFAULT_PANEL_ROWS = 2048
 comptime DEFAULT_COPY_CHUNK_BYTES = 16 * 1024 * 1024
@@ -180,12 +180,12 @@ def f32_addr(mut buf: List[Float32]) -> PtrF32:
 
 
 @always_inline
-def i8_addr(mut buf: List[Scalar[DType.int8]]) -> PtrI8:
+def i8_addr(mut buf: List[Int8]) -> PtrI8:
     return PtrI8(unsafe_from_address=Int(buf.unsafe_ptr()))
 
 
 @always_inline
-def bf16_addr(mut buf: List[Scalar[DType.bfloat16]]) -> PtrBF16:
+def bf16_addr(mut buf: List[BFloat16]) -> PtrBF16:
     return PtrBF16(unsafe_from_address=Int(buf.unsafe_ptr()))
 
 
@@ -314,7 +314,7 @@ def rotate_and_quant[per_block: Bool](
 
 
 def bf16_to_f32(src: PtrU8, dst: PtrF32, count: Int):
-    var bp = src.bitcast[Scalar[DType.bfloat16]]()
+    var bp = src.bitcast[BFloat16]()
     var k = 0
     while k + WIDTH <= count:
         (dst + k).store((bp + k).load[width=WIDTH]().cast[DType.float32]())
@@ -695,8 +695,8 @@ struct Executor(TaskVisitor):
             length=self.panel_rows * cols, fill=Scalar[T.SOURCE_DTYPE](0))
         var work_buf = List[Float32](
             length=self.panel_rows * cols, fill=Float32(0))
-        var qi_buf = List[Scalar[DType.int8]](
-            length=self.panel_rows * cols, fill=Scalar[DType.int8](0))
+        var qi_buf = List[Int8](
+            length=self.panel_rows * cols, fill=Int8(0))
         var scales_buf = List[Float32](
             length=self.panel_rows * num_blocks, fill=Float32(0))
 
@@ -821,10 +821,10 @@ struct Executor(TaskVisitor):
 
         var src_buf = List[Float32](length=total, fill=Float32(0))
         var gauge_buf = List[Float32](length=cols, fill=Float32(0))
-        var centered_buf = List[Scalar[DType.bfloat16]](
-            length=total, fill=Scalar[DType.bfloat16](0))
-        var gauge_bf16_buf = List[Scalar[DType.bfloat16]](
-            length=cols, fill=Scalar[DType.bfloat16](0))
+        var centered_buf = List[BFloat16](
+            length=total, fill=BFloat16(0))
+        var gauge_bf16_buf = List[BFloat16](
+            length=cols, fill=BFloat16(0))
 
         var src = f32_addr(src_buf)
         var gauge = f32_addr(gauge_buf)
