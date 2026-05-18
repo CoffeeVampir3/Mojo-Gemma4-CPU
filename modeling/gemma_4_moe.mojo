@@ -677,6 +677,7 @@ def dispatch_full_attention_qkv[
     ](
         xs, attn.k_proj.binding(attn_ctx), k_outs, pools)
 
+    # Full attention has no v_proj; v reads from k's pre-norm buffer (chain runs V→Q→K).
     dispatch_rms_norm_qkv_heads[
         head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
         num_q=num_q_heads, num_kv=num_kv_heads, tp=degree,
