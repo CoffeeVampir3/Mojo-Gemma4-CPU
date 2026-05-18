@@ -1,18 +1,37 @@
 from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
+from std.sys.info import simd_width_of
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
+
+
+comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+comptime F32Ptr  = UnsafePointer[Scalar[DType.float32],  MutAnyOrigin]
+comptime I32Ptr  = UnsafePointer[Scalar[DType.int32],    MutAnyOrigin]
+comptime W  = simd_width_of[DType.float32]()
+comptime BW = simd_width_of[DType.bfloat16]()
 
 
 comptime DISPATCH_BW_PRODUCT = 2280
 
 
 trait OutputPartitionedKernel(BurstKernel):
-    def over_range(self, start: Int, end: Int) -> Self: ...
+    """A kernel that runs over a (worker_id, start, end) slice.
+
+    `set_partition` is called by `tile_dispatch` once per worker, on a
+    clone of the proto, to install that worker's indices. Kernels that
+    only need (start, end) can ignore `worker_id`. Kernels that maintain
+    per-worker scratch (e.g. flash-attention partials) consume it.
+    """
+
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int): ...
 
 
 @fieldwise_init
-struct Chain[A: OutputPartitionedKernel, B: OutputPartitionedKernel](OutputPartitionedKernel):
+struct Chain[A: OutputPartitionedKernel, B: OutputPartitionedKernel](
+    OutputPartitionedKernel
+):
     var a: Self.A
     var b: Self.B
 
@@ -20,8 +39,10 @@ struct Chain[A: OutputPartitionedKernel, B: OutputPartitionedKernel](OutputParti
         self.a.execute()
         self.b.execute()
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.a.over_range(start, end), self.b.over_range(start, end))
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.a.set_partition(worker_id, start, end)
+        self.b.set_partition(worker_id, start, end)
 
 
 struct RankBuffers[dtype: DType, tp: Int, origin: Origin]:
@@ -155,5 +176,7 @@ def tile_dispatch[
     workers = min(workers, total)
     for w in range(workers):
         var wr = worker_range(total, workers, w, base)
-        buf.slot()[] = proto.over_range(wr[0], wr[1])
+        var item = proto
+        item.set_partition(w, wr[0], wr[1])
+        buf.slot()[] = item
     buf.dispatch(pool)

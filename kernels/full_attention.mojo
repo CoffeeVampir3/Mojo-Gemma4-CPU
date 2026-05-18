@@ -1,41 +1,36 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from simd_math import fast_exp_softmax_biased
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer, recommended_workers,
-    worker_range, join_all, Binding,
+    BF16Ptr, F32Ptr, W,
+    OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
+    recommended_workers, join_all, Binding,
 )
 from .attention_ops import score_position, accumulate_v, scale_acc
 
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
 comptime TILE = W
-
-comptime PARTIAL_STRIDE[num_q: Int, head_dim: Int]: Int = (
-    (num_q * head_dim + num_q + num_q) * 4 + 63) // 64 * 16
 
 
 @fieldwise_init
 struct FullAttentionKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int, kv_stride: Int,
 ](OutputPartitionedKernel):
+    comptime PARTIAL_STRIDE = (
+        (Self.num_q * Self.head_dim + 2 * Self.num_q) * 4 + 63) // 64 * 16
+
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
     var partials: F32Ptr
-    var partial_stride: Int
     var worker_id: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        var my_partial = self.partials + self.worker_id * self.partial_stride
+        var my_partial = self.partials + self.worker_id * Self.PARTIAL_STRIDE
         comptime m_off = Self.num_q * Self.head_dim
         comptime l_off = m_off + Self.num_q
 
@@ -86,9 +81,11 @@ struct FullAttentionKernel[
             (my_partial + m_off + h)[] = m[h]
             (my_partial + l_off + h)[] = l[h]
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.q, self.k_base, self.v_base, self.partials,
-            self.partial_stride, self.worker_id, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.worker_id = worker_id
+        self.start = start
+        self.end = end
 
 
 def dispatch_full_attention[
@@ -103,13 +100,10 @@ def dispatch_full_attention[
     valid_len: InlineArray[Int, tp],
     mut pools: HeapMoveArray[P],
 ) -> InlineArray[Int, tp]:
-    comptime partial_stride = PARTIAL_STRIDE[num_q, head_dim]
+    comptime K = FullAttentionKernel[head_dim, num_q, gqa_ratio, kv_stride]
     var result = InlineArray[Int, tp](fill=0)
 
-    var buf = DispatchBuffer[
-        FullAttentionKernel[head_dim, num_q, gqa_ratio, kv_stride],
-        max_worker_count,
-    ]()
+    var buf = DispatchBuffer[K, max_worker_count]()
     for r in range(tp):
         if valid_len[r] <= 0:
             continue
@@ -117,13 +111,9 @@ def dispatch_full_attention[
             valid_len[r] * kv_stride * 2,
             min(max_worker_count, pools[r].get_capacity()),
         )
-        for w in range(nw):
-            var wr = worker_range(valid_len[r], nw, w)
-            buf.slot()[] = FullAttentionKernel[
-                head_dim, num_q, gqa_ratio, kv_stride](
-                q[r], k_base[r], v_base[r], worker_partials[r],
-                partial_stride, w, wr[0], wr[1])
-        buf.dispatch(pools[r])
+        tile_dispatch(buf,
+            K(q[r], k_base[r], v_base[r], worker_partials[r], 0, 0, 0),
+            pools[r], valid_len[r], num_workers=nw)
         result[r] = nw
     join_all[tp](pools)
     return result

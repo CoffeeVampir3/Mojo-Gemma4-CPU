@@ -68,8 +68,10 @@ struct ReadSweepKernel(OutputPartitionedKernel):
             pos += W
         keep(acc.reduce_add())
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.src, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 @fieldwise_init
@@ -86,8 +88,10 @@ struct WriteSweepKernel(OutputPartitionedKernel):
             (self.dst + pos).store(val)
             pos += W
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.dst, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 @fieldwise_init
@@ -104,8 +108,10 @@ struct CopySweepKernel(OutputPartitionedKernel):
             (self.dst + pos).store((self.src + pos).load[width=W]())
             pos += W
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.dst, self.src, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 @fieldwise_init

@@ -8,7 +8,7 @@ from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.logsum_merge import dispatch_merge_flash_partials
+from kernels.logsum_merge import dispatch_merge_flash_partials, FinalizeKernel
 from kernels.helpers import (
     OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
     Binding, ArenaBases,
@@ -25,9 +25,6 @@ comptime FORCE_INLINE = 1 << 30
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
 
-comptime PARTIAL_STRIDE[num_q: Int, head_dim: Int]: Int = (
-    (num_q * head_dim + num_q + num_q) * 4 + 63) // 64 * 16
-
 
 @fieldwise_init
 struct NoopKernel(OutputPartitionedKernel):
@@ -38,8 +35,10 @@ struct NoopKernel(OutputPartitionedKernel):
     def execute(mut self):
         self.dst[self.start] = Scalar[DType.float32](0)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.dst, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 def warm_pool[P: BurstThreadPool](scratch: F32Ptr, mut pool: P):
@@ -116,7 +115,7 @@ def fmt_ns(ns: Int) -> String:
 def measure_finalize[
     P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
 ](
-    output: BF16Ptr, partials: F32Ptr, stride: Int, scratch: F32Ptr,
+    output: BF16Ptr, partials: F32Ptr, scratch: F32Ptr,
     num_sources: Int, mut pools: HeapMoveArray[P], bases: ArenaBases[tp],
 ) -> Int:
     warm_pool(scratch, pools[0])
@@ -124,7 +123,7 @@ def measure_finalize[
         dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
             Binding[Scalar[DType.bfloat16], tp](output, bases),
             Binding[Scalar[DType.float32], tp](partials, bases),
-            stride, source_counts[tp](num_sources), pools,
+            source_counts[tp](num_sources), pools,
             inline_max_bytes=0)
         keep(output[0])
 
@@ -136,7 +135,7 @@ def measure_finalize[
             dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
                 Binding[Scalar[DType.bfloat16], tp](output, bases),
                 Binding[Scalar[DType.float32], tp](partials, bases),
-                stride, source_counts[tp](num_sources), pools,
+                source_counts[tp](num_sources), pools,
                 inline_max_bytes=0)
             keep(output[0])
             elapsed += Int(perf_counter_ns()) - t0
@@ -149,7 +148,7 @@ def measure_finalize[
 def measure_finalize_inline[
     P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
 ](
-    output: BF16Ptr, partials: F32Ptr, stride: Int, scratch: F32Ptr,
+    output: BF16Ptr, partials: F32Ptr, scratch: F32Ptr,
     num_sources: Int, mut pools: HeapMoveArray[P], bases: ArenaBases[tp],
 ) -> Int:
     warm_pool(scratch, pools[0])
@@ -157,7 +156,7 @@ def measure_finalize_inline[
         dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
             Binding[Scalar[DType.bfloat16], tp](output, bases),
             Binding[Scalar[DType.float32], tp](partials, bases),
-            stride, source_counts[tp](num_sources), pools,
+            source_counts[tp](num_sources), pools,
             inline_max_bytes=FORCE_INLINE)
         keep(output[0])
 
@@ -169,7 +168,7 @@ def measure_finalize_inline[
             dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
                 Binding[Scalar[DType.bfloat16], tp](output, bases),
                 Binding[Scalar[DType.float32], tp](partials, bases),
-                stride, source_counts[tp](num_sources), pools,
+                source_counts[tp](num_sources), pools,
                 inline_max_bytes=FORCE_INLINE)
             keep(output[0])
             elapsed += Int(perf_counter_ns()) - t0
@@ -185,7 +184,7 @@ def run_config[
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
     mut pools: HeapMoveArray[P],
 ):
-    comptime stride = PARTIAL_STRIDE[num_q, head_dim]
+    comptime stride = FinalizeKernel[head_dim, num_q].PARTIAL_STRIDE
     var bases = arena_bases[tp](arenas)
     var partials = arena_alloc_all[DType.float32, tp](arenas, MAX_SOURCES * stride)
     var output = arena_alloc_all[DType.bfloat16, tp](arenas, num_q * head_dim)
@@ -211,10 +210,10 @@ def run_config[
         var data_bytes = ns * (head_dim + 2) * 4 * num_q
 
         var t_inline = measure_finalize_inline[head_dim, num_q, tp](
-            output, partials, stride, scratch, ns, pools, bases)
+            output, partials, scratch, ns, pools, bases)
 
         var t_dispatched = measure_finalize[head_dim, num_q, tp](
-            output, partials, stride, scratch, ns, pools, bases)
+            output, partials, scratch, ns, pools, bases)
 
         var line = "  " + String(ns)
         if ns < 100:

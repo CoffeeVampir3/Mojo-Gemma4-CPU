@@ -7,7 +7,7 @@ from modeling.model_spec import Encoding
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from .helpers import (
-    OutputPartitionedKernel, RankBuffers, DispatchBuffer,
+    OutputPartitionedKernel, RankBuffers, DispatchBuffer, Binding,
     join_all, tile_dispatch, recommended_workers,
 )
 
@@ -35,8 +35,10 @@ struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](OutputPartitionedKernel
         memcpy(dest=self.dst + self.start, src=self.src + self.start,
                count=self.end - self.start)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.dst, self.src, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 @fieldwise_init
@@ -53,8 +55,10 @@ struct ReduceStoreKernel[
         reduce_store_range[Self.E, Self.tp, Self.src_origin, Self.Accum](
             self.config, self.rank, self.start, self.end)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.config, self.rank, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 @fieldwise_init
@@ -68,8 +72,10 @@ struct GatherKernel[E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: I
         gather_chunks[Self.E, Self.tp, Self.src_origin](
             self.config, self.rank, self.start, self.end)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.config, self.rank, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 @always_inline
@@ -113,16 +119,6 @@ def reduce_store_range[
         srcs, config[].dst[out_rank], start, end)
 
 
-def copy_chunk[E: Encoding, tp: Int, src_origin: ImmutOrigin](
-    config: UnsafePointer[ReduceConfig[E, tp, src_origin], _],
-    dst_rank: Int, src_rank: Int, start: Int, end: Int,
-):
-    if start >= end:
-        return
-    memcpy(dest=config[].dst[dst_rank] + start,
-           src=config[].dst[src_rank] + start, count=end - start)
-
-
 def gather_chunks[E: Encoding, tp: Int, src_origin: ImmutOrigin](
     config: UnsafePointer[ReduceConfig[E, tp, src_origin], _],
     dst_rank: Int, start: Int, end: Int,
@@ -132,24 +128,11 @@ def gather_chunks[E: Encoding, tp: Int, src_origin: ImmutOrigin](
             continue
         var src_start = config[].chunk * src_rank
         var src_count = rank_chunk_count[tp](config[].chunk, config[].rem, src_rank)
-        copy_chunk[E, tp, src_origin](
-            config, dst_rank, src_rank,
-            max(start, src_start), min(end, src_start + src_count))
-
-
-def make_reduce_config[
-    E: Encoding, tp: Int, src_origin: ImmutOrigin, dst_origin: MutOrigin,
-](
-    src: RankBuffers[E.DTYPE, tp, src_origin],
-    dst: RankBuffers[E.DTYPE, tp, dst_origin],
-) -> ReduceConfig[E, tp, src_origin]:
-    var chunk = src.count // tp
-    var dst_ptrs = InlineArray[DstPtr[E.DTYPE], tp](uninitialized=True)
-    for r in range(tp):
-        dst_ptrs[r] = dst.ptrs[r].as_any_origin()
-    return ReduceConfig[E, tp, src_origin](
-        src=src.ptrs, dst=dst_ptrs, chunk=chunk, rem=src.count - chunk * tp,
-    )
+        var lo = max(start, src_start)
+        var hi = min(end, src_start + src_count)
+        if lo < hi:
+            memcpy(dest=config[].dst[dst_rank] + lo,
+                   src=config[].dst[src_rank] + lo, count=hi - lo)
 
 
 def dispatch_allreduce[
@@ -165,7 +148,13 @@ def dispatch_allreduce[
     if src.count <= 0:
         return
 
-    var cfg = make_reduce_config[E, tp, src_origin, dst_origin](src, output)
+    var chunk = src.count // tp
+    var dst_ptrs = InlineArray[DstPtr[E.DTYPE], tp](uninitialized=True)
+    for r in range(tp):
+        dst_ptrs[r] = output.ptrs[r].as_any_origin()
+    var cfg = ReduceConfig[E, tp, src_origin](
+        src=src.ptrs, dst=dst_ptrs, chunk=chunk, rem=src.count - chunk * tp,
+    )
     var config = UnsafePointer(to=cfg).as_immutable()
     comptime cfg_ro = ImmutOrigin(origin_of(cfg))
 
@@ -203,6 +192,30 @@ def dispatch_allreduce[
             GatherKernel[E, tp, src_origin, cfg_ro](config, r, 0, 0),
             pools[r], src.count, num_workers=nw)
     join_all[tp](pools)
+
+
+@always_inline
+def dispatch_allreduce_inplace[
+    P: BurstThreadPool, //,
+    E: Encoding, tp: Int, Accum: DType = DType.float32,
+    max_worker_count: Int = 128,
+](
+    buf: Binding[Scalar[E.DTYPE], tp], count: Int,
+    mut pools: HeapMoveArray[P],
+    inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
+):
+    """In-place allreduce over a per-rank `Binding`. Each rank's buffer
+    acts as both an input source and the output destination — the same
+    pattern called out at 3 sites in modeling/gemma_4_moe.mojo."""
+    comptime immut = ImmutOrigin(MutAnyOrigin)
+    var src = RankBuffers[E.DTYPE, tp, immut](count=count)
+    var dst = RankBuffers[E.DTYPE, tp, MutAnyOrigin](count=count)
+    for r in range(tp):
+        src.ptrs[r] = buf[r].as_immutable()
+        dst.ptrs[r] = buf[r]
+    dispatch_allreduce[E, tp, Accum, max_worker_count=max_worker_count](
+        src, dst, pools, inline_max_bytes=inline_max_bytes)
+
 
 def dispatch_broadcast[
     P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
@@ -245,3 +258,26 @@ def dispatch_broadcast[
     for r in range(tp):
         if r != src_rank:
             pools[r].join()
+
+
+@always_inline
+def dispatch_broadcast_from_ptr[
+    P: BurstThreadPool, src_origin: ImmutOrigin, //,
+    E: Encoding, tp: Int, max_worker_count: Int = 128,
+](
+    src_ptr: UnsafePointer[Scalar[E.DTYPE], src_origin],
+    dst: Binding[Scalar[E.DTYPE], tp], count: Int,
+    mut pools: HeapMoveArray[P],
+    src_rank: Int = 0,
+    inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
+):
+    """Broadcast from a single source pointer (typically the owner
+    rank's slice of a row-sharded tensor) to every rank's binding —
+    the shape used by the embedding broadcast in `Gemma4.forward`."""
+    var s = RankBuffers[E.DTYPE, tp, src_origin](count=count)
+    var d = RankBuffers[E.DTYPE, tp, MutAnyOrigin](count=count)
+    for r in range(tp):
+        s.ptrs[r] = src_ptr
+        d.ptrs[r] = dst[r]
+    dispatch_broadcast[E, tp, max_worker_count=max_worker_count](
+        s, d, pools, src_rank=src_rank, inline_max_bytes=inline_max_bytes)

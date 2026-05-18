@@ -1,4 +1,3 @@
-from std.memory import UnsafePointer
 from std.sys import CompilationTarget, llvm_intrinsic
 from std.sys.info import simd_width_of, size_of
 

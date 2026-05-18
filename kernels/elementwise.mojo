@@ -1,6 +1,4 @@
 from std.algorithm import vectorize
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
@@ -8,11 +6,8 @@ from simd_math.ops import gelu_tanh_f32
 from .helpers import (
     OutputPartitionedKernel, DispatchBuffer, Binding,
     tile_dispatch, recommended_workers, join_all,
+    BF16Ptr, W,
 )
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
 
 
 @always_inline
@@ -42,8 +37,10 @@ struct GeluGateUpTokenKernel[intermediate: Int](OutputPartitionedKernel):
             gelu_gate_up_row[Self.intermediate](
                 self.gate + off, self.up + off, self.dst + off)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.gate, self.up, self.dst, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 comptime GELU_GATE_UP_INLINE_TOKENS = 16
@@ -107,8 +104,10 @@ struct ScalarMulTokenKernel[hidden: Int](OutputPartitionedKernel):
             scalar_mul_row[Self.hidden](
                 self.src + off, self.dst + off, self.scalar)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.src, self.dst, self.scalar, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 comptime SCALAR_MUL_INLINE_TOKENS = 16

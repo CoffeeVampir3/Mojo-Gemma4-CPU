@@ -1,13 +1,7 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from simd_math import pick_port_unroll, tree_reduce_accs
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
+from .helpers import BF16Ptr, F32Ptr, W
 
 
 @always_inline

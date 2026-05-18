@@ -9,7 +9,7 @@ from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.full_attention import dispatch_full_attention, PARTIAL_STRIDE
+from kernels.full_attention import dispatch_full_attention, FullAttentionKernel
 from kernels.logsum_merge import dispatch_merge_context_flash_partials
 from kernels.helpers import Binding, ArenaBases
 
@@ -111,7 +111,6 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     print("\n=== Validation (valid_len=64) ===")
     comptime VL = 64
     comptime LOCAL_NUM_Q = GLOBAL_NUM_Q // tp
-    comptime PSTRIDE = PARTIAL_STRIDE[GLOBAL_NUM_Q, HEAD_DIM]
 
     var nw = dispatch_full_attention[
         head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
@@ -126,7 +125,7 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     ](
         Binding[Scalar[DType.bfloat16], tp](output, bases),
         Binding[Scalar[DType.float32], tp](partials, bases),
-        PSTRIDE, nw, pools)
+        nw, pools)
 
     print("  output[0..3]: "
         + String(output[0].cast[DType.float32]()) + " "
@@ -149,7 +148,6 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
     print("\n=== Context sweep (replicated Q + context-local attention + merge) ===")
     print("  valid_len | latency      | KV read  | BW")
     comptime LOCAL_NUM_Q = GLOBAL_NUM_Q // tp
-    comptime PSTRIDE = PARTIAL_STRIDE[GLOBAL_NUM_Q, HEAD_DIM]
 
     var sizes = InlineArray[Int, 8](fill=0)
     sizes[0] = 4; sizes[1] = 32; sizes[2] = 64; sizes[3] = 128
@@ -175,7 +173,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
             ](
                 Binding[Scalar[DType.bfloat16], tp](output, bases),
                 Binding[Scalar[DType.float32], tp](partials, bases),
-                PSTRIDE, nw, pools)
+                nw, pools)
             keep(output[0])
 
         var best = Int(1 << 60)
@@ -197,7 +195,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 ](
                     Binding[Scalar[DType.bfloat16], tp](output, bases),
                     Binding[Scalar[DType.float32], tp](partials, bases),
-                    PSTRIDE, nw, pools)
+                    nw, pools)
                 elapsed += Int(perf_counter_ns()) - t0
             keep(output[0])
             var avg = elapsed // ITERS
@@ -218,7 +216,8 @@ def run_all[P: BurstThreadPool, //, tp: Int](
 ):
     var bases = arena_bases[tp](arenas)
     comptime LOCAL_NUM_Q = GLOBAL_NUM_Q // tp
-    comptime PSTRIDE = PARTIAL_STRIDE[GLOBAL_NUM_Q, HEAD_DIM]
+    comptime PSTRIDE = FullAttentionKernel[
+        HEAD_DIM, GLOBAL_NUM_Q, GLOBAL_GQA, KV_STRIDE].PARTIAL_STRIDE
     var q = arena_alloc_all[DType.bfloat16, tp](arenas, GLOBAL_NUM_Q * HEAD_DIM)
     var k_cache = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_SEQ * KV_STRIDE)
     var v_cache = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_SEQ * KV_STRIDE)

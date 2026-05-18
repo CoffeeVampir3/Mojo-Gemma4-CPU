@@ -3,7 +3,7 @@ from std.memory import Span, UnsafePointer, alloc
 from std.os import abort
 from std.sys.info import simd_width_of
 
-from kernels.full_attention import dispatch_full_attention, PARTIAL_STRIDE
+from kernels.full_attention import dispatch_full_attention, FullAttentionKernel
 from kernels.logsum_merge import dispatch_merge_context_flash_partials
 from kernels.helpers import Binding, ArenaBases
 from notstdcollections import HeapMoveArray
@@ -17,7 +17,9 @@ comptime LOCAL_Q = GLOBAL_Q // TP
 comptime NUM_KV = 2
 comptime GLOBAL_GQA = GLOBAL_Q // NUM_KV
 comptime KV_STRIDE = NUM_KV * HEAD_DIM
-comptime PSTRIDE = PARTIAL_STRIDE[GLOBAL_Q, HEAD_DIM]
+comptime PSTRIDE = FullAttentionKernel[
+    HEAD_DIM, GLOBAL_Q, GLOBAL_GQA, KV_STRIDE,
+].PARTIAL_STRIDE
 
 
 @fieldwise_init
@@ -99,7 +101,7 @@ def run_case[
             output.as_any_origin(), rank_bases(LOCAL_Q * HEAD_DIM * 2)),
         Binding[Scalar[DType.float32], TP](
             partials.as_any_origin(), rank_bases(PSTRIDE * 4)),
-        PSTRIDE, nws, pools)
+        nws, pools)
 
     for r in range(TP):
         var out_base = r * LOCAL_Q * HEAD_DIM

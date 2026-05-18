@@ -1,24 +1,14 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from simd_math import fast_exp_softmax_biased
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
-    OutputPartitionedKernel, DispatchBuffer,
-    recommended_workers, worker_range, join_all, Binding,
+    BF16Ptr, F32Ptr, W,
+    OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
+    recommended_workers, join_all, Binding,
 )
 from .attention_ops import score_position, accumulate_v, scale_acc
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
-
-
-comptime FLASH_PARTIAL_STRIDE[num_q: Int, head_dim: Int]: Int = (
-    (num_q * head_dim + num_q + num_q) * 4 + 63) // 64 * 16
 
 
 @fieldwise_init
@@ -26,18 +16,20 @@ struct FlashDecodeKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int,
 ](OutputPartitionedKernel):
+    comptime PARTIAL_STRIDE = (
+        (Self.num_q * Self.head_dim + 2 * Self.num_q) * 4 + 63) // 64 * 16
+
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
     var partials: F32Ptr
-    var partial_stride: Int
     var worker_id: Int
     var start_pos: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        var my_partial = self.partials + self.worker_id * self.partial_stride
+        var my_partial = self.partials + self.worker_id * Self.PARTIAL_STRIDE
         comptime m_off = Self.num_q * Self.head_dim
         comptime l_off = m_off + Self.num_q
         comptime TILE = W
@@ -91,9 +83,11 @@ struct FlashDecodeKernel[
             (my_partial + m_off + h)[] = m[h]
             (my_partial + l_off + h)[] = l[h]
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.q, self.k_base, self.v_base, self.partials,
-            self.partial_stride, self.worker_id, self.start_pos, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.worker_id = worker_id
+        self.start = start
+        self.end = end
 
 
 def dispatch_sliding_attention[
@@ -113,23 +107,18 @@ def dispatch_sliding_attention[
         return result
 
     var start_pos = pos - valid_len + 1
-    comptime stride = FLASH_PARTIAL_STRIDE[num_q, head_dim]
-    var buf = DispatchBuffer[
-        FlashDecodeKernel[head_dim, num_q, gqa_ratio, kv_stride, window],
-        max_worker_count,
-    ]()
+    comptime K = FlashDecodeKernel[
+        head_dim, num_q, gqa_ratio, kv_stride, window]
+    var buf = DispatchBuffer[K, max_worker_count]()
     for r in range(tp):
         var nw = recommended_workers(
             valid_len * kv_stride * 2,
             min(max_worker_count, pools[r].get_capacity()),
         )
-        for w_idx in range(nw):
-            var wr = worker_range(valid_len, nw, w_idx)
-            buf.slot()[] = FlashDecodeKernel[
-                head_dim, num_q, gqa_ratio, kv_stride, window](
-                q[r], k_base[r], v_base[r], partials_buf[r],
-                stride, w_idx, start_pos, wr[0], wr[1])
-        buf.dispatch(pools[r])
+        tile_dispatch(buf,
+            K(q[r], k_base[r], v_base[r], partials_buf[r],
+                0, start_pos, 0, 0),
+            pools[r], valid_len, num_workers=nw)
         result[r] = nw
     join_all[tp](pools)
     return result

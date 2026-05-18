@@ -1,4 +1,4 @@
-from std.memory import UnsafePointer, memcpy
+from std.memory import memcpy
 from std.sys.info import simd_width_of
 
 from simd_math import sincos_simd
@@ -7,12 +7,9 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     OutputPartitionedKernel, DispatchBuffer, Binding,
     tile_dispatch, recommended_workers, join_all,
+    BF16Ptr, F32Ptr, W,
 )
 
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
 
 comptime ROPE_INLINE_TOKENS = 16
 
@@ -117,11 +114,10 @@ struct RopeCacheWriteKernel[
                 var v_dst = self.v_cache + slot * Self.kv_cache_stride
                 memcpy(dest=v_dst, src=v_tok, count=kv_stride)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.q, self.k_src, self.v_src,
-            self.k_cache, self.v_cache,
-            self.cos_table, self.sin_table,
-            self.base_pos, self.rank, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 def dispatch_rope_cache_write[

@@ -9,7 +9,7 @@ from threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.kv_tiled_attention import dispatch_sliding_attention, FLASH_PARTIAL_STRIDE
+from kernels.kv_tiled_attention import dispatch_sliding_attention, FlashDecodeKernel
 from kernels.logsum_merge import dispatch_merge_flash_partials
 from kernels.helpers import Binding, ArenaBases
 
@@ -119,7 +119,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
             dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
                 Binding[Scalar[DType.bfloat16], tp](output, bases),
                 Binding[Scalar[DType.float32], tp](partials, bases),
-                FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pools)
+                nw, pools)
             keep(output[0])
 
         var best = Int(1 << 60)
@@ -139,7 +139,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
                     Binding[Scalar[DType.bfloat16], tp](output, bases),
                     Binding[Scalar[DType.float32], tp](partials, bases),
-                    FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pools)
+                    nw, pools)
                 elapsed += Int(perf_counter_ns()) - t0
             keep(output[0])
             var avg = elapsed // ITERS
@@ -174,7 +174,7 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
         Binding[Scalar[DType.bfloat16], tp](output, bases),
         Binding[Scalar[DType.float32], tp](partials, bases),
-        FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM], nw, pools)
+        nw, pools)
 
     print("  output[0..3]: "
         + String(output[0].cast[DType.float32]()) + " "
@@ -194,7 +194,8 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
-    comptime flash_stride = FLASH_PARTIAL_STRIDE[NUM_Q, HEAD_DIM]
+    comptime flash_stride = FlashDecodeKernel[
+        HEAD_DIM, NUM_Q, GQA_RATIO, KV_STRIDE, WINDOW].PARTIAL_STRIDE
     var bases = arena_bases[tp](arenas)
     var q = arena_alloc_all[DType.bfloat16, tp](arenas, NUM_Q * HEAD_DIM)
     var k_cache = arena_alloc_all[DType.bfloat16, tp](arenas, WINDOW * KV_STRIDE)

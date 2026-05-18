@@ -1,6 +1,4 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from simd_math import pick_port_unroll, tree_reduce_accs
 from simd_math.ops import tanh_f32
@@ -9,12 +7,8 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     Chain, OutputPartitionedKernel, DispatchBuffer,
     tile_dispatch, recommended_workers, join_all,
-    Binding,
+    Binding, BF16Ptr, W,
 )
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
 
 
 @always_inline
@@ -84,8 +78,10 @@ struct GemvKernel[rows: Int, cols: Int](OutputPartitionedKernel):
         gemv_range[Self.rows, Self.cols](
             self.x, self.weight, self.output, self.start, self.end)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.x, self.weight, self.output, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 comptime GEMV_INLINE_ROWS = 4
@@ -131,8 +127,10 @@ struct GemvSoftcapKernel[
         gemv_softcap_range[Self.rows, Self.cols, Self.cap](
             self.x, self.weight, self.output, self.start, self.end)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.x, self.weight, self.output, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 def dispatch_gemv_softcap[
@@ -179,8 +177,10 @@ struct ScaledGemvKernel[rows: Int, cols: Int, numer: Int, denom: Int](OutputPart
         gemv_range[Self.rows, Self.cols](
             self.x, self.weight, self.output, my_start, my_end)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.x, self.weight, self.output, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 def dispatch_gemv_chained_qkv[

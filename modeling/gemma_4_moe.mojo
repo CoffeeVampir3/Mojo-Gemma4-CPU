@@ -8,18 +8,22 @@ from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
-from kernels.helpers import (
-    RankBuffers, Binding, ArenaBases,
+from kernels.helpers import Binding, ArenaBases
+from kernels.reductions import (
+    dispatch_allreduce_inplace, dispatch_broadcast_from_ptr,
 )
-from kernels.reductions import dispatch_broadcast, dispatch_allreduce
 from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
 from kernels.rmsnorm import fused_norm_residual_add
 from kernels.gemv import (
     dispatch_gemv_chained_qkv, dispatch_gemv, dispatch_gemv_softcap,
 )
 from kernels.rope import dispatch_rope_cache_write
-from kernels.kv_tiled_attention import dispatch_sliding_attention, FLASH_PARTIAL_STRIDE
-from kernels.full_attention import dispatch_full_attention, PARTIAL_STRIDE
+from kernels.kv_tiled_attention import (
+    dispatch_sliding_attention, FlashDecodeKernel,
+)
+from kernels.full_attention import (
+    dispatch_full_attention, FullAttentionKernel,
+)
 from kernels.logsum_merge import (
     dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
 )
@@ -29,7 +33,7 @@ from kernels.moe_router import (
 )
 from kernels.moe_experts import (
     dispatch_phase1_gate_up, dispatch_phase2_down,
-    PHASE1_TILE_J, PHASE1_MR,
+    Phase1GateUpKernel,
 )
 from kernels.elementwise import dispatch_gelu_gate_up, dispatch_scalar_mul
 from modeling.temporal_scratch import (
@@ -48,10 +52,10 @@ from modeling.model_spec import (
     align_up,
 )
 from modeling.gemma4_common import (
-    Gemma4BaseConfig, is_full_layer,
+    Gemma4BaseConfig, LAYER_SCHEDULE, LayerKind,
 )
 from modeling.modeling_common import (
-    Repeated, ArenaLayout, BF16Ptr, BF16Bind,
+    Repeated, ArenaLayout, BF16Bind,
 )
 from modeling.slot import (
     Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
@@ -119,12 +123,22 @@ struct Gemma4Shapes[degree: Int]:
 
 
 struct Gemma4StateShapes[degree: Int]:
-    comptime D = DistributionDegree[Self.degree]
-    comptime LocalD = DistributionDegree[1]
-    comptime SlidingKV = TensorColumnSharded[C.SLIDING_WINDOW, C.KV_DIM_SLIDING, Self.D]
-    comptime FullKV = ContextRowSharded[C.MAX_SEQ_LEN, C.KV_DIM_FULL, Self.D]
-    comptime SlidingRope = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_SLIDING, Self.LocalD]
-    comptime FullRope = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_FULL, Self.D]
+    """Distribution choices for per-token state tensors.
+
+    `D` shards a tensor across the `degree` ranks (one slice per rank).
+    `Local` keeps the whole tensor on every rank (replicated). The
+    project's NUMA principle says: data should live closest to its
+    most-frequent reader. The sliding rope table is small and read by
+    every attention worker on every token — replicating it per rank
+    keeps reads NUMA-local. The full rope table is larger and accessed
+    less uniformly, so it's sharded.
+    """
+    comptime D     = DistributionDegree[Self.degree]
+    comptime Local = DistributionDegree[1]
+    comptime SlidingKV   = TensorColumnSharded[C.SLIDING_WINDOW, C.KV_DIM_SLIDING, Self.D]
+    comptime FullKV      = ContextRowSharded[C.MAX_SEQ_LEN, C.KV_DIM_FULL, Self.D]
+    comptime SlidingRope = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_SLIDING, Self.Local]
+    comptime FullRope    = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_FULL, Self.D]
 
 
 struct Gemma4TailShapes[degree: Int]:
@@ -242,9 +256,13 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     comptime q_rows = Self.S.SlidingQ.DATA_N
     comptime kv_rows = Self.S.SlidingKV.DATA_N
     comptime head_dim = C.HEAD_DIM_SLIDING
+    comptime num_kv_heads = Self.kv_rows // Self.head_dim
     comptime num_q_heads = Self.q_rows // Self.head_dim
-    comptime flash_stride = FLASH_PARTIAL_STRIDE[
-        Self.num_q_heads, Self.head_dim,
+    # Per-worker flash partial stride is owned by the FlashDecodeKernel.
+    comptime FlashK = FlashDecodeKernel[
+        Self.head_dim, Self.num_q_heads,
+        Self.num_q_heads // Self.num_kv_heads, Self.kv_rows,
+        C.SLIDING_WINDOW,
     ]
 
     comptime PHASES = ScratchPhaseOrder[
@@ -264,7 +282,7 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Scalar[DType.float32], Self.max_worker_count * Self.flash_stride,
+        Scalar[DType.float32], Self.max_worker_count * Self.FlashK.PARTIAL_STRIDE,
     ]
 
 
@@ -278,8 +296,10 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
     comptime local_q_rows = Self.S.FullO.DATA_M
     comptime head_dim = C.HEAD_DIM_FULL
     comptime num_q_heads = Self.q_rows // Self.head_dim
-    comptime partial_stride = PARTIAL_STRIDE[
-        Self.num_q_heads, Self.head_dim,
+    # Per-worker flash partial stride is owned by the FullAttentionKernel.
+    comptime FullK = FullAttentionKernel[
+        Self.head_dim, Self.num_q_heads,
+        C.NUM_HEADS // C.NUM_KV_HEADS_FULL, Self.k_rows,
     ]
 
     comptime PHASES = ScratchPhaseOrder[
@@ -299,7 +319,7 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Scalar[DType.float32], Self.max_worker_count * Self.partial_stride,
+        Scalar[DType.float32], Self.max_worker_count * Self.FullK.PARTIAL_STRIDE,
     ]
 
     var q_local_band: ScratchPhase["merge_partials", "o_proj"]
@@ -378,7 +398,10 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     ]
     var moe_gate_scratch: ScratchBuffer[
         Scalar[DType.float32],
-        Self.max_worker_count * PHASE1_MR * 2 * PHASE1_TILE_J,
+        Self.max_worker_count * Phase1GateUpKernel[
+            C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
+            Self.experts_per_rank,
+        ].WORKER_SCRATCH_ELEMS,
     ]
 
     var phase2_accum: ScratchPhase["phase2_down", "phase2_down"]
@@ -449,18 +472,15 @@ def build_gemma4_plan[
     var fl_off = sl_off + C.NUM_SLIDING_LAYERS * sl_stride
     var distributed = fl_off + C.NUM_FULL_LAYERS * fl_stride
 
-    var si = 0
-    var fi = 0
     for i in range(C.NUM_LAYERS):
-        var prefix = "model.language_model.layers." + String(i) + "."
-        if is_full_layer(i):
+        var entry = LAYER_SCHEDULE[i]
+        var prefix = "model.language_model.layers." + String(entry.idx) + "."
+        if entry.kind == LayerKind.FULL:
             _ = emit_descs[FullLayerRefs[degree]](
-                prefix, fl_off + fi * fl_stride, descs)
-            fi += 1
+                prefix, fl_off + entry.local_idx * fl_stride, descs)
         else:
             _ = emit_descs[SlidingLayerRefs[degree]](
-                prefix, sl_off + si * sl_stride, descs)
-            si += 1
+                prefix, sl_off + entry.local_idx * sl_stride, descs)
 
     var tail_proto = TailRefs[degree]()
     var tail_bytes = stamp_offsets(tail_proto)
@@ -548,7 +568,6 @@ def dispatch_sliding_attention_qkv[
     comptime hd_eps = head_dim * C.RMS_NORM_EPS
     comptime rope_half = C.ROPE_HALF_SLIDING
     comptime kv_cols = kv_rows
-    comptime flash_stride = FLASH_PARTIAL_STRIDE[num_q_heads, head_dim]
     comptime Island = Gemma4SlidingScratch[degree, max_worker_count]
 
     var attn_ctx = ctx.with_layer(layout.sliding.base(ctx.arena_bases[0], layer_idx))
@@ -606,7 +625,7 @@ def dispatch_sliding_attention_qkv[
         head_dim, num_q_heads, tp=degree,
         max_worker_count=max_worker_count,
     ](
-        q_outs, partials, flash_stride, nws, pools)
+        q_outs, partials, nws, pools)
 
     dispatch_gemv[
         rows=C.HIDDEN, cols=q_rows, tp=degree,
@@ -640,7 +659,6 @@ def dispatch_full_attention_qkv[
     comptime rope_half = C.ROPE_HALF_FULL
     comptime pair_stride = head_dim // 2
     comptime kv_cols = k_rows
-    comptime partial_stride = PARTIAL_STRIDE[num_q_heads, head_dim]
     comptime Island = Gemma4FullScratch[degree, max_worker_count]
 
     var attn_ctx = ctx.with_layer(layout.full.base(ctx.arena_bases[0], layer_idx))
@@ -708,7 +726,7 @@ def dispatch_full_attention_qkv[
         head_dim=head_dim, num_q=num_q_heads,
         local_num_q=local_num_q_heads, tp=degree,
         max_worker_count=max_worker_count,
-    ](q_local_outs, partials, partial_stride, nws, pools)
+    ](q_local_outs, partials, nws, pools)
 
     dispatch_gemv[
         rows=C.HIDDEN, cols=local_q_rows, tp=degree,
@@ -734,7 +752,6 @@ def dispatch_moe[
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
     comptime rms_eps = Scalar[DType.float32](C.RMS_NORM_EPS)
-    comptime immut = ImmutOrigin(MutAnyOrigin)
     comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
 
     var per_expert_scale_ptr = body.router_pes.at(ctx.layer_base)
@@ -788,16 +805,9 @@ def dispatch_moe[
       body.experts_down.binding(ctx),
       moe_accum, moe_out, seq_len, pools)
 
-    var ar_src = RankBuffers[DType.bfloat16, degree, immut](
-        count=seq_len * C.HIDDEN)
-    var ar_dst = RankBuffers[DType.bfloat16, degree, MutAnyOrigin](
-        count=seq_len * C.HIDDEN)
-    for r in range(degree):
-        ar_src.ptrs[r] = moe_out[r].as_immutable()
-        ar_dst.ptrs[r] = moe_out[r]
-    dispatch_allreduce[
+    dispatch_allreduce_inplace[
         BF16, degree, max_worker_count=max_worker_count,
-    ](ar_src, ar_dst, pools)
+    ](moe_out, seq_len * C.HIDDEN, pools)
 
 
 def dispatch_ffn[
@@ -814,7 +824,6 @@ def dispatch_ffn[
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
     comptime intermediate_per_rank = Gemma4Shapes[degree].GateUp.DATA_N
-    comptime immut = ImmutOrigin(MutAnyOrigin)
     comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
 
     var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_base)
@@ -852,16 +861,9 @@ def dispatch_ffn[
         max_worker_count=max_worker_count,
     ](gate, body.down_proj.binding(ctx), dense_out, pools)
 
-    var dense_ar_src = RankBuffers[DType.bfloat16, degree, immut](
-        count=seq_len * C.HIDDEN)
-    var dense_ar_dst = RankBuffers[DType.bfloat16, degree, MutAnyOrigin](
-        count=seq_len * C.HIDDEN)
-    for r in range(degree):
-        dense_ar_src.ptrs[r] = dense_out[r].as_immutable()
-        dense_ar_dst.ptrs[r] = dense_out[r]
-    dispatch_allreduce[
+    dispatch_allreduce_inplace[
         BF16, degree, max_worker_count=max_worker_count,
-    ](dense_ar_src, dense_ar_dst, pools)
+    ](dense_out, seq_len * C.HIDDEN, pools)
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
@@ -920,18 +922,15 @@ struct Gemma4[
         comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
         for rank in range(Self.degree):
             var arena_base = self.arena_bases[rank]
-            var si = 0
-            var fi = 0
             for i in range(C.NUM_LAYERS):
+                var entry = LAYER_SCHEDULE[i]
                 var p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-                if is_full_layer(i):
-                    var lb = layout.full.base(arena_base, fi)
+                if entry.kind == LayerKind.FULL:
+                    var lb = layout.full.base(arena_base, entry.local_idx)
                     p = layout.full.proto.body.router_scale.at(lb)
-                    fi += 1
                 else:
-                    var lb = layout.sliding.base(arena_base, si)
+                    var lb = layout.sliding.base(arena_base, entry.local_idx)
                     p = layout.sliding.proto.body.router_scale.at(lb)
-                    si += 1
                 for j in range(0, C.HIDDEN, width):
                     var lane = p + j
                     var v = lane.load[width=width]().cast[DType.float32]()
@@ -966,22 +965,16 @@ struct Gemma4[
         var ctx = BindContext[Self.degree](
             arena_bases=self.arena_bases, layer_base=0)
 
-        comptime immut = ImmutOrigin(MutAnyOrigin)
         var x_main_ranks = layout.activations.x_main.state_binding(ctx)
         var x_res_ranks = layout.activations.x_residual.state_binding(ctx)
 
-        var src = RankBuffers[DType.bfloat16, Self.degree, immut](count=C.HIDDEN)
-        var dst = RankBuffers[DType.bfloat16, Self.degree, MutAnyOrigin](count=C.HIDDEN)
         var tail_base_owner = layout.tail.base(self.arena_bases[owner], 0)
-        var embed_row = layout.tail.proto.embed.at(tail_base_owner)
-            + local_row * C.HIDDEN
-        for r in range(Self.degree):
-            src.ptrs[r] = embed_row.as_immutable()
-            dst.ptrs[r] = x_main_ranks[r]
+        var embed_row = layout.tail.proto.embed.at(tail_base_owner) + local_row * C.HIDDEN
 
-        dispatch_broadcast[
+        dispatch_broadcast_from_ptr[
             BF16, Self.degree, max_worker_count=Self.max_worker_count,
-        ](src, dst, self.pools, src_rank=owner)
+        ](embed_row.as_immutable(), x_main_ranks, C.HIDDEN,
+          self.pools, src_rank=owner)
 
         comptime embed_scale = sqrt[DType.float32, 1](C.HIDDEN).cast[DType.bfloat16]().cast[DType.float32]()
         dispatch_scalar_mul[
@@ -989,22 +982,15 @@ struct Gemma4[
             max_worker_count=Self.max_worker_count,
         ](x_main_ranks, x_main_ranks, embed_scale, 1, self.pools)
 
-        var ar_src = RankBuffers[DType.bfloat16, Self.degree, immut](count=C.HIDDEN)
-        var ar_dst = RankBuffers[DType.bfloat16, Self.degree, MutAnyOrigin](count=C.HIDDEN)
-        for r in range(Self.degree):
-            ar_src.ptrs[r] = x_res_ranks[r].as_immutable()
-            ar_dst.ptrs[r] = x_res_ranks[r]
-
-        var si = 0
-        var fi = 0
         for i in range(C.NUM_LAYERS):
+            var entry = LAYER_SCHEDULE[i]
             var body: BodyRefs[Self.degree]
             var layer_ctx: BindContext[Self.degree]
-            if is_full_layer(i):
-                layer_ctx = ctx.with_layer(layout.full.base(self.arena_bases[0], fi))
+            if entry.kind == LayerKind.FULL:
+                layer_ctx = ctx.with_layer(layout.full.base(self.arena_bases[0], entry.local_idx))
                 body = layout.full.proto.body
             else:
-                layer_ctx = ctx.with_layer(layout.sliding.base(self.arena_bases[0], si))
+                layer_ctx = ctx.with_layer(layout.sliding.base(self.arena_bases[0], entry.local_idx))
                 body = layout.sliding.proto.body
 
             dispatch_rms_norm[
@@ -1014,22 +1000,22 @@ struct Gemma4[
               body.input_norm.binding(layer_ctx),
               1, self.pools)
 
-            if is_full_layer(i):
+            if entry.kind == LayerKind.FULL:
                 dispatch_full_attention_qkv[
                     degree=Self.degree,
                     max_worker_count=Self.max_worker_count,
                 ](
-                    layout, ctx, pos, fi, self.scratch, self.pools)
+                    layout, ctx, pos, entry.local_idx, self.scratch, self.pools)
             else:
                 dispatch_sliding_attention_qkv[
                     degree=Self.degree,
                     max_worker_count=Self.max_worker_count,
                 ](
-                    layout, ctx, pos, si, self.scratch, self.pools)
+                    layout, ctx, pos, entry.local_idx, self.scratch, self.pools)
 
-            dispatch_allreduce[
+            dispatch_allreduce_inplace[
                 BF16, Self.degree, max_worker_count=Self.max_worker_count,
-            ](ar_src, ar_dst, self.pools)
+            ](x_res_ranks, C.HIDDEN, self.pools)
 
             fused_norm_residual_add[
                 hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
@@ -1043,11 +1029,6 @@ struct Gemma4[
             ](
                 body, layer_ctx, x_main_ranks, x_res_ranks, 1,
                 self.scratch, self.pools)
-
-            if is_full_layer(i):
-                fi += 1
-            else:
-                si += 1
 
         var tail_ctx = ctx.with_layer(layout.tail.base(self.arena_bases[0], 0))
         dispatch_rms_norm[

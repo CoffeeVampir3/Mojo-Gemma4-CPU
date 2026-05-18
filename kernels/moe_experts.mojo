@@ -1,37 +1,26 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
     OutputPartitionedKernel, DispatchBuffer, Binding,
-    worker_range, join_all,
+    BF16Ptr, F32Ptr, I32Ptr, W, BW,
+    tile_dispatch, join_all,
 )
 from .dpbf16 import bf16_pair_dot
 from .moe_router import SparseRoute, SparseRoutePtr
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr  = UnsafePointer[Scalar[DType.float32],  MutAnyOrigin]
-comptime I32Ptr  = UnsafePointer[Scalar[DType.int32],    MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
-comptime BW = simd_width_of[DType.bfloat16]()
-
-
-comptime PHASE1_TILE_J = 64
-comptime PHASE1_MR = 4
-comptime PHASE1_PU_GU = 4
-comptime PHASE2_TOK_TILE = 64
-comptime PHASE2_MR = 4
-comptime PHASE2_PU_DN = 2
 
 
 @fieldwise_init
 struct Phase1GateUpKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, experts_per_rank: Int,
 ](OutputPartitionedKernel):
+    comptime TILE_J = 64
+    comptime MR = 4
+    comptime PU_GU = 4
+    comptime WORKER_SCRATCH_ELEMS = Self.MR * 2 * Self.TILE_J
+
     var x_normed: BF16Ptr
     var expert_offset: I32Ptr
     var routes: SparseRoutePtr
@@ -43,10 +32,10 @@ struct Phase1GateUpKernel[
     var end: Int
 
     def execute(mut self):
-        comptime PU_GU = PHASE1_PU_GU
+        comptime PU_GU = Self.PU_GU
         comptime STRIDE_GU = PU_GU * BW
-        comptime MR = PHASE1_MR
-        comptime tile_j = PHASE1_TILE_J
+        comptime MR = Self.MR
+        comptime tile_j = Self.TILE_J
 
         comptime assert Self.intermediate % tile_j == 0, (
             "Phase1: intermediate must be divisible by tile_j")
@@ -198,12 +187,11 @@ struct Phase1GateUpKernel[
 
                 rec_block += 1
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.x_normed, self.expert_offset, self.routes,
-            self.experts_gate_up, self.gate_scratch, self.hidden_bucket,
-            self.worker_id, start, end,
-        )
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.worker_id = worker_id
+        self.start = start
+        self.end = end
 
 
 def dispatch_phase1_gate_up[
@@ -219,28 +207,23 @@ def dispatch_phase1_gate_up[
     hidden_bucket: Binding[Scalar[DType.bfloat16], tp],
     mut pools: HeapMoveArray[P],
 ):
-    comptime n_tiles = intermediate // PHASE1_TILE_J
+    comptime Kernel = Phase1GateUpKernel[
+        hidden, gate_up_fused, intermediate, experts_per_rank,
+    ]
+    comptime n_tiles = intermediate // Kernel.TILE_J
     comptime total_units = experts_per_rank * n_tiles
 
-    var buf = DispatchBuffer[
-        Phase1GateUpKernel[
-            hidden, gate_up_fused, intermediate, experts_per_rank,
-        ],
-        max_worker_count,
-    ]()
+    var buf = DispatchBuffer[Kernel, max_worker_count]()
     for r in range(tp):
         var cap = min(max_worker_count, pools[r].get_capacity())
         var nw = min(cap, total_units)
-        for w in range(nw):
-            var wr = worker_range(total_units, nw, w)
-            buf.slot()[] = Phase1GateUpKernel[
-                hidden, gate_up_fused, intermediate, experts_per_rank,
-            ](
+        tile_dispatch(buf,
+            Kernel(
                 x_normed[r], expert_offset[r], routes[r],
                 experts_gate_up[r], gate_scratch[r], hidden_bucket[r],
-                w, wr[0], wr[1],
-            )
-        buf.dispatch(pools[r])
+                0, 0, 0,
+            ),
+            pools[r], total_units, num_workers=nw)
     join_all[tp](pools)
 
 
@@ -248,6 +231,10 @@ def dispatch_phase1_gate_up[
 struct Phase2DownKernel[
     hidden: Int, intermediate: Int, experts_per_rank: Int,
 ](OutputPartitionedKernel):
+    comptime TOK_TILE = 64
+    comptime MR = 4
+    comptime PU_DN = 2
+
     var expert_offset: I32Ptr
     var routes: SparseRoutePtr
     var hidden_bucket: BF16Ptr
@@ -259,9 +246,9 @@ struct Phase2DownKernel[
     var end: Int
 
     def execute(mut self):
-        comptime PU_DN = PHASE2_PU_DN
+        comptime PU_DN = Self.PU_DN
         comptime STRIDE_DN = PU_DN * BW
-        comptime MR = PHASE2_MR
+        comptime MR = Self.MR
         comptime assert Self.intermediate % STRIDE_DN == 0, (
             "Phase2: intermediate must divide STRIDE_DN")
 
@@ -285,7 +272,7 @@ struct Phase2DownKernel[
 
             var tok_base = 0
             while tok_base < n_tok_total:
-                var n_tok = min(PHASE2_TOK_TILE, n_tok_total - tok_base)
+                var n_tok = min(Self.TOK_TILE, n_tok_total - tok_base)
                 var route_base = self.routes + rec_lo + tok_base
                 var bucket_base = (
                     self.hidden_bucket + (rec_lo + tok_base) * Self.intermediate)
@@ -362,12 +349,10 @@ struct Phase2DownKernel[
                 (dst_row + m)[] = (acc_row + m)[].cast[DType.bfloat16]()
                 m += 1
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.expert_offset, self.routes, self.hidden_bucket,
-            self.experts_down, self.moe_accum, self.moe_partial,
-            self.seq_len, start, end,
-        )
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start * W
+        self.end = end * W
 
 
 def dispatch_phase2_down[
@@ -384,23 +369,18 @@ def dispatch_phase2_down[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
+    comptime Kernel = Phase2DownKernel[hidden, intermediate, experts_per_rank]
     comptime hidden_strides = hidden // W
 
-    var buf = DispatchBuffer[
-        Phase2DownKernel[hidden, intermediate, experts_per_rank],
-        max_worker_count,
-    ]()
+    var buf = DispatchBuffer[Kernel, max_worker_count]()
     for r in range(tp):
         var cap = min(max_worker_count, pools[r].get_capacity())
         var nw = min(cap, hidden_strides)
-        for w in range(nw):
-            var sr = worker_range(hidden_strides, nw, w)
-            buf.slot()[] = Phase2DownKernel[
-                hidden, intermediate, experts_per_rank,
-            ](
+        tile_dispatch(buf,
+            Kernel(
                 expert_offset[r], routes[r], hidden_bucket[r],
                 experts_down[r], moe_accum[r], moe_partial[r],
-                seq_len, sr[0] * W, sr[1] * W,
-            )
-        buf.dispatch(pools[r])
+                seq_len, 0, 0,
+            ),
+            pools[r], hidden_strides, num_workers=nw)
     join_all[tp](pools)

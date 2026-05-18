@@ -1,7 +1,5 @@
 from std.algorithm import vectorize
 from std.collections import InlineArray
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from simd_math.ops import sqrt
 from simd_math import pick_port_unroll, tree_reduce_accs
@@ -10,12 +8,8 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     Chain, OutputPartitionedKernel, DispatchBuffer,
     tile_dispatch, recommended_workers, join_all,
-    Binding,
+    Binding, BF16Ptr, W,
 )
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
 
 
 @always_inline
@@ -97,8 +91,10 @@ struct RmsNormTokenKernel[
                 self.dst + tok * Self.hidden,
                 self.weight)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.src, self.dst, self.weight, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 @fieldwise_init
@@ -119,8 +115,10 @@ struct NormResidualAddTokenKernel[
                 self.src + off, self.residual + off, self.dst + off,
                 self.weight)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.src, self.residual, self.dst, self.weight, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 comptime NORM_INLINE_TOKENS = 16
@@ -179,8 +177,10 @@ struct ScaledNormKernel[
                 self.dst + tok * Self.hidden,
                 self.weight)
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(self.src, self.dst, self.weight, start, end)
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.start = start
+        self.end = end
 
 
 def dispatch_rms_norm_qkv_heads[

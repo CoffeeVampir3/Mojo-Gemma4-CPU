@@ -1,6 +1,5 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
@@ -8,13 +7,10 @@ from simd_math import pick_port_unroll, tree_reduce_accs, fast_exp_softmax_biase
 from simd_math.ops import sqrt
 from .helpers import (
     OutputPartitionedKernel, DispatchBuffer, Binding,
-    recommended_workers, worker_range, join_all,
+    tile_dispatch, join_all,
+    BF16Ptr, F32Ptr, W,
 )
-
-
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime F32Ptr  = UnsafePointer[Scalar[DType.float32],  MutAnyOrigin]
-comptime W = simd_width_of[DType.float32]()
+from .rmsnorm import rms_reduce_row
 
 
 @fieldwise_init
@@ -77,15 +73,8 @@ struct RouterShardedKernel[
         for tok in range(self.start, self.end):
             var x_row = self.x + tok * Self.hidden
 
-            var ss_accs = InlineArray[SIMD[DType.float32, W], PU](
-                fill=SIMD[DType.float32, W](0))
-            for i in range(Self.hidden // STRIDE):
-                comptime for p in range(PU):
-                    var off = i * STRIDE + p * W
-                    var xv = (x_row + off).load[width=W]().cast[DType.float32]()
-                    ss_accs[p] = xv.fma(xv, ss_accs[p])
-            var inv_rms = sqrt_n / sqrt[DType.float32, 1](
-                tree_reduce_accs(ss_accs) + n_eps)
+            var sum_sq = rms_reduce_row[Self.hidden](x_row)
+            var inv_rms = sqrt_n / sqrt[DType.float32, 1](sum_sq + n_eps)
             var inv_vec = SIMD[DType.float32, W](inv_rms)
             for j in range(0, Self.hidden, W):
                 var xv = (x_row + j).load[width=W]().cast[DType.float32]()
@@ -112,12 +101,11 @@ struct RouterShardedKernel[
             comptime for k in range(Self.top_k):
                 dst[k] = cands[k]
 
-    def over_range(self, start: Int, end: Int) -> Self:
-        return Self(
-            self.x, self.router_proj, self.router_scale,
-            self.scaled_scratch, self.cands_out, self.expert_base,
-            self.worker_id, start, end,
-        )
+    @always_inline
+    def set_partition(mut self, worker_id: Int, start: Int, end: Int):
+        self.worker_id = worker_id
+        self.start = start
+        self.end = end
 
 
 comptime ROUTER_INLINE_TOKENS = 16
@@ -151,25 +139,19 @@ def dispatch_router_sharded[
             k.execute()
         return
 
-    var data_bytes = seq_len * (hidden + experts_per_rank * hidden) * 2
     var buf = DispatchBuffer[
         RouterShardedKernel[hidden, experts_per_rank, top_k, rms_eps],
         max_worker_count,
     ]()
     for r in range(tp):
-        var cap = min(max_worker_count, pools[r].get_capacity())
-        var nw = recommended_workers(data_bytes, cap)
-        nw = min(nw, seq_len)
-        for w in range(nw):
-            var wr = worker_range(seq_len, nw, w)
-            buf.slot()[] = RouterShardedKernel[
-                hidden, experts_per_rank, top_k, rms_eps,
-            ](
-                x[r], router_proj[r], router_scale[r],
-                scaled_scratch[r], cands_out[r],
-                r * experts_per_rank, w, wr[0], wr[1],
-            )
-        buf.dispatch(pools[r])
+        var proto = RouterShardedKernel[
+            hidden, experts_per_rank, top_k, rms_eps,
+        ](
+            x[r], router_proj[r], router_scale[r],
+            scaled_scratch[r], cands_out[r],
+            r * experts_per_rank, 0, 0, seq_len,
+        )
+        tile_dispatch(buf, proto, pools[r], seq_len)
     join_all[tp](pools)
 
 
