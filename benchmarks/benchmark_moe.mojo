@@ -1,6 +1,5 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.time import perf_counter_ns
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
@@ -11,6 +10,10 @@ from kernels.helpers import Binding, ArenaBases
 from kernels.moe_router import SparseRoute
 from kernels.moe_experts import dispatch_phase1_gate_up, dispatch_phase2_down
 from modeling.gemma4_common import Gemma4BaseConfig
+from benchmarks.bench_harness import (
+    SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
+    DEFAULT_SAMPLES,
+)
 
 
 comptime HIDDEN = Gemma4BaseConfig.HIDDEN
@@ -20,9 +23,8 @@ comptime NUM_EXPERTS = Gemma4BaseConfig.NUM_EXPERTS
 comptime TOP_K = Gemma4BaseConfig.TOP_K
 
 comptime ALIGNMENT = 64
-comptime WARMUP = 3
-comptime TRIALS = 10
-comptime ITERS = 5
+comptime WARMUP = 30
+comptime SAMPLES = DEFAULT_SAMPLES
 
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 comptime F32Ptr  = UnsafePointer[Float32,  MutAnyOrigin]
@@ -72,33 +74,6 @@ def fill_bf16(ptr: BF16Ptr, count: Int):
 def fill_bf16_all[tp: Int](ptrs: Binding[BFloat16, tp], count: Int):
     for r in range(tp):
         fill_bf16(ptrs[r], count)
-
-
-def fmt_ns(ns: Int) -> String:
-    if ns < 1000:
-        return String(ns) + " ns"
-    elif ns < 1_000_000:
-        return String(ns // 1000) + "." + String((ns % 1000) // 100) + " us"
-    else:
-        return String(ns // 1_000_000) + "." + String((ns % 1_000_000) // 100000) + " ms"
-
-
-def fmt_gflops(flops: Int, ns: Int) -> String:
-    if ns <= 0:
-        return "inf GF/s"
-    var gf_100 = flops * 100 // ns
-    return String(gf_100 // 100) + "." + String(gf_100 % 100) + " GF/s"
-
-
-def max_last_ts[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-) -> Int:
-    var hi = 0
-    for r in range(tp):
-        var ts = pools[r].last_worker_timestamp()
-        if ts > hi:
-            hi = ts
-    return hi
 
 
 def build_uniform_routing[experts_per_rank: Int, tp: Int](
@@ -160,6 +135,7 @@ def section_phase1[
     tp: Int, experts_per_rank: Int,
 ](
     mut pools: HeapMoveArray[P],
+    mut samples: SampleBuffer,
     seq_len: Int,
     x_normed: Binding[BFloat16, tp],
     expert_offset: Binding[Int32, tp],
@@ -176,37 +152,23 @@ def section_phase1[
         ](x_normed, expert_offset, routes,
           experts_gate_up, gate_scratch, hidden_bucket, pools)
 
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_phase1_gate_up[
-                hidden=HIDDEN, gate_up_fused=GATE_UP_FUSED,
-                intermediate=INTERMEDIATE,
-                experts_per_rank=experts_per_rank, tp=tp,
-            ](x_normed, expert_offset, routes,
-              experts_gate_up, gate_scratch, hidden_bucket, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_phase1_gate_up[
+            hidden=HIDDEN, gate_up_fused=GATE_UP_FUSED,
+            intermediate=INTERMEDIATE,
+            experts_per_rank=experts_per_rank, tp=tp,
+        ](x_normed, expert_offset, routes,
+          experts_gate_up, gate_scratch, hidden_bucket, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(hidden_bucket[0][0])
 
-    var flops = phase1_flops(seq_len)
-    var pad = "   " if seq_len < 10 else "  " if seq_len < 100 else " " if seq_len < 1000 else ""
-    print("  phase1 seq=" + String(seq_len) + pad
-        + " | kernel=" + fmt_ns(best_kernel)
-        + " | wall=" + fmt_ns(best_wall)
-        + " | " + fmt_gflops(flops, best_kernel))
+    var ks = compute_stats(samples.kernel_ns, samples.n)
+    var ws = compute_stats(samples.wall_ns, samples.n)
+    print_row("phase1 seq=" + String(seq_len), ks, ws, 0)
 
 
 def section_phase2[
@@ -214,6 +176,7 @@ def section_phase2[
     tp: Int, experts_per_rank: Int,
 ](
     mut pools: HeapMoveArray[P],
+    mut samples: SampleBuffer,
     seq_len: Int,
     expert_offset: Binding[Int32, tp],
     routes: Binding[SparseRoute, tp],
@@ -229,36 +192,22 @@ def section_phase2[
         ](expert_offset, routes, hidden_bucket,
           experts_down, moe_accum, moe_out, seq_len, pools)
 
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_phase2_down[
-                hidden=HIDDEN, intermediate=INTERMEDIATE,
-                experts_per_rank=experts_per_rank, tp=tp,
-            ](expert_offset, routes, hidden_bucket,
-              experts_down, moe_accum, moe_out, seq_len, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_phase2_down[
+            hidden=HIDDEN, intermediate=INTERMEDIATE,
+            experts_per_rank=experts_per_rank, tp=tp,
+        ](expert_offset, routes, hidden_bucket,
+          experts_down, moe_accum, moe_out, seq_len, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(moe_out[0][0])
 
-    var flops = phase2_flops(seq_len)
-    var pad = "   " if seq_len < 10 else "  " if seq_len < 100 else " " if seq_len < 1000 else ""
-    print("  phase2 seq=" + String(seq_len) + pad
-        + " | kernel=" + fmt_ns(best_kernel)
-        + " | wall=" + fmt_ns(best_wall)
-        + " | " + fmt_gflops(flops, best_kernel))
+    var ks = compute_stats(samples.kernel_ns, samples.n)
+    var ws = compute_stats(samples.wall_ns, samples.n)
+    print_row("phase2 seq=" + String(seq_len), ks, ws, 0)
 
 
 def section_combined[
@@ -266,6 +215,7 @@ def section_combined[
     tp: Int, experts_per_rank: Int,
 ](
     mut pools: HeapMoveArray[P],
+    mut samples: SampleBuffer,
     seq_len: Int,
     x_normed: Binding[BFloat16, tp],
     expert_offset: Binding[Int32, tp],
@@ -290,42 +240,28 @@ def section_combined[
         ](expert_offset, routes, hidden_bucket,
           experts_down, moe_accum, moe_out, seq_len, pools)
 
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_phase1_gate_up[
-                hidden=HIDDEN, gate_up_fused=GATE_UP_FUSED,
-                intermediate=INTERMEDIATE,
-                experts_per_rank=experts_per_rank, tp=tp,
-            ](x_normed, expert_offset, routes,
-              experts_gate_up, gate_scratch, hidden_bucket, pools)
-            dispatch_phase2_down[
-                hidden=HIDDEN, intermediate=INTERMEDIATE,
-                experts_per_rank=experts_per_rank, tp=tp,
-            ](expert_offset, routes, hidden_bucket,
-              experts_down, moe_accum, moe_out, seq_len, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_phase1_gate_up[
+            hidden=HIDDEN, gate_up_fused=GATE_UP_FUSED,
+            intermediate=INTERMEDIATE,
+            experts_per_rank=experts_per_rank, tp=tp,
+        ](x_normed, expert_offset, routes,
+          experts_gate_up, gate_scratch, hidden_bucket, pools)
+        dispatch_phase2_down[
+            hidden=HIDDEN, intermediate=INTERMEDIATE,
+            experts_per_rank=experts_per_rank, tp=tp,
+        ](expert_offset, routes, hidden_bucket,
+          experts_down, moe_accum, moe_out, seq_len, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(moe_out[0][0])
 
-    var flops = phase1_flops(seq_len) + phase2_flops(seq_len)
-    var pad = "   " if seq_len < 10 else "  " if seq_len < 100 else " " if seq_len < 1000 else ""
-    print("  p1+p2  seq=" + String(seq_len) + pad
-        + " | kernel=" + fmt_ns(best_kernel)
-        + " | wall=" + fmt_ns(best_wall)
-        + " | " + fmt_gflops(flops, best_kernel))
+    var ks = compute_stats(samples.kernel_ns, samples.n)
+    var ws = compute_stats(samples.wall_ns, samples.n)
+    print_row("p1+p2 seq=" + String(seq_len), ks, ws, 0)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -383,34 +319,33 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         + " experts/rank=" + String(experts_per_rank)
         + " top_k=" + String(TOP_K))
 
+    var samples = SampleBuffer(SAMPLES)
+
     print("\n=== Phase1 (gate+up over routed tokens) ===")
-    print("  seq          | kernel time  | wall time    | throughput")
     for s in range(NUM_SEQ_SIZES):
         var seq = sizes[s]
         build_uniform_routing[experts_per_rank=experts_per_rank, tp=tp](
             seq, expert_offset, routes)
         section_phase1[tp=tp, experts_per_rank=experts_per_rank](
-            pools, seq, x_normed, expert_offset, routes,
+            pools, samples, seq, x_normed, expert_offset, routes,
             experts_gate_up, gate_scratch, hidden_bucket)
 
     print("\n=== Phase2 (down projection, scatter-accumulate) ===")
-    print("  seq          | kernel time  | wall time    | throughput")
     for s in range(NUM_SEQ_SIZES):
         var seq = sizes[s]
         build_uniform_routing[experts_per_rank=experts_per_rank, tp=tp](
             seq, expert_offset, routes)
         section_phase2[tp=tp, experts_per_rank=experts_per_rank](
-            pools, seq, expert_offset, routes, hidden_bucket,
+            pools, samples, seq, expert_offset, routes, hidden_bucket,
             experts_down, moe_accum, moe_out)
 
     print("\n=== Phase1 + Phase2 (no allreduce) ===")
-    print("  seq          | kernel time  | wall time    | throughput")
     for s in range(NUM_SEQ_SIZES):
         var seq = sizes[s]
         build_uniform_routing[experts_per_rank=experts_per_rank, tp=tp](
             seq, expert_offset, routes)
         section_combined[tp=tp, experts_per_rank=experts_per_rank](
-            pools, seq, x_normed, expert_offset, routes,
+            pools, samples, seq, x_normed, expert_offset, routes,
             experts_gate_up, experts_down,
             gate_scratch, hidden_bucket, moe_accum, moe_out)
 

@@ -1,21 +1,25 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.time import perf_counter_ns
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.kv_tiled_attention import dispatch_sliding_attention, FlashDecodeKernel
+from kernels.flash_attention import (
+    dispatch_sliding_attention, FlashAttentionKernel, RingKV,
+)
 from kernels.logsum_merge import dispatch_merge_flash_partials
 from kernels.helpers import Binding, ArenaBases
+from benchmarks.bench_harness import (
+    SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
+    DEFAULT_SAMPLES,
+)
 
 
 comptime ALIGNMENT = 64
-comptime WARMUP = 10
-comptime TRIALS = 20
-comptime ITERS = 50
+comptime WARMUP = 30
+comptime SAMPLES = DEFAULT_SAMPLES
 
 comptime HEAD_DIM = 256
 comptime NUM_Q = 4
@@ -73,33 +77,6 @@ def fill_pattern_all[tp: Int](
         fill_pattern(ptrs[r], count)
 
 
-def fmt_ns(ns: Int) -> String:
-    if ns < 1000:
-        return String(ns) + " ns"
-    elif ns < 1_000_000:
-        return String(ns // 1000) + "." + String((ns % 1000) // 100) + " us"
-    else:
-        return String(ns // 1_000_000) + "." + String((ns % 1_000_000) // 100000) + " ms"
-
-
-def fmt_bw(total_bytes: Int, ns: Int) -> String:
-    if ns <= 0:
-        return "inf GB/s"
-    var bw_100 = total_bytes * 100 // ns
-    return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
-
-
-def max_last_ts[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-) -> Int:
-    var hi = 0
-    for r in range(tp):
-        var ts = pools[r].last_worker_timestamp()
-        if ts > hi:
-            hi = ts
-    return hi
-
-
 def section_context_sweep[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
     q: Binding[BFloat16, tp],
@@ -109,11 +86,12 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
     partials: Binding[Float32, tp],
 ):
     print("\n=== Context sweep (dispatch_sliding_attention) ===")
-    print("  valid_len | kernel time  | wall time    | KV read  | BW")
 
     var sizes = InlineArray[Int, NUM_CTX_SIZES](fill=0)
     sizes[0] = 1; sizes[1] = 8; sizes[2] = 32; sizes[3] = 128
     sizes[4] = 256; sizes[5] = 512; sizes[6] = 1024; sizes[7] = 4096
+
+    var samples = SampleBuffer(SAMPLES)
 
     for s in range(NUM_CTX_SIZES):
         var vl = sizes[s]
@@ -130,38 +108,24 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 output, partials, nw, pools)
             keep(output[0][0])
 
-        var best_wall = Int(1 << 60)
-        var best_kernel = Int(1 << 60)
-        for _ in range(TRIALS):
-            var wall_sum = 0
-            var kernel_sum = 0
-            for _ in range(ITERS):
-                var t0 = Int(perf_counter_ns())
-                var nw = dispatch_sliding_attention[
-                    head_dim=HEAD_DIM, num_q=NUM_Q,
-                    gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
-                    tp=tp](q, k_cache, v_cache, partials, pos, vl, pools)
-                dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
-                    output, partials, nw, pools)
-                var t1 = Int(perf_counter_ns())
-                var t_done = max_last_ts[tp=tp](pools)
-                wall_sum += t1 - t0
-                kernel_sum += t_done - t0
-            keep(output[0][0])
-            var avg_wall = wall_sum // ITERS
-            var avg_kernel = kernel_sum // ITERS
-            if avg_wall < best_wall:
-                best_wall = avg_wall
-            if avg_kernel < best_kernel:
-                best_kernel = avg_kernel
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            var nw = dispatch_sliding_attention[
+                head_dim=HEAD_DIM, num_q=NUM_Q,
+                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
+                tp=tp](q, k_cache, v_cache, partials, pos, vl, pools)
+            dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
+                output, partials, nw, pools)
+            var t1 = now_ns()
+            var t_done = max_last_ts[tp=tp](pools)
+            samples.push(t_done - t0, t1 - t0)
+        keep(output[0][0])
 
+        var ks = compute_stats(samples.kernel_ns, samples.n)
+        var ws = compute_stats(samples.wall_ns, samples.n)
         var kv_bytes = vl * KV_STRIDE * 2 * 2
-        var pad = "   " if vl < 10 else "  " if vl < 100 else " " if vl < 1000 else ""
-        print("  " + String(vl) + pad
-            + "     | " + fmt_ns(best_kernel)
-            + " | " + fmt_ns(best_wall)
-            + " | " + String(kv_bytes // 1024) + " KB"
-            + "  | " + fmt_bw(kv_bytes, best_kernel))
+        print_row("seq=" + String(vl), ks, ws, kv_bytes)
 
 
 def section_validation[P: BurstThreadPool, //, tp: Int](
@@ -202,8 +166,9 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
-    comptime flash_stride = FlashDecodeKernel[
-        HEAD_DIM, NUM_Q, GQA_RATIO, KV_STRIDE, WINDOW].PARTIAL_STRIDE
+    comptime flash_stride = FlashAttentionKernel[
+        RingKV[WINDOW], HEAD_DIM, NUM_Q, GQA_RATIO, KV_STRIDE,
+    ].PARTIAL_STRIDE
     var bases = arena_bases[tp](arenas)
 
     var q_ptr = arena_alloc_all[DType.bfloat16, tp](arenas, NUM_Q * HEAD_DIM)

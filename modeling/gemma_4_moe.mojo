@@ -18,11 +18,9 @@ from kernels.gemv import (
     dispatch_gemv_chained_qkv, dispatch_gemv, dispatch_gemv_softcap,
 )
 from kernels.rope import dispatch_rope_cache_write
-from kernels.kv_tiled_attention import (
-    dispatch_sliding_attention, FlashDecodeKernel,
-)
-from kernels.full_attention import (
-    dispatch_full_attention, FullAttentionKernel,
+from kernels.flash_attention import (
+    dispatch_full_attention, dispatch_sliding_attention,
+    FlashAttentionKernel, LinearKV, RingKV,
 )
 from kernels.logsum_merge import (
     dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
@@ -258,11 +256,10 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     comptime head_dim = C.HEAD_DIM_SLIDING
     comptime num_kv_heads = Self.kv_rows // Self.head_dim
     comptime num_q_heads = Self.q_rows // Self.head_dim
-    # Per-worker flash partial stride is owned by the FlashDecodeKernel.
-    comptime FlashK = FlashDecodeKernel[
+    comptime FlashK = FlashAttentionKernel[
+        RingKV[C.SLIDING_WINDOW],
         Self.head_dim, Self.num_q_heads,
         Self.num_q_heads // Self.num_kv_heads, Self.kv_rows,
-        C.SLIDING_WINDOW,
     ]
 
     comptime PHASES = ScratchPhaseOrder[
@@ -296,8 +293,8 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
     comptime local_q_rows = Self.S.FullO.DATA_M
     comptime head_dim = C.HEAD_DIM_FULL
     comptime num_q_heads = Self.q_rows // Self.head_dim
-    # Per-worker flash partial stride is owned by the FullAttentionKernel.
-    comptime FullK = FullAttentionKernel[
+    comptime FullK = FlashAttentionKernel[
+        LinearKV,
         Self.head_dim, Self.num_q_heads,
         C.NUM_HEADS // C.NUM_KV_HEADS_FULL, Self.k_rows,
     ]

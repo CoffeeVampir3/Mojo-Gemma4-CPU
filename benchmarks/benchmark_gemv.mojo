@@ -1,6 +1,5 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.time import perf_counter_ns
 from std.benchmark import keep
 from std.sys.info import simd_width_of
 
@@ -15,12 +14,15 @@ from kernels.gemv import (
     gemv_range, dispatch_gemv, dispatch_gemv_chained_qkv, GemvKernel,
 )
 from simd_math import pick_port_unroll, tree_reduce_accs
+from benchmarks.bench_harness import (
+    SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
+    DEFAULT_SAMPLES,
+)
 
 
 comptime ALIGNMENT = 64
-comptime WARMUP = 5
-comptime TRIALS = 10
-comptime ITERS = 10
+comptime WARMUP = 30
+comptime SAMPLES = DEFAULT_SAMPLES
 
 comptime HIDDEN = 2816
 comptime Q_SLIDING = 4096
@@ -74,33 +76,6 @@ def fill_pattern_all[tp: Int](
         fill_pattern(ptrs[r], count)
 
 
-def fmt_ns(ns: Int) -> String:
-    if ns < 1000:
-        return String(ns) + " ns"
-    elif ns < 1000000:
-        return String(ns // 1000) + "." + String((ns % 1000) // 100) + " us"
-    else:
-        return String(ns // 1000000) + "." + String((ns % 1000000) // 100000) + " ms"
-
-
-def fmt_bw(total_bytes: Int, ns: Int) -> String:
-    if ns <= 0:
-        return "inf GB/s"
-    var bw_100 = total_bytes * 100 // ns
-    return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
-
-
-def max_last_ts[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-) -> Int:
-    var hi = 0
-    for r in range(tp):
-        var ts = pools[r].last_worker_timestamp()
-        if ts > hi:
-            hi = ts
-    return hi
-
-
 def section_dot_primitive(x: BF16Ptr, weight: BF16Ptr):
     print("\n=== dot_row primitive (single row, HIDDEN=" + String(HIDDEN) + ") ===")
 
@@ -113,31 +88,24 @@ def section_dot_primitive(x: BF16Ptr, weight: BF16Ptr):
         dot_into_accs[cols=HIDDEN](x, weight, accs)
         keep(tree_reduce_accs(accs))
 
-    var best = Int(1 << 60)
-    for _ in range(TRIALS):
-        var elapsed = 0
-        for _ in range(ITERS * 10):
-            var t0 = Int(perf_counter_ns())
-            comptime for p in range(PU):
-                accs[p] = SIMD[DType.float32, FW](0)
-            dot_into_accs[cols=HIDDEN](x, weight, accs)
-            keep(tree_reduce_accs(accs))
-            var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // (ITERS * 10)
-        if avg < best:
-            best = avg
+    var samples = SampleBuffer(SAMPLES)
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        comptime for p in range(PU):
+            accs[p] = SIMD[DType.float32, FW](0)
+        dot_into_accs[cols=HIDDEN](x, weight, accs)
+        keep(tree_reduce_accs(accs))
+        var t1 = now_ns()
+        samples.push(t1 - t0, t1 - t0)
 
-    var flops = HIDDEN * 2
-    var mflops = flops * 1000 // best
-    print("  latency: " + fmt_ns(best)
-        + "  (" + fmt_bw(HIDDEN * 2 * 2, best) + " read x+w, "
-        + String(mflops) + " MFLOP/s)")
+    var ks = compute_stats(samples.kernel_ns, samples.n)
+    var ws = compute_stats(samples.wall_ns, samples.n)
+    print_row("dot_row HIDDEN=" + String(HIDDEN), ks, ws, HIDDEN * 2 * 2)
 
 
 def section_row_sweep[rows: Int](x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr):
     print("\n=== gemv_range inline (row count sweep, no dispatch) ===")
-    print("  rows  | time         | weight BW    | rows/us")
 
     comptime NUM_SIZES = 8
     var sizes = InlineArray[Int, NUM_SIZES](fill=0)
@@ -150,6 +118,8 @@ def section_row_sweep[rows: Int](x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr):
     sizes[6] = 1024
     sizes[7] = 2048
 
+    var samples = SampleBuffer(SAMPLES)
+
     for s in range(NUM_SIZES):
         var n_rows = sizes[s]
         if n_rows > rows:
@@ -158,28 +128,18 @@ def section_row_sweep[rows: Int](x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr):
         for _ in range(WARMUP):
             gemv_range[rows, HIDDEN](x, weight, output, 0, n_rows)
 
-        var best = Int(1 << 60)
-        for _ in range(TRIALS):
-            var elapsed = 0
-            for _ in range(ITERS):
-                var t0 = Int(perf_counter_ns())
-                gemv_range[rows, HIDDEN](x, weight, output, 0, n_rows)
-                var t1 = Int(perf_counter_ns())
-                elapsed += t1 - t0
-            var avg = elapsed // ITERS
-            if avg < best:
-                best = avg
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            gemv_range[rows, HIDDEN](x, weight, output, 0, n_rows)
+            var t1 = now_ns()
+            samples.push(t1 - t0, t1 - t0)
         keep(output[0])
 
+        var ks = compute_stats(samples.kernel_ns, samples.n)
+        var ws = compute_stats(samples.wall_ns, samples.n)
         var weight_bytes = n_rows * HIDDEN * 2
-        var throughput = 0
-        if best > 0:
-            throughput = n_rows * 1000 // best
-        var pad = "  " if n_rows < 10 else " " if n_rows < 100 else "" if n_rows < 1000 else ""
-        print("  " + String(n_rows) + pad
-            + "   | " + fmt_ns(best)
-            + " | " + fmt_bw(weight_bytes, best)
-            + " | " + String(throughput))
+        print_row("rows=" + String(n_rows), ks, ws, weight_bytes)
 
 
 def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
@@ -188,27 +148,24 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
     var cap = pool.get_capacity()
     print("\n=== Dispatch scaling (local Q rows=" + String(rows)
         + " rows, capacity=" + String(cap) + ") ===")
-    print("  workers | kernel time  | wall time    | weight BW    | speedup")
+
+    var samples = SampleBuffer(SAMPLES)
 
     for _ in range(WARMUP):
         gemv_range[rows, HIDDEN](x, weight, output, 0, rows)
-    var best_inline = Int(1 << 60)
-    for _ in range(TRIALS):
-        var elapsed = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            gemv_range[rows, HIDDEN](x, weight, output, 0, rows)
-            var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // ITERS
-        if avg < best_inline:
-            best_inline = avg
+
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        gemv_range[rows, HIDDEN](x, weight, output, 0, rows)
+        var t1 = now_ns()
+        samples.push(t1 - t0, t1 - t0)
     keep(output[0])
 
     var weight_bytes = rows * HIDDEN * 2
-    print("  inline  | " + fmt_ns(best_inline)
-        + " | " + fmt_ns(best_inline)
-        + " | " + fmt_bw(weight_bytes, best_inline) + " | 1.0x")
+    var ks_inline = compute_stats(samples.kernel_ns, samples.n)
+    var ws_inline = compute_stats(samples.wall_ns, samples.n)
+    print_row("inline", ks_inline, ws_inline, weight_bytes)
 
     var nw = 1
     while nw <= cap:
@@ -219,36 +176,21 @@ def section_dispatch_scaling[P: BurstThreadPool, //, rows: Int](
                 pool, rows, num_workers=nw)
             pool.join()
 
-        var best_wall = Int(1 << 60)
-        var best_kernel = Int(1 << 60)
-        for _ in range(TRIALS):
-            var wall_sum = 0
-            var kernel_sum = 0
-            for _ in range(ITERS):
-                var t0 = Int(perf_counter_ns())
-                _ = tile_dispatch(buf,
-                    GemvKernel[rows, HIDDEN](x, weight, output, 0, 0),
-                    pool, rows, num_workers=nw)
-                pool.join()
-                var t1 = Int(perf_counter_ns())
-                var t_done = pool.last_worker_timestamp()
-                wall_sum += t1 - t0
-                kernel_sum += t_done - t0
-            var avg_wall = wall_sum // ITERS
-            var avg_kernel = kernel_sum // ITERS
-            if avg_wall < best_wall:
-                best_wall = avg_wall
-            if avg_kernel < best_kernel:
-                best_kernel = avg_kernel
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            _ = tile_dispatch(buf,
+                GemvKernel[rows, HIDDEN](x, weight, output, 0, 0),
+                pool, rows, num_workers=nw)
+            pool.join()
+            var t1 = now_ns()
+            var t_done = pool.last_worker_timestamp()
+            samples.push(t_done - t0, t1 - t0)
         keep(output[0])
 
-        var speedup_10 = best_inline * 10 // best_kernel
-        var pad = "  " if nw < 10 else " "
-        print("  " + String(nw) + pad
-            + "      | " + fmt_ns(best_kernel)
-            + " | " + fmt_ns(best_wall)
-            + " | " + fmt_bw(weight_bytes, best_kernel)
-            + " | " + String(speedup_10 // 10) + "." + String(speedup_10 % 10) + "x")
+        var ks = compute_stats(samples.kernel_ns, samples.n)
+        var ws = compute_stats(samples.wall_ns, samples.n)
+        print_row("workers=" + String(nw), ks, ws, weight_bytes)
 
         if nw < 4:
             nw *= 2
@@ -262,8 +204,8 @@ def measure_dispatch_gemv[
     P: BurstThreadPool, //, rows: Int, tp: Int,
 ](
     mut pools: HeapMoveArray[P], x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    bases: ArenaBases[tp],
-) -> Tuple[Int, Int]:
+    bases: ArenaBases[tp], mut samples: SampleBuffer, label: String,
+):
     var xs = Binding[BFloat16, tp](x, bases)
     var ws = Binding[BFloat16, tp](weight, bases)
     var outs = Binding[BFloat16, tp](output, bases)
@@ -272,40 +214,19 @@ def measure_dispatch_gemv[
         dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
         keep(output[0])
 
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_gemv[rows=rows, cols=HIDDEN, tp=tp](xs, ws, outs, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(output[0])
-    return Tuple[Int, Int](best_kernel, best_wall)
 
-
-def print_projection_row(name: String, rows: Int, kernel_ns: Int, wall_ns: Int):
+    var ks = compute_stats(samples.kernel_ns, samples.n)
+    var wsx = compute_stats(samples.wall_ns, samples.n)
     var weight_bytes = rows * HIDDEN * 2
-    var mb = weight_bytes // (1024 * 1024)
-    var pad = ""
-    if name.byte_length() < 20:
-        pad = " " * (20 - name.byte_length())
-    print("  " + name + pad
-        + "| " + String(rows)
-        + "  | " + String(mb)
-        + "        | " + fmt_ns(kernel_ns)
-        + " | " + fmt_ns(wall_ns)
-        + " | " + fmt_bw(weight_bytes, kernel_ns))
+    print_row(label + " rows=" + String(rows), ks, wsx, weight_bytes)
 
 
 def section_projection_sizes[P: BurstThreadPool, //, tp: Int](
@@ -313,28 +234,22 @@ def section_projection_sizes[P: BurstThreadPool, //, tp: Int](
     bases: ArenaBases[tp],
 ):
     print("\n=== Real projection sizes (full dispatch) ===")
-    print("  projection         | rows  | weight MB | kernel time  | wall time    | BW")
 
     comptime SL_Q = Q_SLIDING // tp
     comptime SL_KV = KV_SLIDING // tp
     comptime FL_Q = Q_FULL // tp
     comptime FL_K = KV_FULL
 
-    var sl_q = measure_dispatch_gemv[SL_Q, tp](
-        pools, x, weight, output, bases)
-    print_projection_row("sliding Q", SL_Q, sl_q[0], sl_q[1])
+    var samples = SampleBuffer(SAMPLES)
 
-    var sl_kv = measure_dispatch_gemv[SL_KV, tp](
-        pools, x, weight, output, bases)
-    print_projection_row("sliding KV", SL_KV, sl_kv[0], sl_kv[1])
-
-    var fl_q = measure_dispatch_gemv[FL_Q, tp](
-        pools, x, weight, output, bases)
-    print_projection_row("full Q", FL_Q, fl_q[0], fl_q[1])
-
-    var fl_k = measure_dispatch_gemv[FL_K, tp](
-        pools, x, weight, output, bases)
-    print_projection_row("full K replicated", FL_K, fl_k[0], fl_k[1])
+    measure_dispatch_gemv[SL_Q, tp](
+        pools, x, weight, output, bases, samples, "sliding Q")
+    measure_dispatch_gemv[SL_KV, tp](
+        pools, x, weight, output, bases, samples, "sliding KV")
+    measure_dispatch_gemv[FL_Q, tp](
+        pools, x, weight, output, bases, samples, "full Q")
+    measure_dispatch_gemv[FL_K, tp](
+        pools, x, weight, output, bases, samples, "full K replicated")
 
 
 def section_chained_qkv[P: BurstThreadPool, //, tp: Int](
@@ -356,67 +271,46 @@ def section_chained_qkv[P: BurstThreadPool, //, tp: Int](
     var ko = Binding[BFloat16, tp](k_out, bases)
     var vo = Binding[BFloat16, tp](v_out, bases)
 
+    var samples = SampleBuffer(SAMPLES)
+    var total_weight_bytes = (Q_R + KV_R + KV_R) * HIDDEN * 2
+
     for _ in range(WARMUP):
         dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
         dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, kw, ko, pools)
         dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, vw, vo, pools)
 
-    var best_sep_wall = Int(1 << 60)
-    var best_sep_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
-            dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, kw, ko, pools)
-            dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, vw, vo, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_sep_wall:
-            best_sep_wall = avg_wall
-        if avg_kernel < best_sep_kernel:
-            best_sep_kernel = avg_kernel
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_gemv[rows=Q_R, cols=HIDDEN, tp=tp](xs, qw, qo, pools)
+        dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, kw, ko, pools)
+        dispatch_gemv[rows=KV_R, cols=HIDDEN, tp=tp](xs, vw, vo, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(q_out[0])
+
+    var ks_sep = compute_stats(samples.kernel_ns, samples.n)
+    var ws_sep = compute_stats(samples.wall_ns, samples.n)
+    print_row("3x separate", ks_sep, ws_sep, total_weight_bytes)
 
     for _ in range(WARMUP):
         dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN, tp=tp](
             xs, qw, kw, vw, qo, ko, vo, pools)
 
-    var best_ch_wall = Int(1 << 60)
-    var best_ch_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN, tp=tp](
-                xs, qw, kw, vw, qo, ko, vo, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_ch_wall:
-            best_ch_wall = avg_wall
-        if avg_kernel < best_ch_kernel:
-            best_ch_kernel = avg_kernel
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_gemv_chained_qkv[q_rows=Q_R, kv_rows=KV_R, cols=HIDDEN, tp=tp](
+            xs, qw, kw, vw, qo, ko, vo, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(q_out[0])
 
-    var total_weight_bytes = (Q_R + KV_R + KV_R) * HIDDEN * 2
-    print("  3x separate: kernel=" + fmt_ns(best_sep_kernel)
-        + " wall=" + fmt_ns(best_sep_wall)
-        + "  (" + fmt_bw(total_weight_bytes, best_sep_kernel) + ")")
-    print("  chained:     kernel=" + fmt_ns(best_ch_kernel)
-        + " wall=" + fmt_ns(best_ch_wall)
-        + "  (" + fmt_bw(total_weight_bytes, best_ch_kernel) + ")")
-    print("  savings:     kernel=" + fmt_ns(best_sep_kernel - best_ch_kernel)
-        + "  (" + String(100 - best_ch_kernel * 100 // best_sep_kernel) + "%)")
+    var ks_ch = compute_stats(samples.kernel_ns, samples.n)
+    var ws_ch = compute_stats(samples.wall_ns, samples.n)
+    print_row("chained", ks_ch, ws_ch, total_weight_bytes)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](

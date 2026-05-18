@@ -1,6 +1,5 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.time import perf_counter_ns
 from std.benchmark import keep
 from std.sys.info import simd_width_of
 
@@ -14,12 +13,15 @@ from kernels.helpers import (
 )
 from kernels.reductions import dispatch_allreduce
 from modeling.model_spec import BF16, Encoding
+from benchmarks.bench_harness import (
+    SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
+    DEFAULT_SAMPLES,
+)
 
 
 comptime ALIGNMENT = 64
-comptime WARMUP = 3
-comptime TRIALS = 10
-comptime ITERS = 20
+comptime WARMUP = 30
+comptime SAMPLES = DEFAULT_SAMPLES
 comptime MAX_ELEMS = 32 * 1024 * 1024
 comptime BUF_ELEMS = 2816 * 4096
 
@@ -39,38 +41,6 @@ def arena_alloc[dtype: DType](
 def fill_pattern(ptr: BF16Ptr, count: Int):
     for i in range(count):
         ptr[i] = BFloat16(Float32(i % 256))
-
-
-def fmt_bw(total_bytes: Int, ns: Int) -> String:
-    if ns <= 0:
-        return "inf GB/s"
-    var bw_100 = total_bytes * 100 // ns
-    return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
-
-
-def print_bw(label: String, total_bytes: Int, ns: Int):
-    print("  " + label + ": " + String(ns) + " ns  " + fmt_bw(total_bytes, ns))
-
-
-def print_bw_split(
-    label: String, total_bytes: Int, kernel_ns: Int, wall_ns: Int,
-):
-    print("  " + label
-        + ": kernel=" + String(kernel_ns) + " ns "
-        + fmt_bw(total_bytes, kernel_ns)
-        + " | wall=" + String(wall_ns) + " ns "
-        + fmt_bw(total_bytes, wall_ns))
-
-
-def max_last_ts[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-) -> Int:
-    var hi = 0
-    for r in range(tp):
-        var ts = pools[r].last_worker_timestamp()
-        if ts > hi:
-            hi = ts
-    return hi
 
 
 @fieldwise_init
@@ -142,90 +112,55 @@ struct NoopKernel(BurstKernel):
 
 
 def timed_read[P: BurstThreadPool](
-    mut pool: P, src: BF16Ptr, count: Int,
-) -> Tuple[Int, Int]:
+    mut pool: P, src: BF16Ptr, count: Int, mut samples: SampleBuffer,
+):
     var buf = DispatchBuffer[ReadSweepKernel]()
     for _ in range(WARMUP):
         _ = tile_dispatch(buf, ReadSweepKernel(src, 0, 0), pool, count)
         pool.join()
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            _ = tile_dispatch(buf, ReadSweepKernel(src, 0, 0), pool, count)
-            pool.join()
-            var t1 = Int(perf_counter_ns())
-            var t_done = pool.last_worker_timestamp()
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
-    return (best_kernel, best_wall)
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        _ = tile_dispatch(buf, ReadSweepKernel(src, 0, 0), pool, count)
+        pool.join()
+        var t1 = now_ns()
+        var t_done = pool.last_worker_timestamp()
+        samples.push(t_done - t0, t1 - t0)
 
 
 def timed_write[P: BurstThreadPool](
-    mut pool: P, dst: BF16Ptr, count: Int,
-) -> Tuple[Int, Int]:
+    mut pool: P, dst: BF16Ptr, count: Int, mut samples: SampleBuffer,
+):
     var buf = DispatchBuffer[WriteSweepKernel]()
     for _ in range(WARMUP):
         _ = tile_dispatch(buf, WriteSweepKernel(dst, 0, 0), pool, count)
         pool.join()
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            _ = tile_dispatch(buf, WriteSweepKernel(dst, 0, 0), pool, count)
-            pool.join()
-            var t1 = Int(perf_counter_ns())
-            var t_done = pool.last_worker_timestamp()
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
-    return (best_kernel, best_wall)
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        _ = tile_dispatch(buf, WriteSweepKernel(dst, 0, 0), pool, count)
+        pool.join()
+        var t1 = now_ns()
+        var t_done = pool.last_worker_timestamp()
+        samples.push(t_done - t0, t1 - t0)
 
 
 def timed_copy[P: BurstThreadPool](
     mut pool: P, dst: BF16Ptr, src: BF16Ptr, count: Int,
-) -> Tuple[Int, Int]:
+    mut samples: SampleBuffer,
+):
     var buf = DispatchBuffer[CopySweepKernel]()
     for _ in range(WARMUP):
         _ = tile_dispatch(buf, CopySweepKernel(dst, src, 0, 0), pool, count)
         pool.join()
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            _ = tile_dispatch(buf, CopySweepKernel(dst, src, 0, 0), pool, count)
-            pool.join()
-            var t1 = Int(perf_counter_ns())
-            var t_done = pool.last_worker_timestamp()
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
-    return (best_kernel, best_wall)
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        _ = tile_dispatch(buf, CopySweepKernel(dst, src, 0, 0), pool, count)
+        pool.join()
+        var t1 = now_ns()
+        var t_done = pool.last_worker_timestamp()
+        samples.push(t_done - t0, t1 - t0)
 
 
 def section_local_bw[P: BurstThreadPool, //, tp: Int](
@@ -236,16 +171,22 @@ def section_local_bw[P: BurstThreadPool, //, tp: Int](
 ):
     var mb = count * 2 // 1024 // 1024
     print("\n=== Local BW per node (" + String(mb) + " MB bf16) ===")
+    var samples = SampleBuffer(SAMPLES)
     for n in range(tp):
-        var r_pair = timed_read(pools[n], src[n], count)
-        var w_pair = timed_write(pools[n], dst[n], count)
-        var c_pair = timed_copy(pools[n], dst[n], src[n], count)
-        print_bw_split("n" + String(n) + " read ", count * 2,
-            r_pair[0], r_pair[1])
-        print_bw_split("n" + String(n) + " write", count * 2,
-            w_pair[0], w_pair[1])
-        print_bw_split("n" + String(n) + " copy ", count * 4,
-            c_pair[0], c_pair[1])
+        timed_read(pools[n], src[n], count, samples)
+        var rk = compute_stats(samples.kernel_ns, samples.n)
+        var rw = compute_stats(samples.wall_ns, samples.n)
+        print_row("n" + String(n) + " read", rk, rw, count * 2)
+
+        timed_write(pools[n], dst[n], count, samples)
+        var wk = compute_stats(samples.kernel_ns, samples.n)
+        var ww = compute_stats(samples.wall_ns, samples.n)
+        print_row("n" + String(n) + " write", wk, ww, count * 2)
+
+        timed_copy(pools[n], dst[n], src[n], count, samples)
+        var ck = compute_stats(samples.kernel_ns, samples.n)
+        var cw = compute_stats(samples.wall_ns, samples.n)
+        print_row("n" + String(n) + " copy", ck, cw, count * 4)
 
 
 def section_remote_cached[P: BurstThreadPool, //, tp: Int](
@@ -257,14 +198,17 @@ def section_remote_cached[P: BurstThreadPool, //, tp: Int](
     if tp <= 1:
         return
     print("\n=== Cached remote read BW (data in reader L3 after warmup) ===")
+    var samples = SampleBuffer(SAMPLES)
     for reader in range(tp):
         for owner in range(tp):
             if reader == owner:
                 continue
-            var pair = timed_read(pools[reader], src[owner], count)
-            print_bw_split(
+            timed_read(pools[reader], src[owner], count, samples)
+            var ks = compute_stats(samples.kernel_ns, samples.n)
+            var ws = compute_stats(samples.wall_ns, samples.n)
+            print_row(
                 "reader=n" + String(reader) + " owner=n" + String(owner),
-                count * 2, pair[0], pair[1])
+                ks, ws, count * 2)
 
 
 def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
@@ -276,6 +220,7 @@ def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
     if tp <= 1:
         return
     print("\n=== Fresh remote read BW (owner writes, reader reads) ===")
+    var samples = SampleBuffer(SAMPLES)
     for reader in range(tp):
         for owner in range(tp):
             if reader == owner:
@@ -289,32 +234,23 @@ def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
                 _ = tile_dispatch(rbuf, ReadSweepKernel(bufs[owner], 0, 0),
                     pools[reader], count)
                 pools[reader].join()
-            var best_wall = Int(1 << 60)
-            var best_kernel = Int(1 << 60)
-            for _ in range(TRIALS):
-                var wall_sum = 0
-                var kernel_sum = 0
-                for _ in range(ITERS):
-                    _ = tile_dispatch(wbuf, WriteSweepKernel(bufs[owner], 0, 0),
-                        pools[owner], count)
-                    pools[owner].join()
-                    var t0 = Int(perf_counter_ns())
-                    _ = tile_dispatch(rbuf, ReadSweepKernel(bufs[owner], 0, 0),
-                        pools[reader], count)
-                    pools[reader].join()
-                    var t1 = Int(perf_counter_ns())
-                    var t_done = pools[reader].last_worker_timestamp()
-                    wall_sum += t1 - t0
-                    kernel_sum += t_done - t0
-                var avg_wall = wall_sum // ITERS
-                var avg_kernel = kernel_sum // ITERS
-                if avg_wall < best_wall:
-                    best_wall = avg_wall
-                if avg_kernel < best_kernel:
-                    best_kernel = avg_kernel
-            print_bw_split(
+            samples.clear()
+            for _ in range(SAMPLES):
+                _ = tile_dispatch(wbuf, WriteSweepKernel(bufs[owner], 0, 0),
+                    pools[owner], count)
+                pools[owner].join()
+                var t0 = now_ns()
+                _ = tile_dispatch(rbuf, ReadSweepKernel(bufs[owner], 0, 0),
+                    pools[reader], count)
+                pools[reader].join()
+                var t1 = now_ns()
+                var t_done = pools[reader].last_worker_timestamp()
+                samples.push(t_done - t0, t1 - t0)
+            var ks = compute_stats(samples.kernel_ns, samples.n)
+            var ws = compute_stats(samples.wall_ns, samples.n)
+            print_row(
                 "reader=n" + String(reader) + " owner=n" + String(owner),
-                count * 2, best_kernel, best_wall)
+                ks, ws, count * 2)
 
 
 def section_contended[P: BurstThreadPool, //, tp: Int](
@@ -328,6 +264,7 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
     print("\n=== Contended read BW (" + String(tp)
         + " pools read one node, chunked) ===")
     var chunk = count // tp
+    var samples = SampleBuffer(SAMPLES)
     for src_node in range(tp):
         for _ in range(WARMUP):
             var buf = DispatchBuffer[ReadSweepKernel]()
@@ -335,80 +272,76 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
                 _ = tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
                     pools[r], chunk, chunk * r)
             join_all[tp](pools)
-        var best_wall = Int(1 << 60)
-        var best_kernel = Int(1 << 60)
-        for _ in range(TRIALS):
-            var wall_sum = 0
-            var kernel_sum = 0
-            for _ in range(ITERS):
-                var buf = DispatchBuffer[ReadSweepKernel]()
-                var t0 = Int(perf_counter_ns())
-                for r in range(tp):
-                    _ = tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
-                        pools[r], chunk, chunk * r)
-                join_all[tp](pools)
-                var t1 = Int(perf_counter_ns())
-                var t_done = max_last_ts[tp=tp](pools)
-                wall_sum += t1 - t0
-                kernel_sum += t_done - t0
-            var avg_wall = wall_sum // ITERS
-            var avg_kernel = kernel_sum // ITERS
-            if avg_wall < best_wall:
-                best_wall = avg_wall
-            if avg_kernel < best_kernel:
-                best_kernel = avg_kernel
-        print_bw_split(
+        samples.clear()
+        for _ in range(SAMPLES):
+            var buf = DispatchBuffer[ReadSweepKernel]()
+            var t0 = now_ns()
+            for r in range(tp):
+                _ = tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
+                    pools[r], chunk, chunk * r)
+            join_all[tp](pools)
+            var t1 = now_ns()
+            var t_done = max_last_ts[tp=tp](pools)
+            samples.push(t_done - t0, t1 - t0)
+        var ks = compute_stats(samples.kernel_ns, samples.n)
+        var ws = compute_stats(samples.wall_ns, samples.n)
+        print_row(
             "src=n" + String(src_node) + " (" + String(tp) + " readers)",
-            count * 2, best_kernel, best_wall)
+            ks, ws, count * 2)
 
 
 def section_dispatch[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
 ):
     print("\n=== Dispatch + join overhead ===")
+    var samples = SampleBuffer(SAMPLES)
     for _ in range(WARMUP):
         var buf = DispatchBuffer[NoopKernel]()
         for r in range(tp):
             buf.slot()[] = NoopKernel(0)
             buf.dispatch(pools[r])
         join_all[tp](pools)
-    var best = Int(1 << 60)
-    for _ in range(TRIALS * 5):
-        var elapsed = 0
-        for _ in range(ITERS * 5):
-            var buf = DispatchBuffer[NoopKernel]()
-            var t0 = Int(perf_counter_ns())
-            for r in range(tp):
-                buf.slot()[] = NoopKernel(0)
-                buf.dispatch(pools[r])
-            join_all[tp](pools)
-            var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // (ITERS * 5)
-        if avg < best:
-            best = avg
-    print("  noop dispatch+join (" + String(tp) + " pools x 1 job): "
-        + String(best) + " ns")
+    samples.clear()
+    for _ in range(SAMPLES):
+        var buf = DispatchBuffer[NoopKernel]()
+        var t0 = now_ns()
+        for r in range(tp):
+            buf.slot()[] = NoopKernel(0)
+            buf.dispatch(pools[r])
+        join_all[tp](pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
+    var ks = compute_stats(samples.kernel_ns, samples.n)
+    var ws = compute_stats(samples.wall_ns, samples.n)
+    print_row("noop dispatch+join (" + String(tp) + " pools x 1 job)",
+        ks, ws, 0)
 
-    var best2 = Int(1 << 60)
-    for _ in range(TRIALS * 5):
-        var elapsed = 0
-        for _ in range(ITERS * 5):
-            var buf = DispatchBuffer[NoopKernel]()
-            var t0 = Int(perf_counter_ns())
-            for r in range(tp):
-                var cap = pools[r].get_capacity()
-                for _ in range(cap):
-                    buf.slot()[] = NoopKernel(0)
-                buf.dispatch(pools[r])
-            join_all[tp](pools)
-            var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // (ITERS * 5)
-        if avg < best2:
-            best2 = avg
-    print("  noop dispatch+join (" + String(tp) + " pools x all workers): "
-        + String(best2) + " ns")
+    for _ in range(WARMUP):
+        var buf = DispatchBuffer[NoopKernel]()
+        for r in range(tp):
+            var cap = pools[r].get_capacity()
+            for _ in range(cap):
+                buf.slot()[] = NoopKernel(0)
+            buf.dispatch(pools[r])
+        join_all[tp](pools)
+    samples.clear()
+    for _ in range(SAMPLES):
+        var buf = DispatchBuffer[NoopKernel]()
+        var t0 = now_ns()
+        for r in range(tp):
+            var cap = pools[r].get_capacity()
+            for _ in range(cap):
+                buf.slot()[] = NoopKernel(0)
+            buf.dispatch(pools[r])
+        join_all[tp](pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
+    var ks2 = compute_stats(samples.kernel_ns, samples.n)
+    var ws2 = compute_stats(samples.wall_ns, samples.n)
+    print_row("noop dispatch+join (" + String(tp) + " pools x all workers)",
+        ks2, ws2, 0)
 
 
 def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
@@ -419,30 +352,29 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
     var cap = pools[0].get_capacity()
     print("\n=== Worker scaling on node 0 (capacity=" + String(cap)
         + ", " + String(count * 2 // 1024 // 1024) + " MB) ===")
-    print("  workers | dispatch_ns | read_kernel_ns | read_wall_ns | read_GB/s")
 
+    var samples = SampleBuffer(SAMPLES)
     var n = 1
     while n <= cap:
         var noop_buf = DispatchBuffer[NoopKernel]()
-        for _ in range(WARMUP * 10):
+        for _ in range(WARMUP):
             for _ in range(n):
                 noop_buf.slot()[] = NoopKernel(0)
             noop_buf.dispatch(pools[0])
             pools[0].join()
-        var best_dispatch = Int(1 << 60)
-        for _ in range(TRIALS * 5):
-            var elapsed = 0
-            for _ in range(ITERS * 5):
-                var t0 = Int(perf_counter_ns())
-                for _ in range(n):
-                    noop_buf.slot()[] = NoopKernel(0)
-                noop_buf.dispatch(pools[0])
-                pools[0].join()
-                var t1 = Int(perf_counter_ns())
-                elapsed += t1 - t0
-            var avg = elapsed // (ITERS * 5)
-            if avg < best_dispatch:
-                best_dispatch = avg
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            for _ in range(n):
+                noop_buf.slot()[] = NoopKernel(0)
+            noop_buf.dispatch(pools[0])
+            pools[0].join()
+            var t1 = now_ns()
+            var t_done = pools[0].last_worker_timestamp()
+            samples.push(t_done - t0, t1 - t0)
+        var dk = compute_stats(samples.kernel_ns, samples.n)
+        var dw = compute_stats(samples.wall_ns, samples.n)
+        print_row("workers=" + String(n) + " noop dispatch", dk, dw, 0)
 
         var read_buf = DispatchBuffer[ReadSweepKernel]()
         for _ in range(WARMUP):
@@ -451,34 +383,20 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
                 read_buf.slot()[] = ReadSweepKernel(src[0], wr[0], wr[1])
             read_buf.dispatch(pools[0])
             pools[0].join()
-        var best_read_wall = Int(1 << 60)
-        var best_read_kernel = Int(1 << 60)
-        for _ in range(TRIALS):
-            var wall_sum = 0
-            var kernel_sum = 0
-            for _ in range(ITERS):
-                var t0 = Int(perf_counter_ns())
-                for w in range(n):
-                    var wr = worker_range(count, n, w)
-                    read_buf.slot()[] = ReadSweepKernel(src[0], wr[0], wr[1])
-                read_buf.dispatch(pools[0])
-                pools[0].join()
-                var t1 = Int(perf_counter_ns())
-                var t_done = pools[0].last_worker_timestamp()
-                wall_sum += t1 - t0
-                kernel_sum += t_done - t0
-            var avg_wall = wall_sum // ITERS
-            var avg_kernel = kernel_sum // ITERS
-            if avg_wall < best_read_wall:
-                best_read_wall = avg_wall
-            if avg_kernel < best_read_kernel:
-                best_read_kernel = avg_kernel
-
-        var pad = "       " if n < 10 else "      " if n < 100 else "     "
-        print("  " + String(n) + pad + "| " + String(best_dispatch)
-            + " | " + String(best_read_kernel)
-            + " | " + String(best_read_wall)
-            + " | " + fmt_bw(count * 2, best_read_kernel))
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            for w in range(n):
+                var wr = worker_range(count, n, w)
+                read_buf.slot()[] = ReadSweepKernel(src[0], wr[0], wr[1])
+            read_buf.dispatch(pools[0])
+            pools[0].join()
+            var t1 = now_ns()
+            var t_done = pools[0].last_worker_timestamp()
+            samples.push(t_done - t0, t1 - t0)
+        var rk = compute_stats(samples.kernel_ns, samples.n)
+        var rw = compute_stats(samples.wall_ns, samples.n)
+        print_row("workers=" + String(n) + " read", rk, rw, count * 2)
 
         if n < 4:
             n *= 2
@@ -517,6 +435,8 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[16] = 16777216
     sizes[17] = MAX_ELEMS
 
+    var samples = SampleBuffer(SAMPLES)
+
     for s in range(NUM_SIZES):
         var count = sizes[s]
         var rb = RankBuffers[DType.bfloat16, tp, immut](count=count)
@@ -528,25 +448,14 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
         for _ in range(WARMUP):
             dispatch_allreduce[BF16, tp](rb, db, pools)
 
-        var best_wall = Int(1 << 60)
-        var best_kernel = Int(1 << 60)
-        for _ in range(TRIALS):
-            var wall_sum = 0
-            var kernel_sum = 0
-            for _ in range(ITERS):
-                var t0 = Int(perf_counter_ns())
-                dispatch_allreduce[BF16, tp](rb, db, pools)
-                var t1 = Int(perf_counter_ns())
-                var t_done = max_last_ts[tp=tp](pools)
-                wall_sum += t1 - t0
-                kernel_sum += t_done - t0
-            keep(db[0][0])
-            var avg_wall = wall_sum // ITERS
-            var avg_kernel = kernel_sum // ITERS
-            if avg_wall < best_wall:
-                best_wall = avg_wall
-            if avg_kernel < best_kernel:
-                best_kernel = avg_kernel
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            dispatch_allreduce[BF16, tp](rb, db, pools)
+            var t1 = now_ns()
+            var t_done = max_last_ts[tp=tp](pools)
+            samples.push(t_done - t0, t1 - t0)
+        keep(db[0][0])
 
         var total_bytes = count * 2 * tp * 2
         var sz_kb = count * 2 // 1024
@@ -555,7 +464,9 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
             label = "allreduce " + String(sz_kb) + "KB"
         else:
             label = "allreduce " + String(sz_kb // 1024) + "MB"
-        print_bw_split(label, total_bytes, best_kernel, best_wall)
+        var ks = compute_stats(samples.kernel_ns, samples.n)
+        var ws = compute_stats(samples.wall_ns, samples.n)
+        print_row(label, ks, ws, total_bytes)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](

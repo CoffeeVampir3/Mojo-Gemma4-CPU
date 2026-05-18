@@ -1,6 +1,5 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.time import perf_counter_ns
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
@@ -12,12 +11,15 @@ from kernels.rope import (
     rope_head, dispatch_rope_cache_write,
     init_rope_table, init_rope_table_partial_strided,
 )
+from benchmarks.bench_harness import (
+    SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
+    DEFAULT_SAMPLES,
+)
 
 
 comptime ALIGNMENT = 64
-comptime WARMUP = 5
-comptime TRIALS = 12
-comptime ITERS = 30
+comptime WARMUP = 30
+comptime SAMPLES = DEFAULT_SAMPLES
 
 comptime HEAD_DIM_SLIDING = 256
 comptime HEAD_DIM_FULL = 512
@@ -96,75 +98,43 @@ def init_full_tables_all[tp: Int](
             cos[r], sin[r], 1000000.0, HEAD_DIM_FULL, r, tp)
 
 
-def fmt_ns(ns: Int) -> String:
-    if ns < 1000:
-        return String(ns) + " ns"
-    elif ns < 1000000:
-        return String(ns // 1000) + "." + String((ns % 1000) // 100) + " us"
-    else:
-        return String(ns // 1000000) + "." + String((ns % 1000000) // 100000) + " ms"
-
-
-def fmt_bw(total_bytes: Int, ns: Int) -> String:
-    if ns <= 0:
-        return "inf GB/s"
-    var bw_100 = total_bytes * 100 // ns
-    return String(bw_100 // 100) + "." + String(bw_100 % 100) + " GB/s"
-
-
-def max_last_ts[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-) -> Int:
-    var hi = 0
-    for r in range(tp):
-        var ts = pools[r].last_worker_timestamp()
-        if ts > hi:
-            hi = ts
-    return hi
-
-
 def section_head_primitive(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr,
                            cos_fl: F32Ptr, sin_fl: F32Ptr):
     print("\n=== rope_head primitive (single head) ===")
 
+    var samples = SampleBuffer(SAMPLES)
+
     for _ in range(WARMUP):
         rope_head[HALF_SLIDING, HALF_SLIDING](data, cos_sl, sin_sl)
-    var best_sl = Int(1 << 60)
-    for _ in range(TRIALS):
-        var elapsed = 0
-        for _ in range(ITERS * 10):
-            var t0 = Int(perf_counter_ns())
-            rope_head[HALF_SLIDING, HALF_SLIDING](data, cos_sl, sin_sl)
-            var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // (ITERS * 10)
-        if avg < best_sl:
-            best_sl = avg
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        rope_head[HALF_SLIDING, HALF_SLIDING](data, cos_sl, sin_sl)
+        var t1 = now_ns()
+        samples.push(t1 - t0, t1 - t0)
     keep(data[0])
-    print("  sliding (256 dim, full rot):  " + fmt_ns(best_sl)
-        + "  (" + fmt_bw(HEAD_DIM_SLIDING * 2 + HALF_SLIDING * 4 * 2, best_sl) + " r+w+cos+sin)")
+    var ks_sl = compute_stats(samples.kernel_ns, samples.n)
+    var ws_sl = compute_stats(samples.wall_ns, samples.n)
+    print_row("sliding (256 dim, full rot)", ks_sl, ws_sl,
+        HEAD_DIM_SLIDING * 2 + HALF_SLIDING * 4 * 2)
 
     for _ in range(WARMUP):
         rope_head[HALF_FULL, HEAD_DIM_FULL // 2](data, cos_fl, sin_fl)
-    var best_fl = Int(1 << 60)
-    for _ in range(TRIALS):
-        var elapsed = 0
-        for _ in range(ITERS * 10):
-            var t0 = Int(perf_counter_ns())
-            rope_head[HALF_FULL, HEAD_DIM_FULL // 2](data, cos_fl, sin_fl)
-            var t1 = Int(perf_counter_ns())
-            elapsed += t1 - t0
-        var avg = elapsed // (ITERS * 10)
-        if avg < best_fl:
-            best_fl = avg
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        rope_head[HALF_FULL, HEAD_DIM_FULL // 2](data, cos_fl, sin_fl)
+        var t1 = now_ns()
+        samples.push(t1 - t0, t1 - t0)
     keep(data[0])
-    print("  full (512 dim, 128 partial):  " + fmt_ns(best_fl)
-        + "  (" + fmt_bw(HALF_FULL * 2 * 2 + HALF_FULL * 4 * 2, best_fl) + " rotated portion)")
+    var ks_fl = compute_stats(samples.kernel_ns, samples.n)
+    var ws_fl = compute_stats(samples.wall_ns, samples.n)
+    print_row("full (512 dim, 128 partial)", ks_fl, ws_fl,
+        HALF_FULL * 2 * 2 + HALF_FULL * 4 * 2)
 
 
 def section_token_scaling(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr):
     print("\n=== rope_head loop: head count scaling (sliding, single pos) ===")
-    print("  heads | time         | bytes touched | BW")
 
     comptime NUM_SIZES = 5
     var head_counts = InlineArray[Int, NUM_SIZES](fill=0)
@@ -174,6 +144,8 @@ def section_token_scaling(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr):
     head_counts[3] = 8
     head_counts[4] = 16
 
+    var samples = SampleBuffer(SAMPLES)
+
     for s in range(NUM_SIZES):
         var nh = head_counts[s]
 
@@ -182,30 +154,23 @@ def section_token_scaling(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr):
                 rope_head[HALF_SLIDING, HALF_SLIDING](
                     data + h * HEAD_DIM_SLIDING, cos_sl, sin_sl)
 
-        var best = Int(1 << 60)
-        for _ in range(TRIALS):
-            var elapsed = 0
-            for _ in range(ITERS * 10):
-                var t0 = Int(perf_counter_ns())
-                for h in range(nh):
-                    rope_head[HALF_SLIDING, HALF_SLIDING](
-                        data + h * HEAD_DIM_SLIDING, cos_sl, sin_sl)
-                var t1 = Int(perf_counter_ns())
-                elapsed += t1 - t0
-            var avg = elapsed // (ITERS * 10)
-            if avg < best:
-                best = avg
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            for h in range(nh):
+                rope_head[HALF_SLIDING, HALF_SLIDING](
+                    data + h * HEAD_DIM_SLIDING, cos_sl, sin_sl)
+            var t1 = now_ns()
+            samples.push(t1 - t0, t1 - t0)
         keep(data[0])
 
         var data_bytes = nh * HEAD_DIM_SLIDING * 2
-        var pad = "  " if nh < 10 else " "
-        print("  " + String(nh) + pad
-            + "    | " + fmt_ns(best)
-            + " | " + String(data_bytes)
-            + "         | " + fmt_bw(data_bytes * 2, best))
+        var ks = compute_stats(samples.kernel_ns, samples.n)
+        var ws = compute_stats(samples.wall_ns, samples.n)
+        print_row("heads=" + String(nh), ks, ws, data_bytes * 2)
 
 
-def measure_sliding_cache_write[
+def section_sliding_cache_write[
     P: BurstThreadPool, //, tp: Int,
 ](
     mut pools: HeapMoveArray[P],
@@ -213,7 +178,7 @@ def measure_sliding_cache_write[
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_sl: F32Ptr, sin_sl: F32Ptr,
     bases: ArenaBases[tp],
-) -> Tuple[Int, Int]:
+):
     comptime Q_ROWS = Q_DIM_SLIDING // tp
     comptime KV_ROWS = KV_DIM_SLIDING // tp
     comptime NUM_Q = Q_ROWS // HEAD_DIM_SLIDING
@@ -235,34 +200,28 @@ def measure_sliding_cache_write[
             slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
         ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
 
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_rope_cache_write[
-                half=HALF_SLIDING, pair_stride=HEAD_DIM_SLIDING // 2,
-                num_q=NUM_Q, num_kv=NUM_KV,
-                head_dim=HEAD_DIM_SLIDING, kv_cache_stride=KV_ROWS,
-                slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
-            ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
+    var samples = SampleBuffer(SAMPLES)
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_rope_cache_write[
+            half=HALF_SLIDING, pair_stride=HEAD_DIM_SLIDING // 2,
+            num_q=NUM_Q, num_kv=NUM_KV,
+            head_dim=HEAD_DIM_SLIDING, kv_cache_stride=KV_ROWS,
+            slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
+        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(q[0])
-    return (best_kernel, best_wall)
+
+    var ks_stats = compute_stats(samples.kernel_ns, samples.n)
+    var ws_stats = compute_stats(samples.wall_ns, samples.n)
+    var sl_bytes = (Q_DIM_SLIDING // tp + 2 * (KV_DIM_SLIDING // tp)) * 2
+    print_row("sliding", ks_stats, ws_stats, sl_bytes)
 
 
-def measure_full_cache_write[
+def section_full_cache_write[
     P: BurstThreadPool, //, tp: Int,
 ](
     mut pools: HeapMoveArray[P],
@@ -270,7 +229,7 @@ def measure_full_cache_write[
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_fl: F32Ptr, sin_fl: F32Ptr,
     bases: ArenaBases[tp],
-) -> Tuple[Int, Int]:
+):
     comptime Q_ROWS = Q_DIM_FULL // tp
     comptime NUM_Q = Q_ROWS // HEAD_DIM_FULL
     comptime NUM_KV = KV_DIM_FULL // HEAD_DIM_FULL
@@ -296,31 +255,25 @@ def measure_full_cache_write[
             slot_mask=-1, cache_degree=tp, tp=tp,
         ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
 
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_rope_cache_write[
-                half=HALF_FULL, pair_stride=HEAD_DIM_FULL // 2,
-                num_q=NUM_Q, num_kv=NUM_KV,
-                head_dim=HEAD_DIM_FULL, kv_cache_stride=KV_DIM_FULL,
-                slot_mask=-1, cache_degree=tp, tp=tp,
-            ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
+    var samples = SampleBuffer(SAMPLES)
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_rope_cache_write[
+            half=HALF_FULL, pair_stride=HEAD_DIM_FULL // 2,
+            num_q=NUM_Q, num_kv=NUM_KV,
+            head_dim=HEAD_DIM_FULL, kv_cache_stride=KV_DIM_FULL,
+            slot_mask=-1, cache_degree=tp, tp=tp,
+        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
+        var t1 = now_ns()
+        var t_done = max_last_ts[tp=tp](pools)
+        samples.push(t_done - t0, t1 - t0)
     keep(q[0])
-    return (best_kernel, best_wall)
+
+    var ks_stats = compute_stats(samples.kernel_ns, samples.n)
+    var ws_stats = compute_stats(samples.wall_ns, samples.n)
+    var fl_bytes = (Q_DIM_FULL // tp + 2 * KV_DIM_FULL) * 2
+    print_row("full", ks_stats, ws_stats, fl_bytes)
 
 
 def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
@@ -335,21 +288,12 @@ def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
     print("\n=== dispatch_rope_cache_write model path (seq_len=1, TP="
         + String(tp) + ") ===")
 
-    var sliding = measure_sliding_cache_write[tp=tp](
+    section_sliding_cache_write[tp=tp](
         pools, sliding_q, sliding_k, sliding_v,
         sliding_k_cache, sliding_v_cache, cos_sl, sin_sl, bases)
-    var full = measure_full_cache_write[tp=tp](
+    section_full_cache_write[tp=tp](
         pools, full_q, full_k, full_v,
         full_k_cache, full_v_cache, cos_fl, sin_fl, bases)
-
-    comptime SL_BYTES = (Q_DIM_SLIDING // tp + 2 * (KV_DIM_SLIDING // tp)) * 2
-    comptime FL_BYTES = (Q_DIM_FULL // tp + 2 * KV_DIM_FULL) * 2
-    print("  sliding: kernel=" + fmt_ns(sliding[0])
-        + " | wall=" + fmt_ns(sliding[1])
-        + "  (" + fmt_bw(SL_BYTES, sliding[0]) + " q/k/v touch)")
-    print("  full:    kernel=" + fmt_ns(full[0])
-        + " | wall=" + fmt_ns(full[1])
-        + "  (" + fmt_bw(FL_BYTES, full[0]) + " q/k/v touch)")
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](

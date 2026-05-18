@@ -1,6 +1,5 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
-from std.time import perf_counter_ns
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
@@ -12,12 +11,15 @@ from kernels.helpers import (
     OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
     Binding, ArenaBases,
 )
+from benchmarks.bench_harness import (
+    SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
+    DEFAULT_SAMPLES,
+)
 
 
 comptime ALIGNMENT = 64
-comptime WARMUP = 50
-comptime TRIALS = 30
-comptime ITERS = 100
+comptime WARMUP = 30
+comptime SAMPLES = DEFAULT_SAMPLES
 comptime MAX_SOURCES = 128
 comptime FORCE_INLINE = 1 << 30
 
@@ -102,106 +104,6 @@ def source_counts[tp: Int](num_sources: Int) -> InlineArray[Int, tp]:
     return InlineArray[Int, tp](fill=num_sources)
 
 
-def fmt_ns(ns: Int) -> String:
-    if ns < 1000:
-        return String(ns) + " ns"
-    elif ns < 1000000:
-        return String(ns // 1000) + "." + String((ns % 1000) // 100) + " us"
-    else:
-        return String(ns // 1000000) + "." + String((ns % 1000000) // 100000) + " ms"
-
-
-def max_last_ts[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-) -> Int:
-    var hi = 0
-    for r in range(tp):
-        var ts = pools[r].last_worker_timestamp()
-        if ts > hi:
-            hi = ts
-    return hi
-
-
-@fieldwise_init
-struct MergeTiming(Copyable, ImplicitlyCopyable):
-    var kernel_ns: Int
-    var wall_ns: Int
-
-
-def measure_finalize[
-    P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
-](
-    output: BF16Ptr, partials: F32Ptr, scratch: F32Ptr,
-    num_sources: Int, mut pools: HeapMoveArray[P], bases: ArenaBases[tp],
-) -> MergeTiming:
-    warm_pool(scratch, pools[0])
-    for _ in range(WARMUP):
-        dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-            Binding[BFloat16, tp](output, bases),
-            Binding[Float32, tp](partials, bases),
-            source_counts[tp](num_sources), pools,
-            inline_max_bytes=0)
-        keep(output[0])
-
-    var best_wall = Int(1 << 60)
-    var best_kernel = Int(1 << 60)
-    for _ in range(TRIALS):
-        var wall_sum = 0
-        var kernel_sum = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-                Binding[BFloat16, tp](output, bases),
-                Binding[Float32, tp](partials, bases),
-                source_counts[tp](num_sources), pools,
-                inline_max_bytes=0)
-            var t1 = Int(perf_counter_ns())
-            var t_done = max_last_ts[tp=tp](pools)
-            keep(output[0])
-            wall_sum += t1 - t0
-            kernel_sum += t_done - t0
-        var avg_wall = wall_sum // ITERS
-        var avg_kernel = kernel_sum // ITERS
-        if avg_wall < best_wall:
-            best_wall = avg_wall
-        if avg_kernel < best_kernel:
-            best_kernel = avg_kernel
-    return MergeTiming(best_kernel, best_wall)
-
-
-def measure_finalize_inline[
-    P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
-](
-    output: BF16Ptr, partials: F32Ptr, scratch: F32Ptr,
-    num_sources: Int, mut pools: HeapMoveArray[P], bases: ArenaBases[tp],
-) -> Int:
-    warm_pool(scratch, pools[0])
-    for _ in range(WARMUP):
-        dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-            Binding[BFloat16, tp](output, bases),
-            Binding[Float32, tp](partials, bases),
-            source_counts[tp](num_sources), pools,
-            inline_max_bytes=FORCE_INLINE)
-        keep(output[0])
-
-    var best = Int(1 << 60)
-    for _ in range(TRIALS):
-        var elapsed = 0
-        for _ in range(ITERS):
-            var t0 = Int(perf_counter_ns())
-            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
-                Binding[BFloat16, tp](output, bases),
-                Binding[Float32, tp](partials, bases),
-                source_counts[tp](num_sources), pools,
-                inline_max_bytes=FORCE_INLINE)
-            keep(output[0])
-            elapsed += Int(perf_counter_ns()) - t0
-        var avg = elapsed // ITERS
-        if avg < best:
-            best = avg
-    return best
-
-
 def run_config[
     P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
 ](
@@ -222,42 +124,68 @@ def run_config[
 
     print("\n=== head_dim=" + String(head_dim) + " num_q=" + String(num_q)
         + " pool_capacity=" + String(pools[0].get_capacity()) + " ===")
-    print("  sources | data     | inline     | kernel     | wall       -> best")
 
     var counts = InlineArray[Int, 7](fill=0)
     counts[0] = 2; counts[1] = 4; counts[2] = 8
     counts[3] = 16; counts[4] = 32; counts[5] = 64
     counts[6] = 128
 
+    var samples = SampleBuffer(SAMPLES)
+
     for s in range(7):
         var ns = counts[s]
         var data_bytes = ns * (head_dim + 2) * 4 * num_q
 
-        var t_inline = measure_finalize_inline[head_dim, num_q, tp](
-            output, partials, scratch, ns, pools, bases)
+        warm_pool(scratch, pools[0])
+        for _ in range(WARMUP):
+            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+                Binding[BFloat16, tp](output, bases),
+                Binding[Float32, tp](partials, bases),
+                source_counts[tp](ns), pools,
+                inline_max_bytes=FORCE_INLINE)
+            keep(output[0])
 
-        var t_dispatched = measure_finalize[head_dim, num_q, tp](
-            output, partials, scratch, ns, pools, bases)
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+                Binding[BFloat16, tp](output, bases),
+                Binding[Float32, tp](partials, bases),
+                source_counts[tp](ns), pools,
+                inline_max_bytes=FORCE_INLINE)
+            var t1 = now_ns()
+            samples.push(t1 - t0, t1 - t0)
+        keep(output[0])
 
-        var line = "  " + String(ns)
-        if ns < 100:
-            line += " " * (8 - String(ns).byte_length())
-        else:
-            line += " " * (7 - String(ns).byte_length())
-        line += "| " + String(data_bytes // 1024) + "KB"
-        var kb_str = String(data_bytes // 1024)
-        line += " " * (7 - kb_str.byte_length())
-        line += "| " + fmt_ns(t_inline)
-        line += " " * max(0, 11 - fmt_ns(t_inline).byte_length())
-        line += "| " + fmt_ns(t_dispatched.kernel_ns)
-        line += " " * max(0, 11 - fmt_ns(t_dispatched.kernel_ns).byte_length())
-        line += "| " + fmt_ns(t_dispatched.wall_ns)
-        line += " " * max(0, 11 - fmt_ns(t_dispatched.wall_ns).byte_length())
+        var iks = compute_stats(samples.kernel_ns, samples.n)
+        var iws = compute_stats(samples.wall_ns, samples.n)
+        print_row("sources=" + String(ns) + " inline", iks, iws, data_bytes)
 
-        var best_label = "inline" if t_inline <= t_dispatched.kernel_ns else "dispatched"
-        line += "-> " + best_label
+        warm_pool(scratch, pools[0])
+        for _ in range(WARMUP):
+            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+                Binding[BFloat16, tp](output, bases),
+                Binding[Float32, tp](partials, bases),
+                source_counts[tp](ns), pools,
+                inline_max_bytes=0)
+            keep(output[0])
 
-        print(line)
+        samples.clear()
+        for _ in range(SAMPLES):
+            var t0 = now_ns()
+            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+                Binding[BFloat16, tp](output, bases),
+                Binding[Float32, tp](partials, bases),
+                source_counts[tp](ns), pools,
+                inline_max_bytes=0)
+            var t1 = now_ns()
+            var t_done = max_last_ts[tp=tp](pools)
+            samples.push(t_done - t0, t1 - t0)
+        keep(output[0])
+
+        var dks = compute_stats(samples.kernel_ns, samples.n)
+        var dws = compute_stats(samples.wall_ns, samples.n)
+        print_row("sources=" + String(ns) + " dispatched", dks, dws, data_bytes)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](

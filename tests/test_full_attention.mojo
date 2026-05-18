@@ -3,7 +3,9 @@ from std.memory import Span, UnsafePointer, alloc
 from std.os import abort
 from std.sys.info import simd_width_of
 
-from kernels.full_attention import dispatch_full_attention, FullAttentionKernel
+from kernels.flash_attention import (
+    dispatch_full_attention, FlashAttentionKernel, LinearKV,
+)
 from kernels.logsum_merge import dispatch_merge_context_flash_partials
 from kernels.helpers import Binding, ArenaBases
 from notstdcollections import HeapMoveArray
@@ -17,8 +19,8 @@ comptime LOCAL_Q = GLOBAL_Q // TP
 comptime NUM_KV = 2
 comptime GLOBAL_GQA = GLOBAL_Q // NUM_KV
 comptime KV_STRIDE = NUM_KV * HEAD_DIM
-comptime PSTRIDE = FullAttentionKernel[
-    HEAD_DIM, GLOBAL_Q, GLOBAL_GQA, KV_STRIDE,
+comptime PSTRIDE = FlashAttentionKernel[
+    LinearKV, HEAD_DIM, GLOBAL_Q, GLOBAL_GQA, KV_STRIDE,
 ].PARTIAL_STRIDE
 
 
