@@ -180,12 +180,15 @@ def dispatch_rms_norm_qkv_heads[
     v_dst: Binding[BFloat16, tp],
     q_weight: Binding[BFloat16, tp],
     k_weight: Binding[BFloat16, tp],
+    seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    comptime total = num_q + num_kv + num_kv
-    comptime VK = ScaledNormKernel[head_dim, sqrt_n, n_eps, False, num_kv, total]
-    comptime QK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_q, total]
-    comptime KK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_kv, total]
+    if seq_len <= 0:
+        return
+    comptime heads_per_token = num_q + num_kv + num_kv
+    comptime VK = ScaledNormKernel[head_dim, sqrt_n, n_eps, False, num_kv, heads_per_token]
+    comptime QK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_q, heads_per_token]
+    comptime KK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_kv, heads_per_token]
     comptime VQChain = Chain[VK, QK]
     comptime VQKChain = Chain[VQChain, KK]
 
@@ -199,6 +202,7 @@ def dispatch_rms_norm_qkv_heads[
             KK(k_src[r], k_dst[r], k_weight[r], 0, 0),
         )
 
+    var total = seq_len * heads_per_token
     fanout_dispatch[
         tp, make,
         max_worker_count=max_worker_count,

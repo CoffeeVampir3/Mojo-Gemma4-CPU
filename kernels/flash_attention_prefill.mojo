@@ -1,0 +1,475 @@
+from std.collections import InlineArray
+from std.memory import UnsafePointer
+
+from simd_math import fast_exp_softmax_biased
+from threading.threading_traits import BurstThreadPool
+from notstdcollections import HeapMoveArray
+from .helpers import (
+    BF16Ptr, F32Ptr, W,
+    RangePartitionedKernel, WorkerRangePartitionedKernel,
+    fanout_dispatch, Binding,
+    accumulate_scaled, scale_unrolled,
+)
+from .attention_ops import score_position, flash_partial_stride
+from .logsum_merge import MergeSegment, write_finalized_head
+from .flash_attention import TILE
+
+
+@always_inline
+def full_local_kv_count(rank: Int, abs_pos: Int, degree: Int) -> Int:
+    if abs_pos < 0:
+        return 0
+    if rank <= abs_pos % degree:
+        return abs_pos // degree + 1
+    return abs_pos // degree
+
+
+@fieldwise_init
+struct FlashPrefillSlidingKernel[
+    head_dim: Int, num_q: Int, gqa_ratio: Int,
+    kv_stride: Int, window: Int,
+](WorkerRangePartitionedKernel):
+    """Sliding-window prefill: each worker owns a contiguous Q-token
+    range and scans the per-Q `[max(0, pos - W + 1), pos]` window of the
+    ring KV cache (head-sharded across ranks, so no cross-rank merge).
+    Per-Q (acc, m, l) state lives in a worker-private scratch slice; the
+    finalized row is written straight to `output`."""
+
+    comptime SCRATCH_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
+
+    var q: BF16Ptr
+    var k_base: BF16Ptr
+    var v_base: BF16Ptr
+    var output: BF16Ptr
+    var worker_scratch: F32Ptr
+    var base_pos: Int
+    var worker_id: Int
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        comptime q_stride = Self.num_q * Self.head_dim
+        comptime slot_mask = Self.window - 1
+
+        var scratch = self.worker_scratch \
+                     + self.worker_id * Self.SCRATCH_STRIDE
+        var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
+        var q_ptrs = InlineArray[BF16Ptr, Self.num_q](uninitialized=True)
+        comptime for h in range(Self.num_q):
+            acc_ptrs[h] = scratch + h * Self.head_dim
+
+        for t in range(self.start, self.end):
+            var abs_pos = self.base_pos + t
+            var lo = max(0, abs_pos - Self.window + 1)
+            var hi = abs_pos + 1
+
+            var q_tok = self.q + t * q_stride
+            var out_tok = self.output + t * q_stride
+
+            var m = InlineArray[Float32, Self.num_q](fill=Float32(-1e30))
+            var l = InlineArray[Float32, Self.num_q](fill=Float32(0))
+            comptime for h in range(Self.num_q):
+                q_ptrs[h] = q_tok + h * Self.head_dim
+                for j in range(0, Self.head_dim, W):
+                    (acc_ptrs[h] + j).store(SIMD[DType.float32, W](0))
+
+            var pos = lo
+            while pos < hi:
+                var tile_len = min(TILE, hi - pos)
+
+                comptime for q_idx in range(Self.num_q):
+                    comptime kv_h = q_idx // Self.gqa_ratio
+
+                    var scores = SIMD[DType.float32, TILE](-1e30)
+                    for tt in range(tile_len):
+                        var slot = (pos + tt) & slot_mask
+                        var k_head = self.k_base \
+                                    + slot * Self.kv_stride \
+                                    + kv_h * Self.head_dim
+                        scores[tt] = score_position[Self.head_dim](
+                            q_ptrs[q_idx], k_head)
+
+                    var tile_max = scores.reduce_max()
+                    var m_new = tile_max if tile_max > m[q_idx] \
+                                else m[q_idx]
+
+                    var bias_x = max(
+                        SIMD[DType.float32, 1](-87.0),
+                        SIMD[DType.float32, 1](m[q_idx] - m_new))
+                    var corr = fast_exp_softmax_biased[1](bias_x)[0]
+                    var weights_x = max(
+                        SIMD[DType.float32, TILE](-87.0),
+                        scores - SIMD[DType.float32, TILE](m_new))
+                    var weights = fast_exp_softmax_biased[TILE](weights_x)
+
+                    scale_unrolled[cols=Self.head_dim](
+                        acc_ptrs[q_idx], corr)
+                    l[q_idx] = l[q_idx] * corr + weights.reduce_add()
+                    m[q_idx] = m_new
+
+                    for tt in range(tile_len):
+                        var slot = (pos + tt) & slot_mask
+                        var v_head = self.v_base \
+                                    + slot * Self.kv_stride \
+                                    + kv_h * Self.head_dim
+                        accumulate_scaled[cols=Self.head_dim](
+                            v_head, weights[tt], acc_ptrs[q_idx])
+
+                pos += TILE
+
+            comptime for h in range(Self.num_q):
+                if l[h] > 0:
+                    var inv_l = SIMD[DType.float32, W](
+                        Float32(1.0) / l[h])
+                    for j in range(0, Self.head_dim, W):
+                        var v = (acc_ptrs[h] + j).load[width=W]() * inv_l
+                        (out_tok + h * Self.head_dim + j).store(
+                            v.cast[DType.bfloat16]())
+                else:
+                    for j in range(0, Self.head_dim, W):
+                        (out_tok + h * Self.head_dim + j).store(
+                            SIMD[DType.bfloat16, W](0))
+
+    @always_inline
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
+        self.worker_id = worker_id
+        self.start = start
+        self.end = end
+
+
+def dispatch_flash_prefill_sliding_chunk[
+    P: BurstThreadPool, //,
+    head_dim: Int, num_q: Int, gqa_ratio: Int,
+    kv_stride: Int, window: Int, tp: Int,
+    max_worker_count: Int = 128,
+](
+    q: Binding[BFloat16, tp],
+    k_base: Binding[BFloat16, tp],
+    v_base: Binding[BFloat16, tp],
+    output: Binding[BFloat16, tp],
+    worker_scratch: Binding[Float32, tp],
+    base_pos: Int, chunk_len: Int,
+    mut pools: HeapMoveArray[P],
+):
+    if chunk_len <= 0:
+        return
+    comptime K = FlashPrefillSlidingKernel[
+        head_dim, num_q, gqa_ratio, kv_stride, window,
+    ]
+
+    @parameter
+    def make(r: Int) -> K:
+        return K(q[r], k_base[r], v_base[r], output[r],
+                 worker_scratch[r], base_pos, 0, 0, 0)
+
+    var per_q_kv = window if chunk_len > window else chunk_len
+    var data_bytes = chunk_len * per_q_kv * kv_stride * 2
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, chunk_len, data_bytes)
+
+
+def dispatch_flash_prefill_sliding[
+    P: BurstThreadPool, //,
+    head_dim: Int, num_q: Int, gqa_ratio: Int,
+    kv_stride: Int, window: Int, tp: Int,
+    chunk_size: Int = 4096,
+    max_worker_count: Int = 128,
+](
+    q: Binding[BFloat16, tp],
+    k_base: Binding[BFloat16, tp],
+    v_base: Binding[BFloat16, tp],
+    output: Binding[BFloat16, tp],
+    worker_scratch: Binding[Float32, tp],
+    base_pos: Int, seq_len: Int,
+    mut pools: HeapMoveArray[P],
+):
+    """Sliding-window prefill orchestrator: walks `seq_len` Q-tokens in
+    contiguous slabs of comptime-fixed `chunk_size`. The per-worker
+    scratch is bounded by `max_worker_count * SCRATCH_STRIDE` regardless
+    of `seq_len`; sliding has no cross-rank merge so each chunk writes
+    final output directly into `output[chunk_start : chunk_start +
+    chunk_len, :]` and the next chunk reuses the same scratch."""
+    if seq_len <= 0:
+        return
+    comptime q_stride = num_q * head_dim
+    var done = 0
+    while done < seq_len:
+        var chunk_len = min(chunk_size, seq_len - done)
+        dispatch_flash_prefill_sliding_chunk[
+            head_dim=head_dim, num_q=num_q, gqa_ratio=gqa_ratio,
+            kv_stride=kv_stride, window=window, tp=tp,
+            max_worker_count=max_worker_count,
+        ](
+            q.shifted(done * q_stride),
+            k_base, v_base,
+            output.shifted(done * q_stride),
+            worker_scratch,
+            base_pos + done, chunk_len, pools,
+        )
+        done += chunk_len
+
+
+@fieldwise_init
+struct FlashPrefillFullKernel[
+    head_dim: Int, num_q: Int, gqa_ratio: Int,
+    kv_stride: Int, degree: Int,
+](RangePartitionedKernel):
+    """Full-attention prefill on a position-sharded KV cache: each
+    worker owns a Q-token range, walks this rank's `pos // degree` local
+    KV slice with causal upper bound, and writes one (acc, m, l) partial
+    per (Q-token, head) into `partials_out`. The cross-rank
+    `dispatch_merge_flash_prefill_partials` then folds the `degree`
+    partials per (Q-token, local head) via logsum into the final O."""
+
+    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
+
+    var q: BF16Ptr
+    var k_base: BF16Ptr
+    var v_base: BF16Ptr
+    var partials_out: F32Ptr
+    var base_pos: Int
+    var rank: Int
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        comptime q_stride = Self.num_q * Self.head_dim
+        comptime m_off = Self.num_q * Self.head_dim
+        comptime l_off = m_off + Self.num_q
+
+        var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
+        var q_ptrs = InlineArray[BF16Ptr, Self.num_q](uninitialized=True)
+
+        for t in range(self.start, self.end):
+            var abs_pos = self.base_pos + t
+            var local_kv_count = full_local_kv_count(
+                self.rank, abs_pos, Self.degree)
+
+            var partial_tok = self.partials_out \
+                             + t * Self.PARTIAL_STRIDE
+            var q_tok = self.q + t * q_stride
+
+            var m = InlineArray[Float32, Self.num_q](fill=Float32(-1e30))
+            var l = InlineArray[Float32, Self.num_q](fill=Float32(0))
+
+            comptime for h in range(Self.num_q):
+                acc_ptrs[h] = partial_tok + h * Self.head_dim
+                q_ptrs[h] = q_tok + h * Self.head_dim
+                for j in range(0, Self.head_dim, W):
+                    (acc_ptrs[h] + j).store(SIMD[DType.float32, W](0))
+
+            var pos = 0
+            while pos < local_kv_count:
+                var tile_len = min(TILE, local_kv_count - pos)
+
+                comptime for q_idx in range(Self.num_q):
+                    comptime kv_h = q_idx // Self.gqa_ratio
+
+                    var scores = SIMD[DType.float32, TILE](-1e30)
+                    for tt in range(tile_len):
+                        var k_head = self.k_base \
+                                    + (pos + tt) * Self.kv_stride \
+                                    + kv_h * Self.head_dim
+                        scores[tt] = score_position[Self.head_dim](
+                            q_ptrs[q_idx], k_head)
+
+                    var tile_max = scores.reduce_max()
+                    var m_new = tile_max if tile_max > m[q_idx] \
+                                else m[q_idx]
+
+                    var bias_x = max(
+                        SIMD[DType.float32, 1](-87.0),
+                        SIMD[DType.float32, 1](m[q_idx] - m_new))
+                    var corr = fast_exp_softmax_biased[1](bias_x)[0]
+                    var weights_x = max(
+                        SIMD[DType.float32, TILE](-87.0),
+                        scores - SIMD[DType.float32, TILE](m_new))
+                    var weights = fast_exp_softmax_biased[TILE](weights_x)
+
+                    scale_unrolled[cols=Self.head_dim](
+                        acc_ptrs[q_idx], corr)
+                    l[q_idx] = l[q_idx] * corr + weights.reduce_add()
+                    m[q_idx] = m_new
+
+                    for tt in range(tile_len):
+                        var v_head = self.v_base \
+                                    + (pos + tt) * Self.kv_stride \
+                                    + kv_h * Self.head_dim
+                        accumulate_scaled[cols=Self.head_dim](
+                            v_head, weights[tt], acc_ptrs[q_idx])
+
+                pos += TILE
+
+            comptime for h in range(Self.num_q):
+                (partial_tok + m_off + h)[] = m[h]
+                (partial_tok + l_off + h)[] = l[h]
+
+    @always_inline
+    def install_range(mut self, start: Int, end: Int):
+        self.start = start
+        self.end = end
+
+
+def dispatch_flash_prefill_full_chunk[
+    P: BurstThreadPool, //,
+    head_dim: Int, num_q: Int, gqa_ratio: Int,
+    kv_stride: Int, tp: Int,
+    max_worker_count: Int = 128,
+](
+    q: Binding[BFloat16, tp],
+    k_base: Binding[BFloat16, tp],
+    v_base: Binding[BFloat16, tp],
+    partials_out: Binding[Float32, tp],
+    base_pos: Int, chunk_len: Int,
+    mut pools: HeapMoveArray[P],
+):
+    if chunk_len <= 0:
+        return
+    comptime K = FlashPrefillFullKernel[
+        head_dim, num_q, gqa_ratio, kv_stride, tp,
+    ]
+
+    @parameter
+    def make(r: Int) -> K:
+        return K(q[r], k_base[r], v_base[r], partials_out[r],
+                 base_pos, r, 0, 0)
+
+    var avg_local_kv = (base_pos + chunk_len // 2) // tp + 1
+    var data_bytes = chunk_len * avg_local_kv * kv_stride * 2
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, chunk_len, data_bytes)
+
+
+def dispatch_flash_prefill_full[
+    P: BurstThreadPool, //,
+    head_dim: Int, num_q: Int, local_num_q: Int, gqa_ratio: Int,
+    kv_stride: Int, tp: Int,
+    chunk_size: Int = 4096,
+    max_worker_count: Int = 128,
+](
+    q: Binding[BFloat16, tp],
+    k_base: Binding[BFloat16, tp],
+    v_base: Binding[BFloat16, tp],
+    output: Binding[BFloat16, tp],
+    partials_scratch: Binding[Float32, tp],
+    base_pos: Int, seq_len: Int,
+    mut pools: HeapMoveArray[P],
+):
+    """Full-attention prefill orchestrator: walks `seq_len` Q-tokens in
+    contiguous slabs of comptime-fixed `chunk_size`. Each iteration
+    runs the per-chunk flash kernel into `partials_scratch` (sized for
+    one chunk: `chunk_size * PARTIAL_STRIDE`) and immediately runs the
+    cross-rank merge that finalizes the column-sharded chunk slice of
+    `output`. The partials buffer is reused across chunks; `output` is
+    seq_len-sized and chunk k writes to its disjoint slice."""
+    if seq_len <= 0:
+        return
+    comptime q_stride = num_q * head_dim
+    comptime local_q_stride = local_num_q * head_dim
+    var done = 0
+    while done < seq_len:
+        var chunk_len = min(chunk_size, seq_len - done)
+        dispatch_flash_prefill_full_chunk[
+            head_dim=head_dim, num_q=num_q, gqa_ratio=gqa_ratio,
+            kv_stride=kv_stride, tp=tp,
+            max_worker_count=max_worker_count,
+        ](
+            q.shifted(done * q_stride),
+            k_base, v_base,
+            partials_scratch,
+            base_pos + done, chunk_len, pools,
+        )
+        dispatch_merge_flash_prefill_partials[
+            head_dim=head_dim, num_q=num_q,
+            local_num_q=local_num_q, tp=tp,
+            max_worker_count=max_worker_count,
+        ](
+            output.shifted(done * local_q_stride),
+            partials_scratch, chunk_len, pools,
+        )
+        done += chunk_len
+
+
+@fieldwise_init
+struct PrefillMergeConfig[head_dim: Int, num_q: Int, tp: Int]:
+    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
+
+    var output: Binding[BFloat16, Self.tp]
+    var partials: Binding[Float32, Self.tp]
+
+
+@fieldwise_init
+struct PrefillMergeKernel[
+    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
+    cfg_origin: Origin,
+](RangePartitionedKernel):
+    var config: UnsafePointer[
+        PrefillMergeConfig[Self.head_dim, Self.num_q, Self.tp],
+        Self.cfg_origin,
+    ]
+    var q_rank: Int
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        comptime PSTRIDE = PrefillMergeConfig[
+            Self.head_dim, Self.num_q, Self.tp,
+        ].PARTIAL_STRIDE
+        comptime out_stride = Self.local_num_q * Self.head_dim
+
+        for flat in range(self.start, self.end):
+            var t = flat // Self.local_num_q
+            var local_h = flat % Self.local_num_q
+            var global_h = self.q_rank * Self.local_num_q + local_h
+
+            var segs = InlineArray[MergeSegment, Self.tp](
+                uninitialized=True)
+            comptime for r in range(Self.tp):
+                segs[r] = MergeSegment(
+                    self.config[].partials[r] + t * PSTRIDE,
+                    PSTRIDE, 1)
+
+            var dst = self.config[].output[self.q_rank] \
+                      + t * out_stride + local_h * Self.head_dim
+            write_finalized_head[Self.head_dim, Self.num_q, Self.tp](
+                dst, segs, global_h)
+
+    @always_inline
+    def install_range(mut self, start: Int, end: Int):
+        self.start = start
+        self.end = end
+
+
+def dispatch_merge_flash_prefill_partials[
+    P: BurstThreadPool, //,
+    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
+    max_worker_count: Int = 128,
+](
+    output: Binding[BFloat16, tp],
+    partials: Binding[Float32, tp],
+    seq_len: Int,
+    mut pools: HeapMoveArray[P],
+):
+    if seq_len <= 0:
+        return
+
+    var cfg = PrefillMergeConfig[head_dim, num_q, tp](output, partials)
+    var config = UnsafePointer(to=cfg).as_immutable()
+    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
+    comptime K = PrefillMergeKernel[
+        head_dim, num_q, local_num_q, tp, cfg_ro,
+    ]
+
+    @parameter
+    def make(q_rank: Int) -> K:
+        return K(config, q_rank, 0, 0)
+
+    var total_units = seq_len * local_num_q
+    var data_bytes = total_units * tp * (head_dim + 2) * 4
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, total_units, data_bytes)

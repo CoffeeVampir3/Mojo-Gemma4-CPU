@@ -14,9 +14,8 @@ from kernels.reductions import (
 )
 from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
 from kernels.rmsnorm import fused_norm_residual_add
-from kernels.gemv import (
-    dispatch_gemv_chained_qkv, dispatch_gemv, dispatch_gemv_softcap,
-)
+from kernels.gemv import dispatch_gemv_softcap
+from kernels.gemm import dispatch_gemm, dispatch_gemm_chained_qkv
 from kernels.rope import dispatch_rope_cache_write
 from kernels.flash_attention import (
     dispatch_full_attention, dispatch_sliding_attention,
@@ -575,14 +574,14 @@ def dispatch_sliding_attention_qkv[
     var v_outs = k_outs.shifted(kv_rows)
     var xs = layout.activations.x_residual.state_binding(ctx)
 
-    dispatch_gemv_chained_qkv[
+    dispatch_gemm_chained_qkv[
         q_rows=q_rows, kv_rows=kv_rows, cols=C.HIDDEN, tp=degree,
         max_worker_count=max_worker_count,
     ](xs,
       attn.q_proj.binding(attn_ctx),
       attn.k_proj.binding(attn_ctx),
       attn.v_proj.binding(attn_ctx),
-      q_outs, k_outs, v_outs, pools)
+      q_outs, k_outs, v_outs, 1, pools)
 
     dispatch_rms_norm_qkv_heads[
         head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
@@ -591,7 +590,7 @@ def dispatch_sliding_attention_qkv[
     ](q_outs, q_outs, k_outs, k_outs, v_outs, v_outs,
       attn.q_norm.binding(attn_ctx),
       attn.k_norm.binding(attn_ctx),
-      pools)
+      1, pools)
 
     var kv_lb = layout.sliding_kv.base(ctx.arena_bases[0], layer_idx)
     var k_kv = layout.sliding_kv.proto.k.binding(kv_lb, ctx.arena_bases)
@@ -624,13 +623,13 @@ def dispatch_sliding_attention_qkv[
     ](
         q_outs, partials, nws, pools)
 
-    dispatch_gemv[
+    dispatch_gemm[
         rows=C.HIDDEN, cols=q_rows, tp=degree,
         max_worker_count=max_worker_count,
     ](
         q_outs,
         attn.o_proj.binding(attn_ctx),
-        xs, pools)
+        xs, 1, pools)
 
 
 def dispatch_full_attention_qkv[
@@ -666,16 +665,16 @@ def dispatch_full_attention_qkv[
     var v_outs = k_outs.shifted(k_rows)
     var xs = layout.activations.x_residual.state_binding(ctx)
 
-    dispatch_gemv[
+    dispatch_gemm[
         rows=q_rows, cols=C.HIDDEN, tp=degree,
         max_worker_count=max_worker_count,
     ](
-        xs, attn.q_proj.binding(attn_ctx), q_outs, pools)
-    dispatch_gemv[
+        xs, attn.q_proj.binding(attn_ctx), q_outs, 1, pools)
+    dispatch_gemm[
         rows=k_rows, cols=C.HIDDEN, tp=degree,
         max_worker_count=max_worker_count,
     ](
-        xs, attn.k_proj.binding(attn_ctx), k_outs, pools)
+        xs, attn.k_proj.binding(attn_ctx), k_outs, 1, pools)
 
     # Full attention has no v_proj; v reads from k's pre-norm buffer (chain runs V→Q→K).
     dispatch_rms_norm_qkv_heads[
@@ -685,7 +684,7 @@ def dispatch_full_attention_qkv[
     ](q_outs, q_outs, k_outs, k_outs, k_outs, v_outs,
       attn.q_norm.binding(attn_ctx),
       attn.k_norm.binding(attn_ctx),
-      pools)
+      1, pools)
 
     var owner_bases = ArenaBases[degree].fill(ctx.arena_bases[pos % degree])
     var rope_owner_ctx = BindContext[degree](
@@ -726,13 +725,13 @@ def dispatch_full_attention_qkv[
         max_worker_count=max_worker_count,
     ](q_local_outs, partials, nws, pools)
 
-    dispatch_gemv[
+    dispatch_gemm[
         rows=C.HIDDEN, cols=local_q_rows, tp=degree,
         max_worker_count=max_worker_count,
     ](
         q_local_outs,
         attn.o_proj.binding(attn_ctx),
-        xs, pools)
+        xs, 1, pools)
 
 
 def dispatch_moe[
@@ -836,15 +835,15 @@ def dispatch_ffn[
     ](x_main, x_residual,
       body.pre_ffn_norm.binding(ctx), seq_len, pools)
 
-    dispatch_gemv[
+    dispatch_gemm[
         rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
         max_worker_count=max_worker_count,
-    ](x_residual, body.gate_proj.binding(ctx), gate, pools)
+    ](x_residual, body.gate_proj.binding(ctx), gate, seq_len, pools)
 
-    dispatch_gemv[
+    dispatch_gemm[
         rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
         max_worker_count=max_worker_count,
-    ](x_residual, body.up_proj.binding(ctx), up, pools)
+    ](x_residual, body.up_proj.binding(ctx), up, seq_len, pools)
 
     dispatch_gelu_gate_up[
         intermediate=intermediate_per_rank, tp=degree,
@@ -854,10 +853,10 @@ def dispatch_ffn[
     dispatch_moe[degree=degree, max_worker_count=max_worker_count](
         body, ctx, x_main, x_residual, seq_len, scratch, pools)
 
-    dispatch_gemv[
+    dispatch_gemm[
         rows=C.HIDDEN, cols=intermediate_per_rank, tp=degree,
         max_worker_count=max_worker_count,
-    ](gate, body.down_proj.binding(ctx), dense_out, pools)
+    ](gate, body.down_proj.binding(ctx), dense_out, seq_len, pools)
 
     dispatch_allreduce_inplace[
         BF16, degree, max_worker_count=max_worker_count,
