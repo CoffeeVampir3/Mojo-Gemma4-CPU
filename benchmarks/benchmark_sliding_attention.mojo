@@ -6,10 +6,8 @@ from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.flash_attention import (
-    dispatch_sliding_attention, FlashAttentionKernel, RingKV,
-)
-from kernels.logsum_merge import dispatch_merge_flash_partials
+from kernels.flash_attention import FlashAttentionKernel, RingKV
+from kernels.attention_dispatch_kernels import dispatch_sliding_attention
 from kernels.helpers import Binding, ArenaBases
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -100,23 +98,21 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
         var pos = vl - 1
 
         for _ in range(WARMUP):
-            var nw = dispatch_sliding_attention[
+            dispatch_sliding_attention[
                 head_dim=HEAD_DIM, num_q=NUM_Q,
-                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
-                tp=tp](q, k_cache, v_cache, partials, pos, vl, pools)
-            dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
-                output, partials, nw, pools)
+                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
+                window=WINDOW, cache_size=WINDOW, tp=tp,
+            ](q, k_cache, v_cache, output, partials, pos, 1, pools)
             keep(output[0][0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            var nw = dispatch_sliding_attention[
+            dispatch_sliding_attention[
                 head_dim=HEAD_DIM, num_q=NUM_Q,
-                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
-                tp=tp](q, k_cache, v_cache, partials, pos, vl, pools)
-            dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
-                output, partials, nw, pools)
+                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
+                window=WINDOW, cache_size=WINDOW, tp=tp,
+            ](q, k_cache, v_cache, output, partials, pos, 1, pools)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
@@ -140,12 +136,11 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     comptime VL = 64
     var pos = VL - 1
 
-    var nw = dispatch_sliding_attention[
+    dispatch_sliding_attention[
         head_dim=HEAD_DIM, num_q=NUM_Q,
-        gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE, window=WINDOW,
-        tp=tp](q, k_cache, v_cache, partials, pos, VL, pools)
-    dispatch_merge_flash_partials[HEAD_DIM, NUM_Q, tp=tp](
-        output, partials, nw, pools)
+        gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
+        window=WINDOW, cache_size=WINDOW, tp=tp,
+    ](q, k_cache, v_cache, output, partials, pos, 1, pools)
 
     var out0 = output[0]
     print("  output[0..3]: "

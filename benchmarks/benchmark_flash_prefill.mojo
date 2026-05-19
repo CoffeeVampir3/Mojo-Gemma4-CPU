@@ -7,8 +7,10 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
 from kernels.flash_attention_prefill import (
-    dispatch_flash_prefill_sliding, dispatch_flash_prefill_full,
     FlashPrefillSlidingKernel, FlashPrefillFullKernel,
+)
+from kernels.attention_dispatch_kernels import (
+    dispatch_sliding_attention, dispatch_full_attention,
 )
 from kernels.attention_ops import flash_partial_stride
 from kernels.helpers import Binding, ArenaBases
@@ -106,33 +108,45 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
 
     var samples = SampleBuffer(SAMPLES)
 
+    comptime q_stride = SLIDING_NUM_Q * SLIDING_HEAD_DIM
+
     for s in range(NUM_SLIDING_SIZES):
         var seq_len = sizes[s]
         if seq_len > SLIDING_MAX_SEQ:
             continue
 
         for _ in range(WARMUP):
-            dispatch_flash_prefill_sliding[
-                head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
-                gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
-                window=SLIDING_WINDOW, tp=tp,
-                chunk_size=SLIDING_CHUNK_SIZE,
-                max_worker_count=MAX_WORKERS,
-            ](q, k_cache, v_cache, output, worker_scratch,
-              0, seq_len, pools)
+            var done = 0
+            while done < seq_len:
+                var chunk_len = min(SLIDING_CHUNK_SIZE, seq_len - done)
+                dispatch_sliding_attention[
+                    head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
+                    gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
+                    window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW, tp=tp,
+                    max_worker_count=MAX_WORKERS,
+                ](
+                    q.shifted(done * q_stride), k_cache, v_cache,
+                    output.shifted(done * q_stride), worker_scratch,
+                    done, chunk_len, pools)
+                done += chunk_len
             keep(output[0][0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_flash_prefill_sliding[
-                head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
-                gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
-                window=SLIDING_WINDOW, tp=tp,
-                chunk_size=SLIDING_CHUNK_SIZE,
-                max_worker_count=MAX_WORKERS,
-            ](q, k_cache, v_cache, output, worker_scratch,
-              0, seq_len, pools)
+            var done = 0
+            while done < seq_len:
+                var chunk_len = min(SLIDING_CHUNK_SIZE, seq_len - done)
+                dispatch_sliding_attention[
+                    head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
+                    gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
+                    window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW, tp=tp,
+                    max_worker_count=MAX_WORKERS,
+                ](
+                    q.shifted(done * q_stride), k_cache, v_cache,
+                    output.shifted(done * q_stride), worker_scratch,
+                    done, chunk_len, pools)
+                done += chunk_len
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
@@ -163,33 +177,46 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
 
     var samples = SampleBuffer(SAMPLES)
 
+    comptime q_stride = FULL_NUM_Q * FULL_HEAD_DIM
+    comptime local_q_stride = LOCAL_NUM_Q * FULL_HEAD_DIM
+
     for s in range(NUM_FULL_SIZES):
         var seq_len = sizes[s]
         if seq_len > FULL_MAX_SEQ:
             continue
 
         for _ in range(WARMUP):
-            dispatch_flash_prefill_full[
-                head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
-                local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
-                kv_stride=FULL_KV_STRIDE, tp=tp,
-                chunk_size=FULL_CHUNK_SIZE,
-                max_worker_count=MAX_WORKERS,
-            ](q, k_cache, v_cache, output, partials_scratch,
-              0, seq_len, pools)
+            var done = 0
+            while done < seq_len:
+                var chunk_len = min(FULL_CHUNK_SIZE, seq_len - done)
+                dispatch_full_attention[
+                    head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
+                    local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
+                    kv_stride=FULL_KV_STRIDE, tp=tp,
+                    max_worker_count=MAX_WORKERS,
+                ](
+                    q.shifted(done * q_stride), k_cache, v_cache,
+                    output.shifted(done * local_q_stride),
+                    partials_scratch, done, chunk_len, pools)
+                done += chunk_len
             keep(output[0][0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_flash_prefill_full[
-                head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
-                local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
-                kv_stride=FULL_KV_STRIDE, tp=tp,
-                chunk_size=FULL_CHUNK_SIZE,
-                max_worker_count=MAX_WORKERS,
-            ](q, k_cache, v_cache, output, partials_scratch,
-              0, seq_len, pools)
+            var done = 0
+            while done < seq_len:
+                var chunk_len = min(FULL_CHUNK_SIZE, seq_len - done)
+                dispatch_full_attention[
+                    head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
+                    local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
+                    kv_stride=FULL_KV_STRIDE, tp=tp,
+                    max_worker_count=MAX_WORKERS,
+                ](
+                    q.shifted(done * q_stride), k_cache, v_cache,
+                    output.shifted(done * local_q_stride),
+                    partials_scratch, done, chunk_len, pools)
+                done += chunk_len
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
@@ -215,11 +242,10 @@ def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
     print("\n=== Validation (sliding, seq_len=64) ===")
     comptime SL = 64
 
-    dispatch_flash_prefill_sliding[
+    dispatch_sliding_attention[
         head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
         gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
-        window=SLIDING_WINDOW, tp=tp,
-        chunk_size=SLIDING_CHUNK_SIZE,
+        window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW, tp=tp,
         max_worker_count=MAX_WORKERS,
     ](q, k_cache, v_cache, output, worker_scratch, 0, SL, pools)
 
@@ -254,11 +280,10 @@ def section_validation_full[P: BurstThreadPool, //, tp: Int](
     comptime M_OFF = FULL_NUM_Q * FULL_HEAD_DIM
     comptime L_OFF = M_OFF + FULL_NUM_Q
 
-    dispatch_flash_prefill_full[
+    dispatch_full_attention[
         head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
         local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
         kv_stride=FULL_KV_STRIDE, tp=tp,
-        chunk_size=FULL_CHUNK_SIZE,
         max_worker_count=MAX_WORKERS,
     ](q, k_cache, v_cache, output, partials_scratch, 0, SL, pools)
 
@@ -313,7 +338,7 @@ def run_sliding[P: BurstThreadPool, //, tp: Int](
 ):
     comptime SCRATCH_STRIDE = FlashPrefillSlidingKernel[
         SLIDING_HEAD_DIM, SLIDING_NUM_Q, SLIDING_GQA,
-        SLIDING_KV_STRIDE, SLIDING_WINDOW,
+        SLIDING_KV_STRIDE, SLIDING_WINDOW, SLIDING_WINDOW,
     ].SCRATCH_STRIDE
     var bases = arena_bases[tp](arenas)
 

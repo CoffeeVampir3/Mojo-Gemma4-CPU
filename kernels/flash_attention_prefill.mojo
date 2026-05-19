@@ -27,13 +27,16 @@ def full_local_kv_count(rank: Int, abs_pos: Int, degree: Int) -> Int:
 @fieldwise_init
 struct FlashPrefillSlidingKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int,
+    kv_stride: Int, window: Int, cache_size: Int,
 ](WorkerRangePartitionedKernel):
     """Sliding-window prefill: each worker owns a contiguous Q-token
-    range and scans the per-Q `[max(0, pos - W + 1), pos]` window of the
-    ring KV cache (head-sharded across ranks, so no cross-rank merge).
-    Per-Q (acc, m, l) state lives in a worker-private scratch slice; the
-    finalized row is written straight to `output`."""
+    range and scans the per-Q `[max(0, pos - window + 1), pos]` slice of
+    a ring KV cache of `cache_size` slots (must be a power of two and
+    >= window). The cache holds the prior chunk in one half and the
+    current chunk in the other half, so the windowed read never collides
+    with the chunk's own writes. Head-sharded across ranks, so no
+    cross-rank merge; per-Q (acc, m, l) state lives in a worker-private
+    scratch slice; the finalized row is written straight to `output`."""
 
     comptime SCRATCH_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
@@ -49,7 +52,7 @@ struct FlashPrefillSlidingKernel[
 
     def execute(mut self):
         comptime q_stride = Self.num_q * Self.head_dim
-        comptime slot_mask = Self.window - 1
+        comptime slot_mask = Self.cache_size - 1
 
         var scratch = self.worker_scratch \
                      + self.worker_id * Self.SCRATCH_STRIDE
@@ -137,79 +140,6 @@ struct FlashPrefillSlidingKernel[
         self.worker_id = worker_id
         self.start = start
         self.end = end
-
-
-def dispatch_flash_prefill_sliding_chunk[
-    P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, tp: Int,
-    max_worker_count: Int = 128,
-](
-    q: Binding[BFloat16, tp],
-    k_base: Binding[BFloat16, tp],
-    v_base: Binding[BFloat16, tp],
-    output: Binding[BFloat16, tp],
-    worker_scratch: Binding[Float32, tp],
-    base_pos: Int, chunk_len: Int,
-    mut pools: HeapMoveArray[P],
-):
-    if chunk_len <= 0:
-        return
-    comptime K = FlashPrefillSlidingKernel[
-        head_dim, num_q, gqa_ratio, kv_stride, window,
-    ]
-
-    @parameter
-    def make(r: Int) -> K:
-        return K(q[r], k_base[r], v_base[r], output[r],
-                 worker_scratch[r], base_pos, 0, 0, 0)
-
-    var per_q_kv = window if chunk_len > window else chunk_len
-    var data_bytes = chunk_len * per_q_kv * kv_stride * 2
-
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, chunk_len, data_bytes)
-
-
-def dispatch_flash_prefill_sliding[
-    P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, tp: Int,
-    chunk_size: Int = 4096,
-    max_worker_count: Int = 128,
-](
-    q: Binding[BFloat16, tp],
-    k_base: Binding[BFloat16, tp],
-    v_base: Binding[BFloat16, tp],
-    output: Binding[BFloat16, tp],
-    worker_scratch: Binding[Float32, tp],
-    base_pos: Int, seq_len: Int,
-    mut pools: HeapMoveArray[P],
-):
-    """Sliding-window prefill orchestrator: walks `seq_len` Q-tokens in
-    contiguous slabs of comptime-fixed `chunk_size`. The per-worker
-    scratch is bounded by `max_worker_count * SCRATCH_STRIDE` regardless
-    of `seq_len`; sliding has no cross-rank merge so each chunk writes
-    final output directly into `output[chunk_start : chunk_start +
-    chunk_len, :]` and the next chunk reuses the same scratch."""
-    if seq_len <= 0:
-        return
-    comptime q_stride = num_q * head_dim
-    var done = 0
-    while done < seq_len:
-        var chunk_len = min(chunk_size, seq_len - done)
-        dispatch_flash_prefill_sliding_chunk[
-            head_dim=head_dim, num_q=num_q, gqa_ratio=gqa_ratio,
-            kv_stride=kv_stride, window=window, tp=tp,
-            max_worker_count=max_worker_count,
-        ](
-            q.shifted(done * q_stride),
-            k_base, v_base,
-            output.shifted(done * q_stride),
-            worker_scratch,
-            base_pos + done, chunk_len, pools,
-        )
-        done += chunk_len
 
 
 @fieldwise_init
@@ -311,87 +241,6 @@ struct FlashPrefillFullKernel[
     def install_range(mut self, start: Int, end: Int):
         self.start = start
         self.end = end
-
-
-def dispatch_flash_prefill_full_chunk[
-    P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, tp: Int,
-    max_worker_count: Int = 128,
-](
-    q: Binding[BFloat16, tp],
-    k_base: Binding[BFloat16, tp],
-    v_base: Binding[BFloat16, tp],
-    partials_out: Binding[Float32, tp],
-    base_pos: Int, chunk_len: Int,
-    mut pools: HeapMoveArray[P],
-):
-    if chunk_len <= 0:
-        return
-    comptime K = FlashPrefillFullKernel[
-        head_dim, num_q, gqa_ratio, kv_stride, tp,
-    ]
-
-    @parameter
-    def make(r: Int) -> K:
-        return K(q[r], k_base[r], v_base[r], partials_out[r],
-                 base_pos, r, 0, 0)
-
-    var avg_local_kv = (base_pos + chunk_len // 2) // tp + 1
-    var data_bytes = chunk_len * avg_local_kv * kv_stride * 2
-
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, chunk_len, data_bytes)
-
-
-def dispatch_flash_prefill_full[
-    P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, local_num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, tp: Int,
-    chunk_size: Int = 4096,
-    max_worker_count: Int = 128,
-](
-    q: Binding[BFloat16, tp],
-    k_base: Binding[BFloat16, tp],
-    v_base: Binding[BFloat16, tp],
-    output: Binding[BFloat16, tp],
-    partials_scratch: Binding[Float32, tp],
-    base_pos: Int, seq_len: Int,
-    mut pools: HeapMoveArray[P],
-):
-    """Full-attention prefill orchestrator: walks `seq_len` Q-tokens in
-    contiguous slabs of comptime-fixed `chunk_size`. Each iteration
-    runs the per-chunk flash kernel into `partials_scratch` (sized for
-    one chunk: `chunk_size * PARTIAL_STRIDE`) and immediately runs the
-    cross-rank merge that finalizes the column-sharded chunk slice of
-    `output`. The partials buffer is reused across chunks; `output` is
-    seq_len-sized and chunk k writes to its disjoint slice."""
-    if seq_len <= 0:
-        return
-    comptime q_stride = num_q * head_dim
-    comptime local_q_stride = local_num_q * head_dim
-    var done = 0
-    while done < seq_len:
-        var chunk_len = min(chunk_size, seq_len - done)
-        dispatch_flash_prefill_full_chunk[
-            head_dim=head_dim, num_q=num_q, gqa_ratio=gqa_ratio,
-            kv_stride=kv_stride, tp=tp,
-            max_worker_count=max_worker_count,
-        ](
-            q.shifted(done * q_stride),
-            k_base, v_base,
-            partials_scratch,
-            base_pos + done, chunk_len, pools,
-        )
-        dispatch_merge_flash_prefill_partials[
-            head_dim=head_dim, num_q=num_q,
-            local_num_q=local_num_q, tp=tp,
-            max_worker_count=max_worker_count,
-        ](
-            output.shifted(done * local_q_stride),
-            partials_scratch, chunk_len, pools,
-        )
-        done += chunk_len
 
 
 @fieldwise_init

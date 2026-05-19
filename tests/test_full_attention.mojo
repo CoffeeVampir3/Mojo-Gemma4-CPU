@@ -3,10 +3,8 @@ from std.memory import Span, UnsafePointer, alloc
 from std.os import abort
 from std.sys.info import simd_width_of
 
-from kernels.flash_attention import (
-    dispatch_full_attention, FlashAttentionKernel, LinearKV,
-)
-from kernels.logsum_merge import dispatch_merge_context_flash_partials
+from kernels.flash_attention import FlashAttentionKernel, LinearKV
+from kernels.attention_dispatch_kernels import dispatch_full_attention
 from kernels.helpers import Binding, ArenaBases
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
@@ -73,7 +71,7 @@ def run_case[
     v: UnsafePointer[BFloat16, v_origin],
     output: UnsafePointer[BFloat16, out_origin],
     partials: UnsafePointer[Float32, partials_origin],
-    valid: InlineArray[Int, TP],
+    base_pos: Int,
     expected_kv0: Float32,
     expected_kv1: Float32,
     label: String,
@@ -82,9 +80,10 @@ def run_case[
     for _ in range(TP):
         pools.push(TestPool(1, 0))
 
-    var nws = dispatch_full_attention[
+    dispatch_full_attention[
         head_dim=HEAD_DIM, num_q=GLOBAL_Q,
-        gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=TP,
+        local_num_q=LOCAL_Q, gqa_ratio=GLOBAL_GQA,
+        kv_stride=KV_STRIDE, tp=TP,
     ](
         Binding[BFloat16, TP](
             q.as_any_origin(), rank_bases(GLOBAL_Q * HEAD_DIM * 2)),
@@ -92,18 +91,11 @@ def run_case[
             k.as_any_origin(), rank_bases(KV_STRIDE * 2)),
         Binding[BFloat16, TP](
             v.as_any_origin(), rank_bases(KV_STRIDE * 2)),
-        Binding[Float32, TP](
-            partials.as_any_origin(), rank_bases(PSTRIDE * 4)),
-        valid, pools)
-
-    dispatch_merge_context_flash_partials[
-        head_dim=HEAD_DIM, num_q=GLOBAL_Q, local_num_q=LOCAL_Q, tp=TP,
-    ](
         Binding[BFloat16, TP](
             output.as_any_origin(), rank_bases(LOCAL_Q * HEAD_DIM * 2)),
         Binding[Float32, TP](
             partials.as_any_origin(), rank_bases(PSTRIDE * 4)),
-        nws, pools)
+        base_pos, 1, pools)
 
     for r in range(TP):
         var out_base = r * LOCAL_Q * HEAD_DIM
@@ -137,15 +129,14 @@ def main():
             v[kv_base + i] = BFloat16(Float32(10 + r))
             v[kv_base + HEAD_DIM + i] = BFloat16(Float32(50 + r))
 
-    var valid_first = InlineArray[Int, TP](fill=0)
-    valid_first[0] = 1
+    # base_pos=0 → full_valid_count = [1, 0, 0, 0]: only rank 0 holds context.
     run_case(
-        q, k, v, output, partials, valid_first,
+        q, k, v, output, partials, 0,
         10.0, 50.0, "single context owner")
 
-    var valid_all = InlineArray[Int, TP](fill=1)
+    # base_pos=TP-1 → full_valid_count = [1, 1, 1, 1]: every rank holds one.
     run_case(
-        q, k, v, output, partials, valid_all,
+        q, k, v, output, partials, TP - 1,
         11.5, 51.5, "all context owners")
 
     q.free()

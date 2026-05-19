@@ -6,10 +6,8 @@ from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.flash_attention import (
-    dispatch_full_attention, FlashAttentionKernel, LinearKV,
-)
-from kernels.logsum_merge import dispatch_merge_context_flash_partials
+from kernels.flash_attention import FlashAttentionKernel, LinearKV
+from kernels.attention_dispatch_kernels import dispatch_full_attention
 from kernels.helpers import Binding, ArenaBases
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -75,21 +73,6 @@ def fill_pattern_all[tp: Int](
         fill_pattern(ptrs[r], count)
 
 
-def full_valid_lens[tp: Int](valid_len: Int) -> InlineArray[Int, tp]:
-    var lens = InlineArray[Int, tp](uninitialized=True)
-    if valid_len <= 0:
-        for r in range(tp):
-            lens[r] = 0
-        return lens
-    var last = valid_len - 1
-    for r in range(tp):
-        if r <= last % tp:
-            lens[r] = last // tp + 1
-        else:
-            lens[r] = last // tp
-    return lens
-
-
 def section_validation[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
     output: BF16Ptr, partials: F32Ptr, bases: ArenaBases[tp],
@@ -98,20 +81,17 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     comptime VL = 64
     comptime LOCAL_NUM_Q = GLOBAL_NUM_Q // tp
 
-    var nw = dispatch_full_attention[
+    dispatch_full_attention[
         head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
-        gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=tp](
+        local_num_q=LOCAL_NUM_Q, gqa_ratio=GLOBAL_GQA,
+        kv_stride=KV_STRIDE, tp=tp,
+    ](
         Binding[BFloat16, tp](q, bases),
         Binding[BFloat16, tp](k_cache, bases),
         Binding[BFloat16, tp](v_cache, bases),
-        Binding[Float32, tp](partials, bases),
-        full_valid_lens[tp](VL), pools)
-    dispatch_merge_context_flash_partials[
-        head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q, local_num_q=LOCAL_NUM_Q, tp=tp,
-    ](
         Binding[BFloat16, tp](output, bases),
         Binding[Float32, tp](partials, bases),
-        nw, pools)
+        VL - 1, 1, pools)
 
     print("  output[0..3]: "
         + String(output[0].cast[DType.float32]()) + " "
@@ -146,41 +126,33 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
             continue
 
         for _ in range(WARMUP):
-            var nw = dispatch_full_attention[
+            dispatch_full_attention[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
-                gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=tp](
+                local_num_q=LOCAL_NUM_Q, gqa_ratio=GLOBAL_GQA,
+                kv_stride=KV_STRIDE, tp=tp,
+            ](
                 Binding[BFloat16, tp](q, bases),
                 Binding[BFloat16, tp](k_cache, bases),
                 Binding[BFloat16, tp](v_cache, bases),
-                Binding[Float32, tp](partials, bases),
-                full_valid_lens[tp](vl), pools)
-            dispatch_merge_context_flash_partials[
-                head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
-                local_num_q=LOCAL_NUM_Q, tp=tp,
-            ](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                nw, pools)
+                vl - 1, 1, pools)
             keep(output[0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            var nw = dispatch_full_attention[
+            dispatch_full_attention[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
-                gqa_ratio=GLOBAL_GQA, kv_stride=KV_STRIDE, tp=tp](
+                local_num_q=LOCAL_NUM_Q, gqa_ratio=GLOBAL_GQA,
+                kv_stride=KV_STRIDE, tp=tp,
+            ](
                 Binding[BFloat16, tp](q, bases),
                 Binding[BFloat16, tp](k_cache, bases),
                 Binding[BFloat16, tp](v_cache, bases),
-                Binding[Float32, tp](partials, bases),
-                full_valid_lens[tp](vl), pools)
-            dispatch_merge_context_flash_partials[
-                head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
-                local_num_q=LOCAL_NUM_Q, tp=tp,
-            ](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                nw, pools)
+                vl - 1, 1, pools)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)

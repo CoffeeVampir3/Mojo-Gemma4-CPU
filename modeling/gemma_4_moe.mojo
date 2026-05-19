@@ -18,11 +18,10 @@ from kernels.gemv import dispatch_gemv_softcap
 from kernels.gemm import dispatch_gemm, dispatch_gemm_chained_qkv
 from kernels.rope import dispatch_rope_cache_write
 from kernels.flash_attention import (
-    dispatch_full_attention, dispatch_sliding_attention,
     FlashAttentionKernel, LinearKV, RingKV,
 )
-from kernels.logsum_merge import (
-    dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
+from kernels.attention_dispatch_kernels import (
+    dispatch_sliding_attention, dispatch_full_attention,
 )
 from kernels.moe_router import (
     RouterCandidate, SparseRoute,
@@ -125,17 +124,20 @@ struct Gemma4StateShapes[degree: Int]:
     `D` shards a tensor across the `degree` ranks (one slice per rank).
     `Local` keeps the whole tensor on every rank (replicated). The
     project's NUMA principle says: data should live closest to its
-    most-frequent reader. The sliding rope table is small and read by
-    every attention worker on every token — replicating it per rank
-    keeps reads NUMA-local. The full rope table is larger and accessed
-    less uniformly, so it's sharded.
+    most-frequent reader. Both rope tables are read by every attention
+    worker on every token, so both are replicated per rank to keep reads
+    NUMA-local and to let prefill rotate Q identically on every rank
+    without a cross-rank gather. The sliding KV ring is sized at
+    `2 * SLIDING_WINDOW` so a prefill chunk of W tokens can land in one
+    half while the prior chunk stays addressable in the other half.
     """
     comptime D     = DistributionDegree[Self.degree]
     comptime Local = DistributionDegree[1]
-    comptime SlidingKV   = TensorColumnSharded[C.SLIDING_WINDOW, C.KV_DIM_SLIDING, Self.D]
+    comptime SLIDING_CACHE = 2 * C.SLIDING_WINDOW
+    comptime SlidingKV   = TensorColumnSharded[Self.SLIDING_CACHE, C.KV_DIM_SLIDING, Self.D]
     comptime FullKV      = ContextRowSharded[C.MAX_SEQ_LEN, C.KV_DIM_FULL, Self.D]
     comptime SlidingRope = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_SLIDING, Self.Local]
-    comptime FullRope    = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_FULL, Self.D]
+    comptime FullRope    = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_FULL, Self.Local]
 
 
 struct Gemma4TailShapes[degree: Int]:
@@ -232,7 +234,7 @@ struct Gemma4Layout[degree: Int](Copyable, ImplicitlyCopyable):
     var full_kv: Repeated[FullKVSlots[Self.degree]]
     var activations: ActivationSlots
     var sliding_rope: RopeSlots[C.ROPE_HALF_SLIDING]
-    var full_rope: RopeSlots[C.ROPE_HALF_FULL, Self.degree]
+    var full_rope: RopeSlots[C.ROPE_HALF_FULL]
 
     var tail: Repeated[TailRefs[Self.degree]]
 
@@ -255,8 +257,9 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     comptime head_dim = C.HEAD_DIM_SLIDING
     comptime num_kv_heads = Self.kv_rows // Self.head_dim
     comptime num_q_heads = Self.q_rows // Self.head_dim
+    comptime cache_size = Gemma4StateShapes[Self.degree].SLIDING_CACHE
     comptime FlashK = FlashAttentionKernel[
-        RingKV[C.SLIDING_WINDOW],
+        RingKV[Self.cache_size],
         Self.head_dim, Self.num_q_heads,
         Self.num_q_heads // Self.num_kv_heads, Self.kv_rows,
     ]
@@ -297,6 +300,11 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
         Self.head_dim, Self.num_q_heads,
         C.NUM_HEADS // C.NUM_KV_HEADS_FULL, Self.k_rows,
     ]
+    comptime PARTIAL_SLOTS = (
+        Self.max_worker_count
+        if Self.max_worker_count >= C.SLIDING_WINDOW
+        else C.SLIDING_WINDOW
+    )
 
     comptime PHASES = ScratchPhaseOrder[
         "gemv_q", "gemv_kv", "rms_norm_qkv", "rope_cache_write",
@@ -315,7 +323,7 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Float32, Self.max_worker_count * Self.FullK.PARTIAL_STRIDE,
+        Float32, Self.PARTIAL_SLOTS * Self.FullK.PARTIAL_STRIDE,
     ]
 
     var q_local_band: ScratchPhase["merge_partials", "o_proj"]
@@ -508,7 +516,7 @@ def build_gemma4_plan[
 
     var sliding_rope = RopeSlots[C.ROPE_HALF_SLIDING]()
     state_cursor = stamp_offsets(sliding_rope, state_cursor)
-    var full_rope = RopeSlots[C.ROPE_HALF_FULL, degree]()
+    var full_rope = RopeSlots[C.ROPE_HALF_FULL]()
     state_cursor = stamp_offsets(full_rope, state_cursor)
 
     var arena = ArenaLayout(
@@ -528,32 +536,23 @@ def build_gemma4_plan[
         tail=tail)
 
 
-@always_inline
-def sliding_valid_len(pos: Int) -> Int:
-    if pos + 1 >= C.SLIDING_WINDOW:
-        return C.SLIDING_WINDOW
-    return pos + 1
-
-
-@always_inline
-def full_valid_count(rank: Int, pos: Int, degree: Int) -> Int:
-    if pos < 0:
-        return 0
-    if rank <= pos % degree:
-        return pos // degree + 1
-    return pos // degree
-
-
 def dispatch_sliding_attention_qkv[
     P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
 ](
     layout: Gemma4Layout[degree],
     ctx: BindContext[degree],
-    pos: Int,
+    base_pos: Int,
+    seq_len: Int,
     layer_idx: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: HeapMoveArray[P],
 ):
+    """Sliding-window attention for `seq_len` Q-tokens starting at
+    `base_pos`. `seq_len == 1` uses kv-range-parallel decode flash plus
+    cross-worker merge; `seq_len > 1` uses Q-range-parallel prefill
+    flash that writes finalized output directly (no merge). Caller must
+    keep `seq_len <= SLIDING_WINDOW` so the chunk's KV writes land in
+    one half of the 2W ring and the prior chunk stays addressable."""
     comptime S = Gemma4Shapes[degree]
     comptime q_rows = S.SlidingQ.DATA_N
     comptime kv_rows = S.SlidingKV.DATA_N
@@ -564,14 +563,21 @@ def dispatch_sliding_attention_qkv[
     comptime hd_eps = head_dim * C.RMS_NORM_EPS
     comptime rope_half = C.ROPE_HALF_SLIDING
     comptime kv_cols = kv_rows
+    comptime cache_size = Gemma4StateShapes[degree].SLIDING_CACHE
     comptime Island = Gemma4SlidingScratch[degree, max_worker_count]
+
+    debug_assert(
+        seq_len <= C.SLIDING_WINDOW,
+        "sliding attention chunk exceeds SLIDING_WINDOW; the 2W ring "
+        "only protects W tokens of prior context.",
+    )
 
     var attn_ctx = ctx.with_layer(layout.sliding.base(ctx.arena_bases[0], layer_idx))
     var attn = layout.sliding.proto.attn
 
     var q_outs = scratch.binding[Island, "q"](ctx)
     var k_outs = scratch.binding[Island, "kv"](ctx)
-    var v_outs = k_outs.shifted(kv_rows)
+    var v_outs = k_outs.shifted(seq_len * kv_rows)
     var xs = layout.activations.x_residual.state_binding(ctx)
 
     dispatch_gemm_chained_qkv[
@@ -581,7 +587,7 @@ def dispatch_sliding_attention_qkv[
       attn.q_proj.binding(attn_ctx),
       attn.k_proj.binding(attn_ctx),
       attn.v_proj.binding(attn_ctx),
-      q_outs, k_outs, v_outs, 1, pools)
+      q_outs, k_outs, v_outs, seq_len, pools)
 
     dispatch_rms_norm_qkv_heads[
         head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
@@ -590,7 +596,7 @@ def dispatch_sliding_attention_qkv[
     ](q_outs, q_outs, k_outs, k_outs, v_outs, v_outs,
       attn.q_norm.binding(attn_ctx),
       attn.k_norm.binding(attn_ctx),
-      1, pools)
+      seq_len, pools)
 
     var kv_lb = layout.sliding_kv.base(ctx.arena_bases[0], layer_idx)
     var k_kv = layout.sliding_kv.proto.k.binding(kv_lb, ctx.arena_bases)
@@ -600,28 +606,24 @@ def dispatch_sliding_attention_qkv[
         half=rope_half, pair_stride=head_dim // 2,
         num_q=num_q_heads, num_kv=num_kv_heads,
         head_dim=head_dim, kv_cache_stride=kv_cols,
-        slot_mask=C.SLIDING_WINDOW - 1, cache_degree=1, tp=degree,
+        slot_mask=cache_size - 1, cache_degree=1, tp=degree,
         max_worker_count=max_worker_count,
     ](q_outs, k_outs, v_outs,
       k_kv, v_kv,
       layout.sliding_rope.cos.state_binding(ctx),
       layout.sliding_rope.sin.state_binding(ctx),
-      pos, 1, pools)
+      base_pos, seq_len, pools)
 
     var partials = scratch.binding[Island, "partials"](ctx)
 
-    var nws = dispatch_sliding_attention[
+    dispatch_sliding_attention[
         head_dim=head_dim, num_q=num_q_heads,
-        gqa_ratio=num_q_heads // num_kv_heads, kv_stride=kv_cols,
-        window=C.SLIDING_WINDOW, tp=degree,
+        gqa_ratio=num_q_heads // num_kv_heads,
+        kv_stride=kv_cols, window=C.SLIDING_WINDOW,
+        cache_size=cache_size, tp=degree,
         max_worker_count=max_worker_count,
-    ](q_outs, k_kv, v_kv, partials, pos, sliding_valid_len(pos), pools)
-
-    dispatch_merge_flash_partials[
-        head_dim, num_q_heads, tp=degree,
-        max_worker_count=max_worker_count,
-    ](
-        q_outs, partials, nws, pools)
+    ](q_outs, k_kv, v_kv, q_outs, partials,
+      base_pos, seq_len, pools)
 
     dispatch_gemm[
         rows=C.HIDDEN, cols=q_rows, tp=degree,
@@ -629,7 +631,7 @@ def dispatch_sliding_attention_qkv[
     ](
         q_outs,
         attn.o_proj.binding(attn_ctx),
-        xs, 1, pools)
+        xs, seq_len, pools)
 
 
 def dispatch_full_attention_qkv[
@@ -637,11 +639,15 @@ def dispatch_full_attention_qkv[
 ](
     layout: Gemma4Layout[degree],
     ctx: BindContext[degree],
-    pos: Int,
+    base_pos: Int,
+    seq_len: Int,
     layer_idx: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: HeapMoveArray[P],
 ):
+    """Full attention for `seq_len` Q-tokens starting at `base_pos`. The
+    unified attention dispatcher routes decode vs prefill internally
+    based on seq_len; this orchestrator does not branch."""
     comptime S = Gemma4Shapes[degree]
     comptime q_rows = S.FullQ.DATA_N
     comptime local_q_rows = S.FullO.DATA_M
@@ -662,19 +668,19 @@ def dispatch_full_attention_qkv[
 
     var q_outs = scratch.binding[Island, "q"](ctx)
     var k_outs = scratch.binding[Island, "kv"](ctx)
-    var v_outs = k_outs.shifted(k_rows)
+    var v_outs = k_outs.shifted(seq_len * k_rows)
     var xs = layout.activations.x_residual.state_binding(ctx)
 
     dispatch_gemm[
         rows=q_rows, cols=C.HIDDEN, tp=degree,
         max_worker_count=max_worker_count,
     ](
-        xs, attn.q_proj.binding(attn_ctx), q_outs, 1, pools)
+        xs, attn.q_proj.binding(attn_ctx), q_outs, seq_len, pools)
     dispatch_gemm[
         rows=k_rows, cols=C.HIDDEN, tp=degree,
         max_worker_count=max_worker_count,
     ](
-        xs, attn.k_proj.binding(attn_ctx), k_outs, 1, pools)
+        xs, attn.k_proj.binding(attn_ctx), k_outs, seq_len, pools)
 
     # Full attention has no v_proj; v reads from k's pre-norm buffer (chain runs V→Q→K).
     dispatch_rms_norm_qkv_heads[
@@ -684,11 +690,7 @@ def dispatch_full_attention_qkv[
     ](q_outs, q_outs, k_outs, k_outs, k_outs, v_outs,
       attn.q_norm.binding(attn_ctx),
       attn.k_norm.binding(attn_ctx),
-      1, pools)
-
-    var owner_bases = ArenaBases[degree].fill(ctx.arena_bases[pos % degree])
-    var rope_owner_ctx = BindContext[degree](
-        arena_bases=owner_bases, layer_base=owner_bases[0])
+      seq_len, pools)
 
     var kv_lb = layout.full_kv.base(ctx.arena_bases[0], layer_idx)
     var k_kv = layout.full_kv.proto.k.binding(kv_lb, ctx.arena_bases)
@@ -702,28 +704,21 @@ def dispatch_full_attention_qkv[
         max_worker_count=max_worker_count,
     ](q_outs, k_outs, v_outs,
       k_kv, v_kv,
-      layout.full_rope.cos.state_binding(rope_owner_ctx),
-      layout.full_rope.sin.state_binding(rope_owner_ctx),
-      pos, 1, pools)
+      layout.full_rope.cos.state_binding(ctx),
+      layout.full_rope.sin.state_binding(ctx),
+      base_pos, seq_len, pools)
 
     var q_local_outs = scratch.binding[Island, "q_local"](ctx)
     var partials = scratch.binding[Island, "partials"](ctx)
 
-    var valid_lens = InlineArray[Int, degree](uninitialized=True)
-    for rank in range(degree):
-        valid_lens[rank] = full_valid_count(rank, pos, degree)
-
-    var nws = dispatch_full_attention[
+    dispatch_full_attention[
         head_dim=head_dim, num_q=num_q_heads,
-        gqa_ratio=C.NUM_HEADS // C.NUM_KV_HEADS_FULL, kv_stride=kv_cols,
-        tp=degree, max_worker_count=max_worker_count,
-    ](q_outs, k_kv, v_kv, partials, valid_lens, pools)
-
-    dispatch_merge_context_flash_partials[
-        head_dim=head_dim, num_q=num_q_heads,
-        local_num_q=local_num_q_heads, tp=degree,
+        local_num_q=local_num_q_heads,
+        gqa_ratio=C.NUM_HEADS // C.NUM_KV_HEADS_FULL,
+        kv_stride=kv_cols, tp=degree,
         max_worker_count=max_worker_count,
-    ](q_local_outs, partials, nws, pools)
+    ](q_outs, k_kv, v_kv, q_local_outs, partials,
+      base_pos, seq_len, pools)
 
     dispatch_gemm[
         rows=C.HIDDEN, cols=local_q_rows, tp=degree,
@@ -731,7 +726,7 @@ def dispatch_full_attention_qkv[
     ](
         q_local_outs,
         attn.o_proj.binding(attn_ctx),
-        xs, 1, pools)
+        xs, seq_len, pools)
 
 
 def dispatch_moe[
@@ -944,8 +939,8 @@ struct Gemma4[
             var fl_cos = layout.full_rope.cos.at(base)
             var fl_sin = layout.full_rope.sin.at(base)
             init_rope_table_partial_strided[
-                C.ROPE_HALF_FULL, C.MAX_SEQ_LEN // Self.degree,
-            ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, rank, Self.degree)
+                C.ROPE_HALF_FULL, C.MAX_SEQ_LEN,
+            ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, 0, 1)
         print("  rope tables initialized")
 
     def forward(
@@ -1002,13 +997,13 @@ struct Gemma4[
                     degree=Self.degree,
                     max_worker_count=Self.max_worker_count,
                 ](
-                    layout, ctx, pos, entry.local_idx, self.scratch, self.pools)
+                    layout, ctx, pos, 1, entry.local_idx, self.scratch, self.pools)
             else:
                 dispatch_sliding_attention_qkv[
                     degree=Self.degree,
                     max_worker_count=Self.max_worker_count,
                 ](
-                    layout, ctx, pos, entry.local_idx, self.scratch, self.pools)
+                    layout, ctx, pos, 1, entry.local_idx, self.scratch, self.pools)
 
             dispatch_allreduce_inplace[
                 BF16, Self.degree, max_worker_count=Self.max_worker_count,

@@ -1,11 +1,9 @@
 from std.collections import InlineArray
 
 from simd_math import fast_exp_softmax_biased
-from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
-    WorkerRangePartitionedKernel, fanout_dispatch_per_rank, Binding,
+    WorkerRangePartitionedKernel,
     accumulate_scaled, scale_unrolled,
 )
 from .attention_ops import score_position, flash_partial_stride
@@ -115,74 +113,3 @@ struct FlashAttentionKernel[
         self.end = end
 
 
-def dispatch_full_attention[
-    P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, tp: Int, max_worker_count: Int = 128,
-](
-    q: Binding[BFloat16, tp],
-    k_base: Binding[BFloat16, tp],
-    v_base: Binding[BFloat16, tp],
-    worker_partials: Binding[Float32, tp],
-    valid_len: InlineArray[Int, tp],
-    mut pools: HeapMoveArray[P],
-) -> InlineArray[Int, tp]:
-    comptime K = FlashAttentionKernel[
-        LinearKV, head_dim, num_q, gqa_ratio, kv_stride,
-    ]
-
-    @parameter
-    def make(r: Int) -> K:
-        return K(q[r], k_base[r], v_base[r], worker_partials[r], 0, 0, 0, 0)
-
-    @parameter
-    def total_for(r: Int) -> Int:
-        return valid_len[r]
-
-    @parameter
-    def bytes_for(r: Int) -> Int:
-        return valid_len[r] * kv_stride * 2
-
-    return fanout_dispatch_per_rank[
-        tp, make, total_for, bytes_for,
-        max_worker_count=max_worker_count,
-    ](pools)
-
-
-def dispatch_sliding_attention[
-    P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, tp: Int, max_worker_count: Int = 128,
-](
-    q: Binding[BFloat16, tp],
-    k_base: Binding[BFloat16, tp],
-    v_base: Binding[BFloat16, tp],
-    partials_buf: Binding[Float32, tp],
-    pos: Int, valid_len: Int,
-    mut pools: HeapMoveArray[P],
-) -> InlineArray[Int, tp]:
-    if valid_len <= 0:
-        return InlineArray[Int, tp](fill=0)
-
-    var start_pos = pos - valid_len + 1
-    comptime K = FlashAttentionKernel[
-        RingKV[window], head_dim, num_q, gqa_ratio, kv_stride,
-    ]
-
-    @parameter
-    def make(r: Int) -> K:
-        return K(q[r], k_base[r], v_base[r], partials_buf[r],
-                 0, start_pos, 0, 0)
-
-    @parameter
-    def total_for(r: Int) -> Int:
-        return valid_len
-
-    @parameter
-    def bytes_for(r: Int) -> Int:
-        return valid_len * kv_stride * 2
-
-    return fanout_dispatch_per_rank[
-        tp, make, total_for, bytes_for,
-        max_worker_count=max_worker_count,
-    ](pools)
