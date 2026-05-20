@@ -262,26 +262,3 @@ def dispatch_broadcast[
     for r in range(tp):
         if r != src_rank:
             pools[r].join()
-
-
-@always_inline
-def dispatch_broadcast_from_ptr[
-    P: BurstThreadPool, src_origin: ImmutOrigin, //,
-    E: Encoding, tp: Int, max_worker_count: Int = 128,
-](
-    src_ptr: UnsafePointer[Scalar[E.DTYPE], src_origin],
-    dst: Binding[Scalar[E.DTYPE], tp], count: Int,
-    mut pools: HeapMoveArray[P],
-    src_rank: Int = 0,
-    inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
-):
-    """Broadcast from a single source pointer (typically the owner
-    rank's slice of a row-sharded tensor) to every rank's binding —
-    the shape used by the embedding broadcast in `Gemma4.forward`."""
-    var s = RankBuffers[E.DTYPE, tp, src_origin](count=count)
-    var d = RankBuffers[E.DTYPE, tp, MutAnyOrigin](count=count)
-    for r in range(tp):
-        s.ptrs[r] = src_ptr
-        d.ptrs[r] = dst[r]
-    dispatch_broadcast[E, tp, max_worker_count=max_worker_count](
-        s, d, pools, src_rank=src_rank, inline_max_bytes=inline_max_bytes)

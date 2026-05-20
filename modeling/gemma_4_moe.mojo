@@ -9,9 +9,8 @@ from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from kernels.helpers import Binding, ArenaBases
-from kernels.reductions import (
-    dispatch_allreduce_inplace, dispatch_broadcast_from_ptr,
-)
+from kernels.reductions import dispatch_allreduce_inplace
+from kernels.embedding import dispatch_embed_lookup
 from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
 from kernels.rmsnorm import fused_norm_residual_add
 from kernels.gemv import dispatch_gemv_softcap
@@ -950,29 +949,27 @@ struct Gemma4[
         comptime shard_rows = Gemma4TailShapes[Self.degree].Embed.DATA_N
         comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
         comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
-
-        var owner = token_id // shard_rows
-        var local_row = token_id % shard_rows
+        comptime embed_scale = Float64(sqrt[DType.float32, 1](C.HIDDEN)
+            .cast[DType.bfloat16]().cast[DType.float32]())
 
         var ctx = BindContext[Self.degree](
             arena_bases=self.arena_bases, layer_base=0)
+        var tail_ctx = ctx.with_layer(
+            layout.tail.base(self.arena_bases[0], 0))
 
         var x_main_ranks = layout.activations.x_main.state_binding(ctx)
         var x_res_ranks = layout.activations.x_residual.state_binding(ctx)
 
-        var tail_base_owner = layout.tail.base(self.arena_bases[owner], 0)
-        var embed_row = layout.tail.proto.embed.at(tail_base_owner) + local_row * C.HIDDEN
-
-        dispatch_broadcast_from_ptr[
+        var tid_buf = Int32(token_id)
+        dispatch_embed_lookup[
+            hidden=C.HIDDEN, scale=embed_scale, shard_rows=shard_rows,
+            tp=Self.degree, max_worker_count=Self.max_worker_count,
+        ](UnsafePointer(to=tid_buf).as_immutable(),
+          layout.tail.proto.embed.binding(tail_ctx),
+          x_main_ranks, 1, self.pools)
+        dispatch_allreduce_inplace[
             BF16, Self.degree, max_worker_count=Self.max_worker_count,
-        ](embed_row.as_immutable(), x_main_ranks, C.HIDDEN,
-          self.pools, src_rank=owner)
-
-        comptime embed_scale = sqrt[DType.float32, 1](C.HIDDEN).cast[DType.bfloat16]().cast[DType.float32]()
-        dispatch_scalar_mul[
-            hidden=C.HIDDEN, tp=Self.degree,
-            max_worker_count=Self.max_worker_count,
-        ](x_main_ranks, x_main_ranks, embed_scale, 1, self.pools)
+        ](x_main_ranks, C.HIDDEN, self.pools)
 
         for i in range(C.NUM_LAYERS):
             var entry = LAYER_SCHEDULE[i]
@@ -1022,7 +1019,6 @@ struct Gemma4[
                 body, layer_ctx, x_main_ranks, x_res_ranks, 1,
                 self.scratch, self.pools)
 
-        var tail_ctx = ctx.with_layer(layout.tail.base(self.arena_bases[0], 0))
         dispatch_rms_norm[
             hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
             tp=Self.degree, max_worker_count=Self.max_worker_count,
