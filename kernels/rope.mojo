@@ -13,29 +13,6 @@ from .dispatch_heuristics import ROPE_INLINE_TOKENS
 
 
 @always_inline
-def rotate_pair[width: Int, pair_stride: Int](
-    ptr: BF16Ptr,
-    cos_ptr: F32Ptr,
-    sin_ptr: F32Ptr,
-    j: Int,
-):
-    var x_lo = (ptr + j).load[width=width]().cast[DType.float32]()
-    var x_hi = (ptr + pair_stride + j).load[width=width]().cast[DType.float32]()
-    var cv = (cos_ptr + j).load[width=width]()
-    var sv = (sin_ptr + j).load[width=width]()
-    (ptr + j).store((x_lo * cv - x_hi * sv).cast[DType.bfloat16]())
-    (ptr + pair_stride + j).store((x_hi * cv + x_lo * sv).cast[DType.bfloat16]())
-
-
-@always_inline
-def rope_head[half: Int, pair_stride: Int](
-    head_ptr: BF16Ptr, cos_row: F32Ptr, sin_row: F32Ptr,
-):
-    for j in range(0, half, W):
-        rotate_pair[W, pair_stride](head_ptr, cos_row, sin_row, j)
-
-
-@always_inline
 def rotate_pair_to[width: Int, pair_stride: Int](
     src: BF16Ptr, dst: BF16Ptr,
     cos_ptr: F32Ptr, sin_ptr: F32Ptr, j: Int,
@@ -46,6 +23,15 @@ def rotate_pair_to[width: Int, pair_stride: Int](
     var sv = (sin_ptr + j).load[width=width]()
     (dst + j).store((x_lo * cv - x_hi * sv).cast[DType.bfloat16]())
     (dst + pair_stride + j).store((x_hi * cv + x_lo * sv).cast[DType.bfloat16]())
+
+
+@always_inline
+def rope_head[half: Int, pair_stride: Int](
+    head_ptr: BF16Ptr, cos_row: F32Ptr, sin_row: F32Ptr,
+):
+    for j in range(0, half, W):
+        rotate_pair_to[W, pair_stride](
+            head_ptr, head_ptr, cos_row, sin_row, j)
 
 
 @always_inline
@@ -150,24 +136,6 @@ def dispatch_rope_cache_write[
         pools, seq_len, seq_len * row_bytes,
         inline_threshold_bytes=ROPE_INLINE_TOKENS * row_bytes)
 
-def init_rope_table[half: Int, max_pos: Int](
-    cos_buf: F32Ptr, sin_buf: F32Ptr,
-    theta: Float64,
-):
-    comptime f64w = simd_width_of[DType.float64]()
-
-    for j in range(0, half, f64w):
-        var inv = SIMD[DType.float64, f64w]()
-        for k in range(f64w):
-            var dim_idx = j + k
-            inv[k] = 1.0 / (theta ** (Float64(2 * dim_idx) / Float64(half * 2)))
-
-        for pos in range(max_pos):
-            var sc = sincos_simd[polynomial_degree=8, width=f64w](SIMD[DType.float64, f64w](Float64(pos)) * inv)
-            (cos_buf + pos * half + j).store(sc.cos_val.cast[DType.float32]())
-            (sin_buf + pos * half + j).store(sc.sin_val.cast[DType.float32]())
-
-
 def init_rope_table_partial_strided[rotary_half: Int, rows: Int](
     cos_buf: F32Ptr, sin_buf: F32Ptr,
     theta: Float64, full_head_dim: Int,
@@ -187,3 +155,11 @@ def init_rope_table_partial_strided[rotary_half: Int, rows: Int](
                 SIMD[DType.float64, f64w](Float64(pos)) * inv)
             (cos_buf + row * rotary_half + j).store(sc.cos_val.cast[DType.float32]())
             (sin_buf + row * rotary_half + j).store(sc.sin_val.cast[DType.float32]())
+
+
+def init_rope_table[half: Int, max_pos: Int](
+    cos_buf: F32Ptr, sin_buf: F32Ptr,
+    theta: Float64,
+):
+    init_rope_table_partial_strided[half, max_pos](
+        cos_buf, sin_buf, theta, half * 2, 0, 1)

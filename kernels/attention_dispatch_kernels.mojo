@@ -5,6 +5,7 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     Binding, fanout_dispatch, fanout_dispatch_per_rank,
 )
+from .attention_ops import full_local_kv_count
 from .flash_attention import (
     FlashAttentionKernel, LinearKV, RingKV,
 )
@@ -22,15 +23,6 @@ def sliding_valid_len(pos: Int, window: Int) -> Int:
     if pos + 1 >= window:
         return window
     return pos + 1
-
-
-@always_inline
-def full_valid_count(rank: Int, pos: Int, degree: Int) -> Int:
-    if pos < 0:
-        return 0
-    if rank <= pos % degree:
-        return pos // degree + 1
-    return pos // degree
 
 
 def dispatch_sliding_attention[
@@ -133,7 +125,7 @@ def dispatch_full_attention[
     if seq_len == 1:
         var valid_lens = InlineArray[Int, tp](uninitialized=True)
         for rank in range(tp):
-            valid_lens[rank] = full_valid_count(rank, base_pos, tp)
+            valid_lens[rank] = full_local_kv_count(rank, base_pos, tp)
 
         comptime DecodeK = FlashAttentionKernel[
             LinearKV, head_dim, num_q, gqa_ratio, kv_stride,

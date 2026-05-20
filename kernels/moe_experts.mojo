@@ -8,7 +8,7 @@ from .helpers import (
     BF16Ptr, F32Ptr, I32Ptr, W, BW,
     fanout_dispatch, saturate_workers,
 )
-from .dpbf16 import bf16_panel_dot_to_scalars
+from .dot_products import bf16_panel_dot_to_scalars
 from .moe_router import SparseRoute, SparseRoutePtr
 
 
@@ -239,8 +239,8 @@ struct Phase2DownKernel[
     var moe_accum: F32Ptr
     var moe_partial: BF16Ptr
     var seq_len: Int
-    var start: Int
-    var end: Int
+    var col_start: Int
+    var col_end: Int
 
     def execute(mut self):
         comptime PU_DN = Self.PU_DN
@@ -251,11 +251,11 @@ struct Phase2DownKernel[
 
         for tok in range(self.seq_len):
             var acc_row = self.moe_accum + tok * Self.hidden
-            var m = self.start
-            while m + W <= self.end:
+            var m = self.col_start
+            while m + W <= self.col_end:
                 (acc_row + m).store(SIMD[DType.float32, W](0))
                 m += W
-            while m < self.end:
+            while m < self.col_end:
                 (acc_row + m)[] = Float32(0)
                 m += 1
 
@@ -280,7 +280,7 @@ struct Phase2DownKernel[
                         intermediate=Self.intermediate, port_unroll=PU_DN,
                     ](
                         self.routes, self.moe_accum, rec_start,
-                        hm_base, down_w, self.start, self.end,
+                        hm_base, down_w, self.col_start, self.col_end,
                     )
                     rec_block += MR
 
@@ -292,7 +292,7 @@ struct Phase2DownKernel[
                         intermediate=Self.intermediate, port_unroll=PU_DN,
                     ](
                         self.routes, self.moe_accum, rec_start,
-                        hm_base, down_w, self.start, self.end,
+                        hm_base, down_w, self.col_start, self.col_end,
                     )
                     rec_block += 1
 
@@ -301,19 +301,19 @@ struct Phase2DownKernel[
         for tok in range(self.seq_len):
             var acc_row = self.moe_accum + tok * Self.hidden
             var dst_row = self.moe_partial + tok * Self.hidden
-            var m = self.start
-            while m + W <= self.end:
+            var m = self.col_start
+            while m + W <= self.col_end:
                 var v = (acc_row + m).load[width=W]()
                 (dst_row + m).store(v.cast[DType.bfloat16]())
                 m += W
-            while m < self.end:
+            while m < self.col_end:
                 (dst_row + m)[] = (acc_row + m)[].cast[DType.bfloat16]()
                 m += 1
 
     @always_inline
     def install_range(mut self, start: Int, end: Int):
-        self.start = start * W
-        self.end = end * W
+        self.col_start = start * W
+        self.col_end = end * W
 
 
 def dispatch_phase2_down[

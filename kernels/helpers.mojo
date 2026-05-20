@@ -18,22 +18,11 @@ comptime BW = simd_width_of[DType.bfloat16]()
 
 
 trait OutputPartitionedKernel(BurstKernel):
-    """A kernel that runs over a (worker_id, start, end) slice.
-
-    `set_partition` is called by `tile_dispatch` once per worker, on a
-    clone of the proto, to install that worker's indices. Kernels that
-    only need (start, end) can ignore `worker_id`. Kernels that maintain
-    per-worker scratch (e.g. flash-attention partials) consume it.
-    """
-
     @always_inline
     def set_partition(mut self, worker_id: Int, start: Int, end: Int): ...
 
 
 trait RangePartitionedKernel(OutputPartitionedKernel):
-    """Kernel that only consumes (start, end). Implementers provide
-    `install_range`; `set_partition` is wired automatically."""
-
     @always_inline
     def install_range(mut self, start: Int, end: Int): ...
 
@@ -43,9 +32,6 @@ trait RangePartitionedKernel(OutputPartitionedKernel):
 
 
 trait WorkerRangePartitionedKernel(OutputPartitionedKernel):
-    """Kernel that also needs the worker id (per-worker scratch).
-    Implementers provide `install_worker_range`."""
-
     @always_inline
     def install_worker_range(
         mut self, worker_id: Int, start: Int, end: Int,
@@ -54,27 +40,6 @@ trait WorkerRangePartitionedKernel(OutputPartitionedKernel):
     @always_inline
     def set_partition(mut self, worker_id: Int, start: Int, end: Int):
         self.install_worker_range(worker_id, start, end)
-
-
-@always_inline
-def dot_into_accs[
-    port_unroll: Int,
-    x_dtype: DType, w_dtype: DType,
-    accum: DType, //,
-    cols: Int,
-](
-    x: UnsafePointer[Scalar[x_dtype], MutAnyOrigin],
-    w: UnsafePointer[Scalar[w_dtype], MutAnyOrigin],
-    mut accs: InlineArray[SIMD[accum, simd_width_of[accum]()], port_unroll],
-):
-    comptime width = simd_width_of[accum]()
-    comptime STRIDE = port_unroll * width
-    for i in range(cols // STRIDE):
-        comptime for p in range(port_unroll):
-            var off = i * STRIDE + p * width
-            var xv = (x + off).load[width=width]().cast[accum]()
-            var wv = (w + off).load[width=width]().cast[accum]()
-            accs[p] = xv.fma(wv, accs[p])
 
 
 @always_inline

@@ -1,7 +1,6 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
 
-from simd_math import fast_exp_softmax_biased
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
@@ -10,18 +9,11 @@ from .helpers import (
     fanout_dispatch, Binding,
     accumulate_scaled, scale_unrolled,
 )
-from .attention_ops import score_position, flash_partial_stride
+from .attention_ops import (
+    TILE, flash_partial_stride, full_local_kv_count, online_softmax_tile,
+)
+from .dot_products import dot_to_scalar
 from .logsum_merge import MergeSegment, write_finalized_head
-from .flash_attention import TILE
-
-
-@always_inline
-def full_local_kv_count(rank: Int, abs_pos: Int, degree: Int) -> Int:
-    if abs_pos < 0:
-        return 0
-    if rank <= abs_pos % degree:
-        return abs_pos // degree + 1
-    return abs_pos // degree
 
 
 @fieldwise_init
@@ -89,21 +81,13 @@ struct FlashPrefillSlidingKernel[
                         var k_head = self.k_base \
                                     + slot * Self.kv_stride \
                                     + kv_h * Self.head_dim
-                        scores[tt] = score_position[Self.head_dim](
+                        scores[tt] = dot_to_scalar[Self.head_dim](
                             q_ptrs[q_idx], k_head)
 
-                    var tile_max = scores.reduce_max()
-                    var m_new = tile_max if tile_max > m[q_idx] \
-                                else m[q_idx]
-
-                    var bias_x = max(
-                        SIMD[DType.float32, 1](-87.0),
-                        SIMD[DType.float32, 1](m[q_idx] - m_new))
-                    var corr = fast_exp_softmax_biased[1](bias_x)[0]
-                    var weights_x = max(
-                        SIMD[DType.float32, TILE](-87.0),
-                        scores - SIMD[DType.float32, TILE](m_new))
-                    var weights = fast_exp_softmax_biased[TILE](weights_x)
+                    var sm = online_softmax_tile[TILE](scores, m[q_idx])
+                    var m_new = sm[0]
+                    var corr = sm[1]
+                    var weights = sm[2]
 
                     scale_unrolled[cols=Self.head_dim](
                         acc_ptrs[q_idx], corr)
@@ -203,21 +187,13 @@ struct FlashPrefillFullKernel[
                         var k_head = self.k_base \
                                     + (pos + tt) * Self.kv_stride \
                                     + kv_h * Self.head_dim
-                        scores[tt] = score_position[Self.head_dim](
+                        scores[tt] = dot_to_scalar[Self.head_dim](
                             q_ptrs[q_idx], k_head)
 
-                    var tile_max = scores.reduce_max()
-                    var m_new = tile_max if tile_max > m[q_idx] \
-                                else m[q_idx]
-
-                    var bias_x = max(
-                        SIMD[DType.float32, 1](-87.0),
-                        SIMD[DType.float32, 1](m[q_idx] - m_new))
-                    var corr = fast_exp_softmax_biased[1](bias_x)[0]
-                    var weights_x = max(
-                        SIMD[DType.float32, TILE](-87.0),
-                        scores - SIMD[DType.float32, TILE](m_new))
-                    var weights = fast_exp_softmax_biased[TILE](weights_x)
+                    var sm = online_softmax_tile[TILE](scores, m[q_idx])
+                    var m_new = sm[0]
+                    var corr = sm[1]
+                    var weights = sm[2]
 
                     scale_unrolled[cols=Self.head_dim](
                         acc_ptrs[q_idx], corr)

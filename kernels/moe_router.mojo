@@ -3,15 +3,16 @@ from std.memory import UnsafePointer
 
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
-from simd_math import pick_port_unroll, tree_reduce_accs, fast_exp_softmax_biased
+from simd_math import fast_exp_softmax_biased
 from simd_math.ops import sqrt
 from .helpers import (
     WorkerRangePartitionedKernel, Binding,
     fanout_dispatch, saturate_workers,
-    BF16Ptr, F32Ptr, W, dot_into_accs,
+    BF16Ptr, F32Ptr, W,
 )
 from .dispatch_heuristics import ROUTER_INLINE_TOKENS
 from .rmsnorm import rms_reduce_row
+from .dot_products import dot_to_scalar
 
 
 @fieldwise_init
@@ -63,10 +64,8 @@ struct RouterShardedKernel[
     var end: Int
 
     def execute(mut self):
-        comptime PU = pick_port_unroll[W, Self.hidden]()
         comptime sqrt_n = sqrt[DType.float32, 1](Float32(Self.hidden))
-        comptime n_eps = Float32(
-            Float32(Self.hidden) * Self.rms_eps)
+        comptime n_eps = Float32(Self.hidden) * Self.rms_eps
         comptime sentinel = Float32(-1.0e30)
 
         var scratch = self.scaled_scratch + self.worker_id * Self.hidden
@@ -85,10 +84,7 @@ struct RouterShardedKernel[
                 fill=RouterCandidate(Int32(0), sentinel))
             for e in range(Self.experts_per_rank):
                 var row = self.router_proj + e * Self.hidden
-                var accs = InlineArray[SIMD[DType.float32, W], PU](
-                    fill=SIMD[DType.float32, W](0))
-                dot_into_accs[cols=Self.hidden](scratch, row, accs)
-                var logit = tree_reduce_accs(accs)
+                var logit = dot_to_scalar[Self.hidden](scratch, row)
                 insert_candidate[Self.top_k](
                     Int32(self.expert_base + e), logit, cands)
 

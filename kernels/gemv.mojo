@@ -1,15 +1,13 @@
-from std.collections import InlineArray
-
-from simd_math import pick_port_unroll, tree_reduce_accs
 from simd_math.ops import tanh_f32
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     RangePartitionedKernel,
     fanout_dispatch,
-    Binding, BF16Ptr, W, dot_into_accs,
+    Binding, BF16Ptr,
 )
 from .dispatch_heuristics import GEMV_INLINE_ROWS
+from .dot_products import dot_to_scalar
 
 
 @always_inline
@@ -30,13 +28,9 @@ def gemv_softcap_range[
     x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
     start: Int, end: Int,
 ):
-    comptime PU = pick_port_unroll[W, cols]()
-    var accs = InlineArray[SIMD[DType.float32, W], PU](uninitialized=True)
     for row in range(start, end):
-        comptime for p in range(PU):
-            accs[p] = SIMD[DType.float32, W](0)
-        dot_into_accs[cols=cols](x, weight + row * cols, accs)
-        var capped = softcap_value[cap](tree_reduce_accs(accs))
+        var dot = dot_to_scalar[cols](x, weight + row * cols)
+        var capped = softcap_value[cap](SIMD[DType.float32, 1](dot))
         (output + row)[] = capped.cast[DType.bfloat16]()
 
 

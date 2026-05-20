@@ -1,15 +1,14 @@
 from std.collections import InlineArray
 
-from simd_math import fast_exp_softmax_biased
 from .helpers import (
     BF16Ptr, F32Ptr, W,
     WorkerRangePartitionedKernel,
     accumulate_scaled, scale_unrolled,
 )
-from .attention_ops import score_position, flash_partial_stride
-
-
-comptime TILE = W
+from .attention_ops import (
+    TILE, flash_partial_stride, online_softmax_tile,
+)
+from .dot_products import dot_to_scalar
 
 
 trait KVSlot:
@@ -76,16 +75,13 @@ struct FlashAttentionKernel[
                     var s_idx = Self.KV.slot(self.start_pos, pos + t)
                     var k_head = self.k_base + s_idx * Self.kv_stride \
                                  + kv_h * Self.head_dim
-                    scores[t] = score_position[Self.head_dim](
+                    scores[t] = dot_to_scalar[Self.head_dim](
                         q_ptrs[q_idx], k_head)
 
-                var tile_max = scores.reduce_max()
-                var m_new = tile_max if tile_max > m[q_idx] else m[q_idx]
-
-                var corr = fast_exp_softmax_biased[1](
-                    SIMD[DType.float32, 1](m[q_idx] - m_new))[0]
-                var weights = fast_exp_softmax_biased[TILE](
-                    scores - SIMD[DType.float32, TILE](m_new))
+                var sm = online_softmax_tile[TILE](scores, m[q_idx])
+                var m_new = sm[0]
+                var corr = sm[1]
+                var weights = sm[2]
 
                 scale_unrolled[cols=Self.head_dim](acc_ptrs[q_idx], corr)
                 l[q_idx] = l[q_idx] * corr + weights.reduce_add()
@@ -111,5 +107,3 @@ struct FlashAttentionKernel[
         self.worker_id = worker_id
         self.start = start
         self.end = end
-
-

@@ -1,25 +1,20 @@
 from std.algorithm import vectorize
-from std.collections import InlineArray
 
 from simd_math.ops import sqrt
-from simd_math import pick_port_unroll, tree_reduce_accs
 from threading.threading_traits import BurstThreadPool
 from notstdcollections import HeapMoveArray
 from .helpers import (
     Chain, RangePartitionedKernel,
     fanout_dispatch, saturate_workers,
-    Binding, BF16Ptr, W, dot_into_accs,
+    Binding, BF16Ptr, W,
 )
 from .dispatch_heuristics import NORM_INLINE_TOKENS
+from .dot_products import dot_to_scalar
 
 
 @always_inline
 def rms_reduce_row[hidden: Int](src: BF16Ptr) -> Float32:
-    comptime PU = pick_port_unroll[W, hidden]()
-    var accs = InlineArray[SIMD[DType.float32, W], PU](
-        fill=SIMD[DType.float32, W](0))
-    dot_into_accs[cols=hidden](src, src, accs)
-    return tree_reduce_accs(accs)
+    return dot_to_scalar[hidden](src, src)
 
 
 @always_inline

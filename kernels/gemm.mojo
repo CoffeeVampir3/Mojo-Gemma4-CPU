@@ -9,7 +9,7 @@ from .helpers import (
     Binding, BF16Ptr, BW,
 )
 from .dispatch_heuristics import GEMV_INLINE_ROWS
-from .dpbf16 import bf16_panel_dot_to_scalars
+from .dot_products import bf16_panel_dot_to_scalars
 
 
 @always_inline
