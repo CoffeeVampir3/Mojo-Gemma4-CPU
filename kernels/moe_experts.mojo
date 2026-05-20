@@ -56,11 +56,9 @@ def emit_gate_up_panel[
 @fieldwise_init
 struct Phase1GateUpKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, experts_per_rank: Int,
+    tile_j: Int = 64, MR: Int = 4,
 ](WorkerRangePartitionedKernel):
-    comptime TILE_J = 64
-    comptime MR = 4
     comptime PU_GU = 4
-    comptime WORKER_SCRATCH_ELEMS = Self.MR * 2 * Self.TILE_J
 
     var x_normed: BF16Ptr
     var expert_offset: I32Ptr
@@ -75,20 +73,18 @@ struct Phase1GateUpKernel[
     def execute(mut self):
         comptime PU_GU = Self.PU_GU
         comptime STRIDE_GU = PU_GU * BW
-        comptime MR = Self.MR
-        comptime tile_j = Self.TILE_J
 
-        comptime assert Self.intermediate % tile_j == 0, (
+        comptime assert Self.intermediate % Self.tile_j == 0, (
             "Phase1: intermediate must be divisible by tile_j")
-        comptime assert tile_j % W == 0, (
+        comptime assert Self.tile_j % W == 0, (
             "Phase1: tile_j must be a multiple of f32 SIMD width")
         comptime assert Self.hidden % STRIDE_GU == 0, (
             "Phase1: hidden must be divisible by STRIDE_GU")
         comptime assert Self.gate_up_fused == 2 * Self.intermediate, (
             "Phase1: gate_up_fused must be 2 * intermediate")
-        comptime n_tiles = Self.intermediate // tile_j
+        comptime n_tiles = Self.intermediate // Self.tile_j
         comptime total_tiles = Self.experts_per_rank * n_tiles
-        comptime worker_part = MR * 2 * tile_j
+        comptime worker_part = Self.MR * 2 * Self.tile_j
 
         debug_assert(
             self.start >= 0 and self.start <= self.end and self.end <= total_tiles,
@@ -97,12 +93,12 @@ struct Phase1GateUpKernel[
 
         var worker_base = self.gate_scratch + self.worker_id * worker_part
         var gate_part = worker_base
-        var up_part = worker_base + MR * tile_j
+        var up_part = worker_base + Self.MR * Self.tile_j
 
         for tile_idx in range(self.start, self.end):
             var expert = tile_idx // n_tiles
             var t_in_expert = tile_idx % n_tiles
-            var j_lo = t_in_expert * tile_j
+            var j_lo = t_in_expert * Self.tile_j
 
             var rec_lo = Int(self.expert_offset[expert])
             var rec_hi = Int(self.expert_offset[expert + 1])
@@ -115,21 +111,21 @@ struct Phase1GateUpKernel[
             var up_w_base = gu_w + (Self.intermediate + j_lo) * Self.hidden
 
             var rec_block = 0
-            while rec_block + MR <= n_tok:
+            while rec_block + Self.MR <= n_tok:
                 var bucket_base = (
                     self.hidden_bucket
                     + (rec_lo + rec_block) * Self.intermediate
                     + j_lo)
                 emit_gate_up_panel[
-                    panel=MR, hidden=Self.hidden,
-                    intermediate=Self.intermediate, tile_j=tile_j,
+                    panel=Self.MR, hidden=Self.hidden,
+                    intermediate=Self.intermediate, tile_j=Self.tile_j,
                     port_unroll=PU_GU,
                 ](
                     self.routes, self.x_normed, rec_lo + rec_block,
                     gate_w_base, up_w_base,
                     gate_part, up_part, bucket_base,
                 )
-                rec_block += MR
+                rec_block += Self.MR
 
             while rec_block < n_tok:
                 var bucket_base = (
@@ -138,7 +134,7 @@ struct Phase1GateUpKernel[
                     + j_lo)
                 emit_gate_up_panel[
                     panel=1, hidden=Self.hidden,
-                    intermediate=Self.intermediate, tile_j=tile_j,
+                    intermediate=Self.intermediate, tile_j=Self.tile_j,
                     port_unroll=PU_GU,
                 ](
                     self.routes, self.x_normed, rec_lo + rec_block,
@@ -159,7 +155,8 @@ struct Phase1GateUpKernel[
 def dispatch_phase1_gate_up[
     P: BurstThreadPool, //,
     hidden: Int, gate_up_fused: Int, intermediate: Int,
-    experts_per_rank: Int, tp: Int, max_worker_count: Int = 128,
+    experts_per_rank: Int, tp: Int,
+    tile_j: Int = 64, MR: Int = 4, max_worker_count: Int = 128,
 ](
     x_normed: Binding[BFloat16, tp],
     expert_offset: Binding[Int32, tp],
@@ -170,9 +167,9 @@ def dispatch_phase1_gate_up[
     mut pools: HeapMoveArray[P],
 ):
     comptime K = Phase1GateUpKernel[
-        hidden, gate_up_fused, intermediate, experts_per_rank,
+        hidden, gate_up_fused, intermediate, experts_per_rank, tile_j, MR,
     ]
-    comptime n_tiles = intermediate // K.TILE_J
+    comptime n_tiles = intermediate // tile_j
     comptime total_units = experts_per_rank * n_tiles
 
     @parameter

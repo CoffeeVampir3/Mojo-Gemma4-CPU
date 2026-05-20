@@ -4,7 +4,7 @@ from .helpers import (
     BF16Ptr, F32Ptr,
     WorkerRangePartitionedKernel,
 )
-from .attention_ops import KVSlot, TILE, process_kv_tile
+from .attention_ops import KVSlot, TILE, process_kv_tile, zero_accumulators
 
 
 @fieldwise_init
@@ -35,6 +35,8 @@ struct FlashAttentionKernel[
         comptime for h in range(Self.num_q):
             acc_ptrs[h] = my_partial + h * Self.head_dim
             q_ptrs[h] = self.q + h * Self.head_dim
+
+        zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs)
 
         var pos = self.start
         while pos < self.end:

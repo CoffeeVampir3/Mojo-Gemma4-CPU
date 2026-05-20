@@ -50,8 +50,8 @@ def insert_candidate[top_k: Int](
 
 @fieldwise_init
 struct RouterShardedKernel[
-    hidden: Int, experts_per_rank: Int, top_k: Int,
-    rms_eps: Float32,
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
+    experts_per_rank: Int, top_k: Int,
 ](WorkerRangePartitionedKernel):
     var x: BF16Ptr
     var router_proj: BF16Ptr
@@ -64,8 +64,6 @@ struct RouterShardedKernel[
     var end: Int
 
     def execute(mut self):
-        comptime sqrt_n = sqrt[DType.float32, 1](Float32(Self.hidden))
-        comptime n_eps = Float32(Self.hidden) * Self.rms_eps
         comptime sentinel = Float32(-1.0e30)
 
         var scratch = self.scaled_scratch + self.worker_id * Self.hidden
@@ -73,7 +71,8 @@ struct RouterShardedKernel[
             var x_row = self.x + tok * Self.hidden
 
             var sum_sq = rms_reduce_row[Self.hidden](x_row)
-            var inv_rms = sqrt_n / sqrt[DType.float32, 1](sum_sq + n_eps)
+            var inv_rms = Self.sqrt_n / sqrt[DType.float32, 1](
+                sum_sq + Self.n_eps)
             var inv_vec = SIMD[DType.float32, W](inv_rms)
             for j in range(0, Self.hidden, W):
                 var xv = (x_row + j).load[width=W]().cast[DType.float32]()
@@ -103,8 +102,9 @@ struct RouterShardedKernel[
 
 def dispatch_router_sharded[
     P: BurstThreadPool, //,
-    hidden: Int, experts_per_rank: Int, top_k: Int, tp: Int,
-    rms_eps: Float32, max_worker_count: Int = 128,
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
+    experts_per_rank: Int, top_k: Int, tp: Int,
+    max_worker_count: Int = 128,
 ](
     x: Binding[BFloat16, tp],
     router_proj: Binding[BFloat16, tp],
@@ -114,7 +114,9 @@ def dispatch_router_sharded[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    comptime K = RouterShardedKernel[hidden, experts_per_rank, top_k, rms_eps]
+    comptime K = RouterShardedKernel[
+        hidden, sqrt_n, n_eps, experts_per_rank, top_k,
+    ]
 
     @parameter
     def make(r: Int) -> K:

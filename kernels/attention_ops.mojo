@@ -44,6 +44,17 @@ def full_local_kv_count(rank: Int, abs_pos: Int, degree: Int) -> Int:
 
 
 @always_inline
+def zero_accumulators[num_q: Int, head_dim: Int](
+    read acc_ptrs: InlineArray[F32Ptr, num_q],
+):
+    comptime assert head_dim % W == 0, (
+        "attention head_dim must be divisible by f32 SIMD width")
+    comptime for h in range(num_q):
+        for j in range(0, head_dim, W):
+            (acc_ptrs[h] + j).store(SIMD[DType.float32, W](0))
+
+
+@always_inline
 def online_softmax_tile[
     tile: Int,
 ](

@@ -26,7 +26,6 @@ from kernels.moe_router import (
 )
 from kernels.moe_experts import (
     dispatch_phase1_gate_up, dispatch_phase2_down,
-    Phase1GateUpKernel,
 )
 from kernels.elementwise import dispatch_gelu_gate_up, dispatch_scalar_mul
 from modeling.temporal_scratch import (
@@ -332,6 +331,8 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     comptime S = Gemma4Shapes[Self.degree]
     comptime intermediate_per_rank = Self.S.GateUp.DATA_N
     comptime experts_per_rank = C.NUM_EXPERTS // Self.degree
+    comptime PHASE1_TILE_J = 64
+    comptime PHASE1_MR = 4
 
     comptime PHASES = ScratchPhaseOrder[
         "ffn_rms_norm", "gemv_gate", "gemv_up", "gelu_gate_up",
@@ -395,10 +396,7 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     ]
     var moe_gate_scratch: ScratchBuffer[
         Float32,
-        Self.max_worker_count * Phase1GateUpKernel[
-            C.HIDDEN, C.MOE_GATE_UP_FUSED, C.MOE_INTERMEDIATE,
-            Self.experts_per_rank,
-        ].WORKER_SCRATCH_ELEMS,
+        Self.max_worker_count * Self.PHASE1_MR * 2 * Self.PHASE1_TILE_J,
     ]
 
     var phase2_accum: ScratchPhase["phase2_down", "phase2_down"]
@@ -738,7 +736,6 @@ def dispatch_moe[
     comptime experts_per_rank = C.NUM_EXPERTS // degree
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
-    comptime rms_eps = Float32(C.RMS_NORM_EPS)
     comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
 
     var per_expert_scale_ptr = body.router_pes.at(ctx.layer_base)
@@ -755,8 +752,9 @@ def dispatch_moe[
     var gate_scratch = scratch.binding[Ffn, "moe_gate_scratch"](ctx)
 
     dispatch_router_sharded[
-        hidden=C.HIDDEN, experts_per_rank=experts_per_rank,
-        top_k=C.TOP_K, tp=degree, rms_eps=rms_eps,
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+        experts_per_rank=experts_per_rank,
+        top_k=C.TOP_K, tp=degree,
         max_worker_count=max_worker_count,
     ](x_input,
       body.router_proj.binding(ctx),
@@ -779,6 +777,7 @@ def dispatch_moe[
         hidden=C.HIDDEN, gate_up_fused=C.MOE_GATE_UP_FUSED,
         intermediate=C.MOE_INTERMEDIATE,
         experts_per_rank=experts_per_rank, tp=degree,
+        tile_j=Ffn.PHASE1_TILE_J, MR=Ffn.PHASE1_MR,
         max_worker_count=max_worker_count,
     ](x_normed, expert_offset, routes,
       body.experts_gate_up.binding(ctx),

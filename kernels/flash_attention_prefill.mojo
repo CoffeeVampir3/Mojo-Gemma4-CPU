@@ -10,6 +10,7 @@ from .helpers import (
 )
 from .attention_ops import (
     LinearKV, RingKV, TILE, full_local_kv_count, process_kv_tile,
+    zero_accumulators,
 )
 from .logsum_merge import MergeSegment, write_finalized_head
 
@@ -52,6 +53,8 @@ struct FlashPrefillSlidingKernel[
             var l = InlineArray[Float32, Self.num_q](fill=Float32(0))
             comptime for h in range(Self.num_q):
                 q_ptrs[h] = q_tok + h * Self.head_dim
+
+            zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs)
 
             var pos = lo
             while pos < hi:
@@ -124,6 +127,8 @@ struct FlashPrefillFullKernel[
             comptime for h in range(Self.num_q):
                 acc_ptrs[h] = partial_tok + h * Self.head_dim
                 q_ptrs[h] = q_tok + h * Self.head_dim
+
+            zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs)
 
             var pos = 0
             while pos < local_kv_count:
