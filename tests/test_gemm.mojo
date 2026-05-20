@@ -2,13 +2,11 @@ from std.memory import Span, UnsafePointer, alloc
 from std.os import abort
 
 from kernels.gemm import dispatch_gemm
-from kernels.gemv import dispatch_gemv
 from kernels.helpers import Binding, ArenaBases
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
-comptime BASES = ArenaBases[1].fill(0)
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 
 
@@ -89,13 +87,15 @@ def run_gemm_case[rows: Int, cols: Int, MR: Int](m: Int, label: String):
 
     var pools = HeapMoveArray[TestPool](1)
     pools.push(TestPool(4, 0))
+    var bases = ArenaBases[1].uninitialized()
+    bases[0] = 0
 
     dispatch_gemm[
         rows=rows, cols=cols, tp=1, MR=MR,
     ](
-        Binding[BFloat16, 1](x, BASES),
-        Binding[BFloat16, 1](w, BASES),
-        Binding[BFloat16, 1](got, BASES),
+        Binding[BFloat16, 1](x, bases),
+        Binding[BFloat16, 1](w, bases),
+        Binding[BFloat16, 1](got, bases),
         m, pools)
 
     if m == 0:
@@ -131,48 +131,6 @@ def test_gemm_correctness():
     run_gemm_case[rows=16, cols=2816, MR=4](4, "FFN gate cols=2816")
 
 
-def test_gemm_matches_gemv_at_m1():
-    comptime rows = 16
-    comptime cols = 2816
-    var x = alloc[BFloat16](cols).as_any_origin()
-    var w = alloc[BFloat16](rows * cols).as_any_origin()
-    var out_gemm = alloc[BFloat16](rows).as_any_origin()
-    var out_gemv = alloc[BFloat16](rows).as_any_origin()
-
-    fill_pattern(x, cols, 0)
-    fill_pattern(w, rows * cols, 7)
-    for i in range(rows):
-        out_gemm[i] = BFloat16(0.0)
-        out_gemv[i] = BFloat16(0.0)
-
-    var pools = HeapMoveArray[TestPool](1)
-    pools.push(TestPool(4, 0))
-
-    dispatch_gemm[
-        rows=rows, cols=cols, tp=1, MR=4,
-    ](
-        Binding[BFloat16, 1](x, BASES),
-        Binding[BFloat16, 1](w, BASES),
-        Binding[BFloat16, 1](out_gemm, BASES),
-        1, pools)
-
-    dispatch_gemv[
-        rows=rows, cols=cols, tp=1,
-    ](
-        Binding[BFloat16, 1](x, BASES),
-        Binding[BFloat16, 1](w, BASES),
-        Binding[BFloat16, 1](out_gemv, BASES),
-        pools)
-
-    for n in range(rows):
-        var g = Float32(out_gemm[n])
-        var v = Float32(out_gemv[n])
-        assert_close(g, v, "m=1 gemm-vs-gemv n=" + String(n))
-
-    x.free(); w.free(); out_gemm.free(); out_gemv.free()
-
-
 def main():
     test_gemm_correctness()
-    test_gemm_matches_gemv_at_m1()
     print("gemm tests passed")

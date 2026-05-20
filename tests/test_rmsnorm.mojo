@@ -17,7 +17,6 @@ comptime SQRT_N = sqrt[DType.float32, 1](HIDDEN)
 comptime N_EPS = HIDDEN * 1e-6
 
 comptime BF16ExtPtr = UnsafePointer[BFloat16, MutExternalOrigin]
-comptime BASES = ArenaBases[1].fill(0)
 
 
 @fieldwise_init
@@ -100,10 +99,12 @@ def check_rms_norm_seq(count: Int):
 
     var pools = HeapMoveArray[TestPool](1)
     pools.push(TestPool(4, 0))
+    var bases = ArenaBases[1].uninitialized()
+    bases[0] = 0
     dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=1](
-        Binding[BFloat16, 1](src_any, BASES),
-        Binding[BFloat16, 1](got_any, BASES),
-        Binding[BFloat16, 1](weight_any, BASES),
+        Binding[BFloat16, 1](src_any, bases),
+        Binding[BFloat16, 1](got_any, bases),
+        Binding[BFloat16, 1](weight_any, bases),
         count, pools)
     assert_same(got, expected, total, "rms dispatch output")
 
@@ -140,13 +141,15 @@ def check_fused_norm_residual_add_seq(count: Int):
 
     var pools = HeapMoveArray[TestPool](1)
     pools.push(TestPool(4, 0))
+    var bases = ArenaBases[1].uninitialized()
+    bases[0] = 0
     fused_norm_residual_add[
         hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=1,
     ](
-        Binding[BFloat16, 1](src_any, BASES),
-        Binding[BFloat16, 1](got_any, BASES),
-        Binding[BFloat16, 1](got_any, BASES),
-        Binding[BFloat16, 1](weight_any, BASES),
+        Binding[BFloat16, 1](src_any, bases),
+        Binding[BFloat16, 1](got_any, bases),
+        Binding[BFloat16, 1](got_any, bases),
+        Binding[BFloat16, 1](weight_any, bases),
         count, pools)
 
     assert_same(got, expected, total, "fused norm residual add output")

@@ -70,11 +70,11 @@ comptime SlidingAttentionContract[degree: Int]: Bool = (
 )
 
 
-comptime FullAttentionContract[degree: Int]: Bool = (
+comptime FullAttentionContract[degree: Int, max_seq_len: Int]: Bool = (
     degree > 0
     and C.NUM_HEADS % degree == 0
     and C.Q_DIM_FULL % degree == 0
-    and C.MAX_SEQ_LEN % degree == 0
+    and max_seq_len % degree == 0
 )
 
 
@@ -117,7 +117,7 @@ struct Gemma4Shapes[degree: Int]:
     ]
 
 
-struct Gemma4StateShapes[degree: Int]:
+struct Gemma4StateShapes[degree: Int, max_seq_len: Int]:
     """Distribution choices for per-token state tensors.
 
     `D` shards a tensor across the `degree` ranks (one slice per rank).
@@ -134,9 +134,9 @@ struct Gemma4StateShapes[degree: Int]:
     comptime Local = DistributionDegree[1]
     comptime SLIDING_CACHE = 2 * C.SLIDING_WINDOW
     comptime SlidingKV   = TensorColumnSharded[Self.SLIDING_CACHE, C.KV_DIM_SLIDING, Self.D]
-    comptime FullKV      = ContextRowSharded[C.MAX_SEQ_LEN, C.KV_DIM_FULL, Self.D]
-    comptime SlidingRope = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_SLIDING, Self.Local]
-    comptime FullRope    = ContextRowSharded[C.MAX_SEQ_LEN, C.ROPE_HALF_FULL, Self.Local]
+    comptime FullKV      = ContextRowSharded[Self.max_seq_len, C.KV_DIM_FULL, Self.D]
+    comptime SlidingRope = ContextRowSharded[Self.max_seq_len, C.ROPE_HALF_SLIDING, Self.Local]
+    comptime FullRope    = ContextRowSharded[Self.max_seq_len, C.ROPE_HALF_FULL, Self.Local]
 
 
 struct Gemma4TailShapes[degree: Int]:
@@ -194,22 +194,22 @@ struct FullLayerRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     var body: BodyRefs[Self.degree]
 
 
-struct SlidingKVSlots[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
-    comptime S = Gemma4StateShapes[Self.degree]
+struct SlidingKVSlots[degree: Int, max_seq_len: Int](Copyable, ImplicitlyCopyable, SlotGroup):
+    comptime S = Gemma4StateShapes[Self.degree, Self.max_seq_len]
     var k: Slot[BF16, Self.S.SlidingKV]
     var v: Slot[BF16, Self.S.SlidingKV]
 
 
-struct FullKVSlots[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
-    comptime S = Gemma4StateShapes[Self.degree]
+struct FullKVSlots[degree: Int, max_seq_len: Int](Copyable, ImplicitlyCopyable, SlotGroup):
+    comptime S = Gemma4StateShapes[Self.degree, Self.max_seq_len]
     var k: Slot[BF16, Self.S.FullKV]
     var v: Slot[BF16, Self.S.FullKV]
 
 
-struct RopeSlots[half: Int, degree: Int = 1](Copyable, ImplicitlyCopyable, SlotGroup):
+struct RopeSlots[half: Int, max_seq_len: Int, degree: Int = 1](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime D = DistributionDegree[Self.degree]
-    var cos: Slot[F32, ContextRowSharded[C.MAX_SEQ_LEN, Self.half, Self.D]]
-    var sin: Slot[F32, ContextRowSharded[C.MAX_SEQ_LEN, Self.half, Self.D]]
+    var cos: Slot[F32, ContextRowSharded[Self.max_seq_len, Self.half, Self.D]]
+    var sin: Slot[F32, ContextRowSharded[Self.max_seq_len, Self.half, Self.D]]
 
 
 struct ActivationSlots(Copyable, ImplicitlyCopyable, SlotGroup):
@@ -224,16 +224,16 @@ struct TailRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
 
 
 @fieldwise_init
-struct Gemma4Layout[degree: Int](Copyable, ImplicitlyCopyable):
+struct Gemma4Layout[degree: Int, max_seq_len: Int](Copyable, ImplicitlyCopyable):
     var arena: ArenaLayout
     var sliding: Repeated[SlidingLayerRefs[Self.degree]]
     var full: Repeated[FullLayerRefs[Self.degree]]
 
-    var sliding_kv: Repeated[SlidingKVSlots[Self.degree]]
-    var full_kv: Repeated[FullKVSlots[Self.degree]]
+    var sliding_kv: Repeated[SlidingKVSlots[Self.degree, Self.max_seq_len]]
+    var full_kv: Repeated[FullKVSlots[Self.degree, Self.max_seq_len]]
     var activations: ActivationSlots
-    var sliding_rope: RopeSlots[C.ROPE_HALF_SLIDING]
-    var full_rope: RopeSlots[C.ROPE_HALF_FULL]
+    var sliding_rope: RopeSlots[C.ROPE_HALF_SLIDING, Self.max_seq_len]
+    var full_rope: RopeSlots[C.ROPE_HALF_FULL, Self.max_seq_len]
 
     var tail: Repeated[TailRefs[Self.degree]]
 
@@ -256,7 +256,7 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     comptime head_dim = C.HEAD_DIM_SLIDING
     comptime num_kv_heads = Self.kv_rows // Self.head_dim
     comptime num_q_heads = Self.q_rows // Self.head_dim
-    comptime cache_size = Gemma4StateShapes[Self.degree].SLIDING_CACHE
+    comptime cache_size = 2 * C.SLIDING_WINDOW
     comptime FlashK = FlashAttentionKernel[
         RingKV[Self.cache_size],
         Self.head_dim, Self.num_q_heads,
@@ -457,10 +457,10 @@ comptime Gemma4ScratchPool[
 
 
 def build_gemma4_plan[
-    degree: Int, max_worker_count: Int = 128,
-](mut descs: List[WeightDesc]) -> Gemma4Layout[degree]:
+    degree: Int, max_seq_len: Int, max_worker_count: Int = 128,
+](mut descs: List[WeightDesc]) -> Gemma4Layout[degree, max_seq_len]:
     comptime assert SlidingAttentionContract[degree], "sliding attention distribution contract failed"
-    comptime assert FullAttentionContract[degree], "full attention distribution contract failed"
+    comptime assert FullAttentionContract[degree, max_seq_len], "full attention distribution contract failed"
     comptime assert DenseMlpContract[degree], "dense MLP distribution contract failed"
     comptime assert MoeContract[degree], "MoE distribution contract failed"
     comptime assert LmHeadContract[degree], "LM head distribution contract failed"
@@ -493,15 +493,15 @@ def build_gemma4_plan[
 
     var state_cursor = distributed
 
-    var skv_proto = SlidingKVSlots[degree]()
+    var skv_proto = SlidingKVSlots[degree, max_seq_len]()
     var skv_stride = stamp_offsets(skv_proto)
-    var sliding_kv = Repeated[SlidingKVSlots[degree]](
+    var sliding_kv = Repeated[SlidingKVSlots[degree, max_seq_len]](
         skv_proto, state_cursor, skv_stride, C.NUM_SLIDING_LAYERS)
     state_cursor = align_up(state_cursor + C.NUM_SLIDING_LAYERS * skv_stride)
 
-    var fkv_proto = FullKVSlots[degree]()
+    var fkv_proto = FullKVSlots[degree, max_seq_len]()
     var fkv_stride = stamp_offsets(fkv_proto)
-    var full_kv = Repeated[FullKVSlots[degree]](
+    var full_kv = Repeated[FullKVSlots[degree, max_seq_len]](
         fkv_proto, state_cursor, fkv_stride, C.NUM_FULL_LAYERS)
     state_cursor = align_up(state_cursor + C.NUM_FULL_LAYERS * fkv_stride)
 
@@ -513,9 +513,9 @@ def build_gemma4_plan[
     var scratch_off = state_cursor
     state_cursor = align_up(state_cursor + scratch_cap)
 
-    var sliding_rope = RopeSlots[C.ROPE_HALF_SLIDING]()
+    var sliding_rope = RopeSlots[C.ROPE_HALF_SLIDING, max_seq_len]()
     state_cursor = stamp_offsets(sliding_rope, state_cursor)
-    var full_rope = RopeSlots[C.ROPE_HALF_FULL]()
+    var full_rope = RopeSlots[C.ROPE_HALF_FULL, max_seq_len]()
     state_cursor = stamp_offsets(full_rope, state_cursor)
 
     var arena = ArenaLayout(
@@ -525,7 +525,7 @@ def build_gemma4_plan[
         host_bytes=align_up(state_cursor),
         scratch_off=scratch_off,
     )
-    return Gemma4Layout[degree](
+    return Gemma4Layout[degree, max_seq_len](
         arena=arena,
         sliding=Repeated[SlidingLayerRefs[degree]](sl_proto, sl_off, sl_stride, C.NUM_SLIDING_LAYERS),
         full=Repeated[FullLayerRefs[degree]](fl_proto, fl_off, fl_stride, C.NUM_FULL_LAYERS),
@@ -536,9 +536,9 @@ def build_gemma4_plan[
 
 
 def dispatch_sliding_attention_qkv[
-    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
+    P: BurstThreadPool, //, degree: Int, max_seq_len: Int, max_worker_count: Int = 128,
 ](
-    layout: Gemma4Layout[degree],
+    layout: Gemma4Layout[degree, max_seq_len],
     ctx: BindContext[degree],
     base_pos: Int,
     seq_len: Int,
@@ -562,7 +562,7 @@ def dispatch_sliding_attention_qkv[
     comptime hd_eps = head_dim * C.RMS_NORM_EPS
     comptime rope_half = C.ROPE_HALF_SLIDING
     comptime kv_cols = kv_rows
-    comptime cache_size = Gemma4StateShapes[degree].SLIDING_CACHE
+    comptime cache_size = Gemma4StateShapes[degree, max_seq_len].SLIDING_CACHE
     comptime Island = Gemma4SlidingScratch[degree, max_worker_count]
 
     debug_assert(
@@ -634,9 +634,9 @@ def dispatch_sliding_attention_qkv[
 
 
 def dispatch_full_attention_qkv[
-    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
+    P: BurstThreadPool, //, degree: Int, max_seq_len: Int, max_worker_count: Int = 128,
 ](
-    layout: Gemma4Layout[degree],
+    layout: Gemma4Layout[degree, max_seq_len],
     ctx: BindContext[degree],
     base_pos: Int,
     seq_len: Int,
@@ -881,19 +881,20 @@ def dispatch_ffn[
 
 
 struct Gemma4[
-    degree: Int, max_worker_count: Int = 128,
+    degree: Int, max_seq_len: Int = 8192,
+    max_worker_count: Int = 128,
     Pool: BurstThreadPool = BurstPool[],
 ](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[Self.Pool]
-    var layout: Gemma4Layout[Self.degree]
+    var layout: Gemma4Layout[Self.degree, Self.max_seq_len]
     var scratch: Gemma4ScratchPool[Self.degree, Self.max_worker_count]
     var arena_bases: ArenaBases[Self.degree]
 
     def __init__(out self,
         var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
         var pools: HeapMoveArray[Self.Pool],
-        layout: Gemma4Layout[Self.degree],
+        layout: Gemma4Layout[Self.degree, Self.max_seq_len],
     ):
         self.arena_bases = ArenaBases[Self.degree].uninitialized()
         for r in range(Self.degree):
@@ -933,12 +934,12 @@ struct Gemma4[
             var base = self.arena_bases[rank]
             var sl_cos = layout.sliding_rope.cos.at(base)
             var sl_sin = layout.sliding_rope.sin.at(base)
-            init_rope_table[C.ROPE_HALF_SLIDING, C.MAX_SEQ_LEN](
+            init_rope_table[C.ROPE_HALF_SLIDING, Self.max_seq_len](
                 sl_cos, sl_sin, 10000.0)
             var fl_cos = layout.full_rope.cos.at(base)
             var fl_sin = layout.full_rope.sin.at(base)
             init_rope_table_partial_strided[
-                C.ROPE_HALF_FULL, C.MAX_SEQ_LEN,
+                C.ROPE_HALF_FULL, Self.max_seq_len,
             ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, 0, 1)
         print("  rope tables initialized")
 
@@ -960,8 +961,8 @@ struct Gemma4[
         var total_len = len(token_ids)
         debug_assert(total_len > 0, "forward called with empty token_ids")
         debug_assert(
-            base_pos + total_len <= C.MAX_SEQ_LEN,
-            "forward exceeds MAX_SEQ_LEN",
+            base_pos + total_len <= Self.max_seq_len,
+            "forward exceeds max_seq_len",
         )
 
         var ctx = BindContext[Self.degree](
@@ -1017,6 +1018,7 @@ struct Gemma4[
                 if entry.kind == LayerKind.FULL:
                     dispatch_full_attention_qkv[
                         degree=Self.degree,
+                        max_seq_len=Self.max_seq_len,
                         max_worker_count=Self.max_worker_count,
                     ](
                         layout, ctx, pos, chunk_len, entry.local_idx,
@@ -1024,6 +1026,7 @@ struct Gemma4[
                 else:
                     dispatch_sliding_attention_qkv[
                         degree=Self.degree,
+                        max_seq_len=Self.max_seq_len,
                         max_worker_count=Self.max_worker_count,
                     ](
                         layout, ctx, pos, chunk_len, entry.local_idx,
@@ -1082,7 +1085,7 @@ struct Gemma4[
 
         var descs = List[WeightDesc]()
         var layout = build_gemma4_plan[
-            Self.degree, Self.max_worker_count,
+            Self.degree, Self.max_seq_len, Self.max_worker_count,
         ](descs)
 
         var size = layout.arena.host_arena_bytes()

@@ -144,10 +144,6 @@ struct RankBuffers[dtype: DType, tp: Int, origin: Origin]:
         ](uninitialized=True)
         self.count = count
 
-    @always_inline
-    def __getitem__(self, rank: Int) -> UnsafePointer[Scalar[Self.dtype], Self.origin]:
-        return self.ptrs[rank]
-
 
 struct DispatchBuffer[K: BurstKernel, max_worker_count: Int = 128]:
     var items: InlineArray[Self.K, Self.max_worker_count]
@@ -214,10 +210,6 @@ struct ArenaBases[tp: Int](Copyable, ImplicitlyCopyable):
     @staticmethod
     def uninitialized() -> Self:
         return Self(addrs=InlineArray[Int, Self.tp](uninitialized=True))
-
-    @staticmethod
-    def fill(addr: Int) -> Self:
-        return Self(addrs=InlineArray[Int, Self.tp](fill=addr))
 
     @always_inline
     def __getitem__(self, rank: Int) -> Int:

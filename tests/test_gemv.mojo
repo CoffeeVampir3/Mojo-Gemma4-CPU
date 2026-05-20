@@ -11,7 +11,6 @@ from threading.threading_traits import BurstKernel, BurstThreadPool
 
 comptime W = simd_width_of[DType.float32]()
 comptime ROWS = 6
-comptime BASES = ArenaBases[1].fill(0)
 
 
 @fieldwise_init
@@ -81,12 +80,14 @@ def test_gemv_softcap():
 
     var pools = HeapMoveArray[TestPool](1)
     pools.push(TestPool(3, 0))
+    var bases = ArenaBases[1].uninitialized()
+    bases[0] = 0
     dispatch_gemv_softcap[
         rows=ROWS, cols=W, tp=1, cap=30.0,
     ](
-        Binding[BFloat16, 1](x.as_any_origin(), BASES),
-        Binding[BFloat16, 1](weight.as_any_origin(), BASES),
-        Binding[BFloat16, 1](output.as_any_origin(), BASES),
+        Binding[BFloat16, 1](x.as_any_origin(), bases),
+        Binding[BFloat16, 1](weight.as_any_origin(), bases),
+        Binding[BFloat16, 1](output.as_any_origin(), bases),
         pools,
     )
 

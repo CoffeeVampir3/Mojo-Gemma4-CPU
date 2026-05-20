@@ -455,7 +455,7 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
-        keep(db[0][0])
+        keep(db.ptrs[0][0])
 
         var total_bytes = count * 2 * tp * 2
         var sz_kb = count * 2 // 1024

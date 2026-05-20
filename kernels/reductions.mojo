@@ -25,25 +25,6 @@ struct ReduceConfig[E: Encoding, tp: Int, src_origin: ImmutOrigin]:
 
 
 @fieldwise_init
-struct CopyKernel[dtype: DType, src_origin: ImmutOrigin](
-    RangePartitionedKernel
-):
-    var dst: DstPtr[Self.dtype]
-    var src: UnsafePointer[Scalar[Self.dtype], Self.src_origin]
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        memcpy(dest=self.dst + self.start, src=self.src + self.start,
-               count=self.end - self.start)
-
-    @always_inline
-    def install_range(mut self, start: Int, end: Int):
-        self.start = start
-        self.end = end
-
-
-@fieldwise_init
 struct ReduceStoreKernel[
     E: Encoding, tp: Int, src_origin: ImmutOrigin, cfg_origin: ImmutOrigin,
     Accum: DType = DType.float32,
@@ -219,46 +200,3 @@ def dispatch_allreduce_inplace[
         dst.ptrs[r] = buf[r]
     dispatch_allreduce[E, tp, Accum, max_worker_count=max_worker_count](
         src, dst, pools, inline_max_bytes=inline_max_bytes)
-
-
-def dispatch_broadcast[
-    P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
-    E: Encoding, tp: Int, max_worker_count: Int = 128,
-](
-    src: RankBuffers[E.DTYPE, tp, src_origin],
-    dst: RankBuffers[E.DTYPE, tp, dst_origin],
-    mut pools: HeapMoveArray[P],
-    src_rank: Int = 0,
-    inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
-):
-    if src.count <= 0:
-        return
-
-    if src[src_rank] != dst[src_rank]:
-        memcpy(
-            dest=dst[src_rank].as_any_origin(),
-            src=src[src_rank],
-            count=src.count,
-        )
-
-    if src.count * E.ELEMENT_BYTES <= inline_max_bytes:
-        for r in range(tp):
-            if r != src_rank:
-                memcpy(dest=dst[r].as_any_origin(), src=src[src_rank], count=src.count)
-        return
-
-    var data_bytes = src.count * E.ELEMENT_BYTES
-    var buf = DispatchBuffer[
-        CopyKernel[E.DTYPE, src_origin], max_worker_count,
-    ]()
-    for r in range(tp):
-        if r != src_rank:
-            var nw = recommended_workers(
-                data_bytes, min(max_worker_count, pools[r].get_capacity()))
-            _ = tile_dispatch(buf,
-                CopyKernel[E.DTYPE, src_origin](
-                    dst[r].as_any_origin(), src[src_rank], 0, 0),
-                pools[r], src.count, num_workers=nw)
-    for r in range(tp):
-        if r != src_rank:
-            pools[r].join()

@@ -28,15 +28,9 @@ struct Gemma4BaseConfig:
     comptime VOCAB_SIZE = 262144
     comptime NUM_SLIDING_LAYERS = 25
     comptime NUM_FULL_LAYERS = 5
-    comptime MAX_SEQ_LEN = 4096
     comptime SLIDING_WINDOW = 1024
     comptime RMS_NORM_EPS = 1e-6
     comptime LOGIT_SOFTCAP = 30.0
-
-    # Comptime ceiling on chunked-attention fan-out for full-attention layers.
-    # Sizes dispatcher/merge stack arrays + cross-chunk partials buffer.
-    # Must be >= any pool_capacity we will ever see at runtime.
-    comptime FULL_ATTN_MAX_CHUNKS = 32
 
 
 struct LayerKind:

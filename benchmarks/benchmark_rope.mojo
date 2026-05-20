@@ -235,7 +235,9 @@ def section_full_cache_write[
     comptime NUM_KV = KV_DIM_FULL // HEAD_DIM_FULL
     comptime POS = 513
     var owner = POS % tp
-    var owner_bases = ArenaBases[tp].fill(bases[owner])
+    var owner_bases = ArenaBases[tp].uninitialized()
+    for r in range(tp):
+        owner_bases[r] = bases[owner]
     var full_cos = Binding[Float32, tp](cos_fl, bases)[owner]
     var full_sin = Binding[Float32, tp](sin_fl, bases)[owner]
 

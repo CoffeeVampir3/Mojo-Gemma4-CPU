@@ -7,7 +7,6 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
 from kernels.helpers import Binding, ArenaBases
-from kernels.gemv import dispatch_gemv
 from kernels.gemm import dispatch_gemm
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -66,65 +65,6 @@ def fill_pattern_all[tp: Int](
 ):
     for r in range(tp):
         fill_pattern(ptrs[r], count)
-
-
-def section_decision_gate[
-    P: BurstThreadPool, //,
-    rows: Int, cols: Int, tp: Int,
-](
-    mut pools: HeapMoveArray[P],
-    x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    bases: ArenaBases[tp], label: String,
-):
-    print("\n=== Decision gate: GEMV vs GEMM@M=1, "
-        + label
-        + " (rows=" + String(rows) + " cols=" + String(cols)
-        + " tp=" + String(tp) + ") ===")
-    var xs = Binding[BFloat16, tp](x, bases)
-    var ws = Binding[BFloat16, tp](weight, bases)
-    var outs = Binding[BFloat16, tp](output, bases)
-
-    var samples = SampleBuffer(SAMPLES)
-    var payload = rows * cols * 2
-
-    for _ in range(WARMUP):
-        dispatch_gemv[rows=rows, cols=cols, tp=tp](xs, ws, outs, pools)
-    keep(output[0])
-    samples.clear()
-    for _ in range(SAMPLES):
-        var t0 = now_ns()
-        dispatch_gemv[rows=rows, cols=cols, tp=tp](xs, ws, outs, pools)
-        var t1 = now_ns()
-        var t_done = max_last_ts[tp=tp](pools)
-        samples.push(t_done - t0, t1 - t0)
-    keep(output[0])
-    var gemv_k = compute_stats(samples.kernel_ns, samples.n)
-    var gemv_w = compute_stats(samples.wall_ns, samples.n)
-    print_row("dispatch_gemv          ", gemv_k, gemv_w, payload)
-
-    for _ in range(WARMUP):
-        dispatch_gemm[rows=rows, cols=cols, tp=tp, MR=4](
-            xs, ws, outs, 1, pools)
-    keep(output[0])
-    samples.clear()
-    for _ in range(SAMPLES):
-        var t0 = now_ns()
-        dispatch_gemm[rows=rows, cols=cols, tp=tp, MR=4](
-            xs, ws, outs, 1, pools)
-        var t1 = now_ns()
-        var t_done = max_last_ts[tp=tp](pools)
-        samples.push(t_done - t0, t1 - t0)
-    keep(output[0])
-    var gemm_k = compute_stats(samples.kernel_ns, samples.n)
-    var gemm_w = compute_stats(samples.wall_ns, samples.n)
-    print_row("dispatch_gemm M=1 MR=4 ", gemm_k, gemm_w, payload)
-
-    var ratio_w = Float64(gemm_w.p50) / Float64(gemv_w.p50)
-    var ratio_k = Float64(gemm_k.p50) / Float64(gemv_k.p50)
-    var pct_w = Int(ratio_w * 100.0)
-    var pct_k = Int(ratio_k * 100.0)
-    print("    gemm/gemv ratio: kernel p50 = " + String(pct_k)
-        + "%   wall p50 = " + String(pct_w) + "%")
 
 
 def measure_gemm_m[
@@ -205,50 +145,6 @@ def section_mr_sweep[
         pools, xs, ws, outs, output, 64, samples)
 
 
-def section_loop_vs_gemm[
-    P: BurstThreadPool, //, rows: Int, cols: Int, tp: Int,
-](
-    mut pools: HeapMoveArray[P],
-    x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    bases: ArenaBases[tp], label: String,
-):
-    print("\n=== Loop-of-GEMV vs single GEMM, " + label
-        + " (rows=" + String(rows) + " cols=" + String(cols)
-        + " tp=" + String(tp) + ") ===")
-    var xs = Binding[BFloat16, tp](x, bases)
-    var ws = Binding[BFloat16, tp](weight, bases)
-    var outs = Binding[BFloat16, tp](output, bases)
-    var samples = SampleBuffer(SAMPLES)
-    var ns = InlineArray[Int, 4](uninitialized=True)
-    ns[0] = 16; ns[1] = 64; ns[2] = 256; ns[3] = 1024
-
-    for i in range(4):
-        var n_tok = ns[i]
-        var bytes_payload = (n_tok * cols + rows * cols) * 2
-
-        for _ in range(WARMUP):
-            for _t in range(n_tok):
-                dispatch_gemv[rows=rows, cols=cols, tp=tp](
-                    xs, ws, outs, pools)
-        keep(output[0])
-        samples.clear()
-        for _ in range(SAMPLES):
-            var t0 = now_ns()
-            for _t in range(n_tok):
-                dispatch_gemv[rows=rows, cols=cols, tp=tp](
-                    xs, ws, outs, pools)
-            var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
-            samples.push(t_done - t0, t1 - t0)
-        keep(output[0])
-        var lk = compute_stats(samples.kernel_ns, samples.n)
-        var lw = compute_stats(samples.wall_ns, samples.n)
-        print_row("loop-of-gemv n=" + String(n_tok), lk, lw, bytes_payload)
-
-        measure_gemm_m[rows=rows, cols=cols, tp=tp, MR=4](
-            pools, xs, ws, outs, output, n_tok, samples)
-
-
 def run_all[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
@@ -276,20 +172,12 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     var cap = pools[0].get_capacity()
     print("pool capacity: " + String(cap) + " workers")
 
-    section_decision_gate[rows=gate_up_rows, cols=gate_up_cols, tp=tp](
-        pools, x, w, o, bases, "FFN gate/up shape")
-    section_decision_gate[rows=down_rows, cols=down_cols, tp=tp](
-        pools, x, w, o, bases, "FFN down shape")
-
     section_m_sweep[rows=gate_up_rows, cols=gate_up_cols, tp=tp](
         pools, x, w, o, bases, "FFN gate/up shape")
     section_m_sweep[rows=down_rows, cols=down_cols, tp=tp](
         pools, x, w, o, bases, "FFN down shape")
 
     section_mr_sweep[rows=gate_up_rows, cols=gate_up_cols, tp=tp](
-        pools, x, w, o, bases, "FFN gate/up shape")
-
-    section_loop_vs_gemm[rows=gate_up_rows, cols=gate_up_cols, tp=tp](
         pools, x, w, o, bases, "FFN gate/up shape")
 
 
