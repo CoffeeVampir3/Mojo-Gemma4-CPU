@@ -1,5 +1,5 @@
 from std.algorithm import vectorize
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 
 from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
@@ -36,7 +36,7 @@ struct EmbedLookupKernel[
     tok_origin: ImmutOrigin,
     hidden: Int, scale: Float64, shard_rows: Int,
 ](RangePartitionedKernel):
-    var token_ids: UnsafePointer[Int32, Self.tok_origin]
+    var token_ids: Span[Int32, Self.tok_origin]
     var embed: BF16Ptr
     var dst: BF16Ptr
     var rank: Int
@@ -45,7 +45,7 @@ struct EmbedLookupKernel[
 
     def execute(mut self):
         for tok in range(self.start, self.end):
-            var tid = Int((self.token_ids + tok).load())
+            var tid = Int(self.token_ids[tok])
             var owner = tid // Self.shard_rows
             var dst_row = self.dst + tok * Self.hidden
             if owner == self.rank:
@@ -67,7 +67,7 @@ def dispatch_embed_lookup[
     hidden: Int, scale: Float64, shard_rows: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
-    token_ids: UnsafePointer[Int32, tok_origin],
+    token_ids: Span[Int32, tok_origin],
     embed: Binding[BFloat16, tp],
     dst: Binding[BFloat16, tp],
     seq_len: Int,

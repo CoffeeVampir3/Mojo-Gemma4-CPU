@@ -1,4 +1,4 @@
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
 from std.pathlib import Path
 from std.time import perf_counter_ns
@@ -57,12 +57,15 @@ def load_and_run[
 
     var prompt_len = len(token_ids)
 
-    var t1 = perf_counter_ns()
-    for i in range(prompt_len - 1):
-        var logits = model.forward(token_ids[i], i)
-        logits^.release()
+    var tok_buf = List[Int32](capacity=prompt_len)
+    for i in range(prompt_len):
+        tok_buf.append(Int32(token_ids[i]))
 
-    var logits = model.forward(token_ids[prompt_len - 1], prompt_len - 1)
+    var t1 = perf_counter_ns()
+    var logits = model.forward(
+        Span[Int32, origin_of(tok_buf)](
+            ptr=tok_buf.unsafe_ptr(), length=prompt_len),
+        0)
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     var top_vals = InlineArray[Float32, 5](fill=Float32(-1e30))
@@ -100,7 +103,11 @@ def load_and_run[
     var decode_start = perf_counter_ns()
 
     while len(generated) < MAX_NEW_TOKENS:
-        var step_logits = model.forward(next_id, pos)
+        var step_id = Int32(next_id)
+        var step_logits = model.forward(
+            Span[Int32, origin_of(step_id)](
+                ptr=UnsafePointer(to=step_id), length=1),
+            pos)
         result = greedy_argmax[degree](step_logits)
         next_id = result[0]
         step_logits^.release()

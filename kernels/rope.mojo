@@ -89,9 +89,8 @@ struct RopeCacheWriteKernel[
         comptime kv_stride = Self.num_kv * Self.head_dim
         for tok in range(self.start, self.end):
             var pos = self.base_pos + tok
-            var table_idx = pos // Self.cache_degree
-            var cos_row = self.cos_table + table_idx * Self.half
-            var sin_row = self.sin_table + table_idx * Self.half
+            var cos_row = self.cos_table + pos * Self.half
+            var sin_row = self.sin_table + pos * Self.half
 
             var q_tok = self.q + tok * q_stride
             for h in range(Self.num_q):
@@ -99,7 +98,7 @@ struct RopeCacheWriteKernel[
                     q_tok + h * Self.head_dim, cos_row, sin_row)
 
             if pos % Self.cache_degree == self.rank:
-                var slot = table_idx & Self.slot_mask
+                var slot = (pos // Self.cache_degree) & Self.slot_mask
                 var k_tok = self.k_src + tok * kv_stride
                 var k_dst = self.k_cache + slot * Self.kv_cache_stride
                 for h in range(Self.num_kv):

@@ -1,6 +1,6 @@
 from std.collections import InlineArray
 from std.pathlib import Path
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
 from simd_math.ops import sqrt
 
@@ -213,8 +213,8 @@ struct RopeSlots[half: Int, degree: Int = 1](Copyable, ImplicitlyCopyable, SlotG
 
 
 struct ActivationSlots(Copyable, ImplicitlyCopyable, SlotGroup):
-    var x_main:     Slot[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
-    var x_residual: Slot[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
+    var x_main:     Slot[BF16, Shape[C.SLIDING_WINDOW, C.HIDDEN]]
+    var x_residual: Slot[BF16, Shape[C.SLIDING_WINDOW, C.HIDDEN]]
 
 
 struct TailRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
@@ -270,12 +270,12 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
 
     var q_band: ScratchPhase["gemv_qkv", "o_proj"]
     var q: ScratchBuffer[
-        BFloat16, C.MAX_SEQ_LEN * Self.q_rows,
+        BFloat16, C.SLIDING_WINDOW * Self.q_rows,
     ]
 
     var kv_band: ScratchPhase["gemv_qkv", "rope_cache_write"]
     var kv: ScratchBuffer[
-        BFloat16, C.MAX_SEQ_LEN * Self.kv_rows * 2,
+        BFloat16, C.SLIDING_WINDOW * Self.kv_rows * 2,
     ]
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
@@ -312,12 +312,12 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
 
     var q_band: ScratchPhase["gemv_q", "flash"]
     var q: ScratchBuffer[
-        BFloat16, C.MAX_SEQ_LEN * Self.q_rows,
+        BFloat16, C.SLIDING_WINDOW * Self.q_rows,
     ]
 
     var kv_band: ScratchPhase["gemv_kv", "rope_cache_write"]
     var kv: ScratchBuffer[
-        BFloat16, C.MAX_SEQ_LEN * Self.k_rows * 2,
+        BFloat16, C.SLIDING_WINDOW * Self.k_rows * 2,
     ]
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
@@ -327,7 +327,7 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
 
     var q_local_band: ScratchPhase["merge_partials", "o_proj"]
     var q_local: ScratchBuffer[
-        BFloat16, C.MAX_SEQ_LEN * Self.local_q_rows,
+        BFloat16, C.SLIDING_WINDOW * Self.local_q_rows,
     ]
 
 
@@ -350,13 +350,13 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     var ffn_gate_band: ScratchPhase["gemv_gate", "gemv_dense"]
     var ffn_gate: ScratchBuffer[
         BFloat16,
-        C.MAX_SEQ_LEN * Self.intermediate_per_rank,
+        C.SLIDING_WINDOW * Self.intermediate_per_rank,
     ]
 
     var ffn_up_band: ScratchPhase["gemv_up", "gelu_gate_up"]
     var ffn_up: ScratchBuffer[
         BFloat16,
-        C.MAX_SEQ_LEN * Self.intermediate_per_rank,
+        C.SLIDING_WINDOW * Self.intermediate_per_rank,
     ]
 
     var router_workspace: ScratchPhase[
@@ -367,19 +367,19 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     ]
 
     var router_cands: ScratchPhase["router_sharded", "merge_cands"]
-    var moe_cands: ScratchBuffer[RouterCandidate, C.MAX_SEQ_LEN * C.TOP_K]
+    var moe_cands: ScratchBuffer[RouterCandidate, C.SLIDING_WINDOW * C.TOP_K]
 
     var router_products: ScratchPhase["merge_cands", "build_schedules"]
     var moe_route_idx: ScratchBuffer[
-        Int32, C.MAX_SEQ_LEN * C.TOP_K,
+        Int32, C.SLIDING_WINDOW * C.TOP_K,
     ]
     var moe_route_w: ScratchBuffer[
-        Float32, C.MAX_SEQ_LEN * C.TOP_K,
+        Float32, C.SLIDING_WINDOW * C.TOP_K,
     ]
 
     var expert_input: ScratchPhase["moe_rms_norm", "phase1_gate_up"]
     var moe_x_normed: ScratchBuffer[
-        BFloat16, C.MAX_SEQ_LEN * C.HIDDEN,
+        BFloat16, C.SLIDING_WINDOW * C.HIDDEN,
     ]
 
     var schedule_products: ScratchPhase[
@@ -388,12 +388,12 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     var moe_expert_offset: ScratchBuffer[
         Int32, Self.experts_per_rank + 1,
     ]
-    var moe_routes: ScratchBuffer[SparseRoute, C.MAX_SEQ_LEN * C.TOP_K]
+    var moe_routes: ScratchBuffer[SparseRoute, C.SLIDING_WINDOW * C.TOP_K]
 
     var hidden_bucket: ScratchPhase["phase1_gate_up", "phase2_down"]
     var moe_hidden_bucket: ScratchBuffer[
         BFloat16,
-        C.MAX_SEQ_LEN * C.TOP_K * C.MOE_INTERMEDIATE,
+        C.SLIDING_WINDOW * C.TOP_K * C.MOE_INTERMEDIATE,
     ]
 
     var phase1_workspace: ScratchPhase[
@@ -409,12 +409,12 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
 
     var phase2_accum: ScratchPhase["phase2_down", "phase2_down"]
     var moe_accum: ScratchBuffer[
-        Float32, C.MAX_SEQ_LEN * C.HIDDEN,
+        Float32, C.SLIDING_WINDOW * C.HIDDEN,
     ]
 
     var dense_band: ScratchPhase["gemv_dense", "post_norm_3"]
     var ffn_dense_out: ScratchBuffer[
-        BFloat16, C.MAX_SEQ_LEN * C.HIDDEN,
+        BFloat16, C.SLIDING_WINDOW * C.HIDDEN,
     ]
 
 
@@ -942,8 +942,12 @@ struct Gemma4[
             ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, 0, 1)
         print("  rope tables initialized")
 
-    def forward(
-        mut self, token_id: Int, pos: Int,
+    def forward[
+        tok_origin: ImmutOrigin, //,
+    ](
+        mut self,
+        token_ids: Span[Int32, tok_origin],
+        base_pos: Int,
     ) -> TemporalLogitsView[C.VOCAB_SIZE, Self.degree]:
         ref layout = self.layout
         comptime shard_rows = Gemma4TailShapes[Self.degree].Embed.DATA_N
@@ -951,6 +955,14 @@ struct Gemma4[
         comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
         comptime embed_scale = Float64(sqrt[DType.float32, 1](C.HIDDEN)
             .cast[DType.bfloat16]().cast[DType.float32]())
+        comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
+
+        var total_len = len(token_ids)
+        debug_assert(total_len > 0, "forward called with empty token_ids")
+        debug_assert(
+            base_pos + total_len <= C.MAX_SEQ_LEN,
+            "forward exceeds MAX_SEQ_LEN",
+        )
 
         var ctx = BindContext[Self.degree](
             arena_bases=self.arena_bases, layer_base=0)
@@ -959,82 +971,99 @@ struct Gemma4[
 
         var x_main_ranks = layout.activations.x_main.state_binding(ctx)
         var x_res_ranks = layout.activations.x_residual.state_binding(ctx)
-
-        var tid_buf = Int32(token_id)
-        dispatch_embed_lookup[
-            hidden=C.HIDDEN, scale=embed_scale, shard_rows=shard_rows,
-            tp=Self.degree, max_worker_count=Self.max_worker_count,
-        ](UnsafePointer(to=tid_buf).as_immutable(),
-          layout.tail.proto.embed.binding(tail_ctx),
-          x_main_ranks, 1, self.pools)
-        dispatch_allreduce_inplace[
-            BF16, Self.degree, max_worker_count=Self.max_worker_count,
-        ](x_main_ranks, C.HIDDEN, self.pools)
-
-        for i in range(C.NUM_LAYERS):
-            var entry = LAYER_SCHEDULE[i]
-            var body: BodyRefs[Self.degree]
-            var layer_ctx: BindContext[Self.degree]
-            if entry.kind == LayerKind.FULL:
-                layer_ctx = ctx.with_layer(layout.full.base(self.arena_bases[0], entry.local_idx))
-                body = layout.full.proto.body
-            else:
-                layer_ctx = ctx.with_layer(layout.sliding.base(self.arena_bases[0], entry.local_idx))
-                body = layout.sliding.proto.body
-
-            dispatch_rms_norm[
-                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                tp=Self.degree, max_worker_count=Self.max_worker_count,
-            ](x_main_ranks, x_res_ranks,
-              body.input_norm.binding(layer_ctx),
-              1, self.pools)
-
-            if entry.kind == LayerKind.FULL:
-                dispatch_full_attention_qkv[
-                    degree=Self.degree,
-                    max_worker_count=Self.max_worker_count,
-                ](
-                    layout, ctx, pos, 1, entry.local_idx, self.scratch, self.pools)
-            else:
-                dispatch_sliding_attention_qkv[
-                    degree=Self.degree,
-                    max_worker_count=Self.max_worker_count,
-                ](
-                    layout, ctx, pos, 1, entry.local_idx, self.scratch, self.pools)
-
-            dispatch_allreduce_inplace[
-                BF16, Self.degree, max_worker_count=Self.max_worker_count,
-            ](x_res_ranks, C.HIDDEN, self.pools)
-
-            fused_norm_residual_add[
-                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                tp=Self.degree, max_worker_count=Self.max_worker_count,
-            ](x_res_ranks, x_main_ranks, x_main_ranks,
-              body.post_attn_norm.binding(layer_ctx),
-              1, self.pools)
-
-            dispatch_ffn[
-                degree=Self.degree, max_worker_count=Self.max_worker_count,
-            ](
-                body, layer_ctx, x_main_ranks, x_res_ranks, 1,
-                self.scratch, self.pools)
-
-        dispatch_rms_norm[
-            hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-            tp=Self.degree, max_worker_count=Self.max_worker_count,
-        ](x_main_ranks, x_main_ranks,
-          layout.tail.proto.final_norm.binding(tail_ctx),
-          1, self.pools)
-
-        comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
         var logits = self.scratch.binding[
             Gemma4HeadScratch[Self.degree], "logits",
         ](ctx)
-        dispatch_gemv_softcap[
-            rows=vocab_per_rank, cols=C.HIDDEN, tp=Self.degree,
-            cap=C.LOGIT_SOFTCAP,
-            max_worker_count=Self.max_worker_count,
-        ](x_main_ranks, layout.tail.proto.embed.binding(tail_ctx), logits, self.pools)
+
+        var consumed = 0
+        var pos = base_pos
+        while consumed < total_len:
+            var remaining = total_len - consumed
+            var chunk_len = remaining if remaining < C.SLIDING_WINDOW else C.SLIDING_WINDOW
+            var is_last = (consumed + chunk_len == total_len)
+
+            var chunk = Span[Int32, tok_origin](
+                ptr=token_ids.unsafe_ptr() + consumed,
+                length=chunk_len)
+
+            dispatch_embed_lookup[
+                hidden=C.HIDDEN, scale=embed_scale, shard_rows=shard_rows,
+                tp=Self.degree, max_worker_count=Self.max_worker_count,
+            ](chunk,
+              layout.tail.proto.embed.binding(tail_ctx),
+              x_main_ranks, chunk_len, self.pools)
+            dispatch_allreduce_inplace[
+                BF16, Self.degree, max_worker_count=Self.max_worker_count,
+            ](x_main_ranks, chunk_len * C.HIDDEN, self.pools)
+
+            for i in range(C.NUM_LAYERS):
+                var entry = LAYER_SCHEDULE[i]
+                var body: BodyRefs[Self.degree]
+                var layer_ctx: BindContext[Self.degree]
+                if entry.kind == LayerKind.FULL:
+                    layer_ctx = ctx.with_layer(layout.full.base(self.arena_bases[0], entry.local_idx))
+                    body = layout.full.proto.body
+                else:
+                    layer_ctx = ctx.with_layer(layout.sliding.base(self.arena_bases[0], entry.local_idx))
+                    body = layout.sliding.proto.body
+
+                dispatch_rms_norm[
+                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+                    tp=Self.degree, max_worker_count=Self.max_worker_count,
+                ](x_main_ranks, x_res_ranks,
+                  body.input_norm.binding(layer_ctx),
+                  chunk_len, self.pools)
+
+                if entry.kind == LayerKind.FULL:
+                    dispatch_full_attention_qkv[
+                        degree=Self.degree,
+                        max_worker_count=Self.max_worker_count,
+                    ](
+                        layout, ctx, pos, chunk_len, entry.local_idx,
+                        self.scratch, self.pools)
+                else:
+                    dispatch_sliding_attention_qkv[
+                        degree=Self.degree,
+                        max_worker_count=Self.max_worker_count,
+                    ](
+                        layout, ctx, pos, chunk_len, entry.local_idx,
+                        self.scratch, self.pools)
+
+                dispatch_allreduce_inplace[
+                    BF16, Self.degree, max_worker_count=Self.max_worker_count,
+                ](x_res_ranks, chunk_len * C.HIDDEN, self.pools)
+
+                fused_norm_residual_add[
+                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+                    tp=Self.degree, max_worker_count=Self.max_worker_count,
+                ](x_res_ranks, x_main_ranks, x_main_ranks,
+                  body.post_attn_norm.binding(layer_ctx),
+                  chunk_len, self.pools)
+
+                dispatch_ffn[
+                    degree=Self.degree, max_worker_count=Self.max_worker_count,
+                ](
+                    body, layer_ctx, x_main_ranks, x_res_ranks, chunk_len,
+                    self.scratch, self.pools)
+
+            if is_last:
+                var x_last = x_main_ranks.shifted((chunk_len - 1) * C.HIDDEN)
+
+                dispatch_rms_norm[
+                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+                    tp=Self.degree, max_worker_count=Self.max_worker_count,
+                ](x_last, x_last,
+                  layout.tail.proto.final_norm.binding(tail_ctx),
+                  1, self.pools)
+
+                dispatch_gemv_softcap[
+                    rows=vocab_per_rank, cols=C.HIDDEN, tp=Self.degree,
+                    cap=C.LOGIT_SOFTCAP,
+                    max_worker_count=Self.max_worker_count,
+                ](x_last, layout.tail.proto.embed.binding(tail_ctx), logits, self.pools)
+
+            consumed += chunk_len
+            pos += chunk_len
 
         return TemporalLogitsView[C.VOCAB_SIZE, Self.degree](
             logits.ptr, self.arena_bases)
