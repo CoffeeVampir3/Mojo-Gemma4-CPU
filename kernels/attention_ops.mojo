@@ -53,9 +53,11 @@ def online_softmax_tile[
     var tile_max = scores.reduce_max()
     var m_new = tile_max if tile_max > old_m else old_m
     var corr = fast_exp_softmax_biased[1](
-        SIMD[DType.float32, 1](old_m - m_new))[0]
+        max(SIMD[DType.float32, 1](-87.0),
+            SIMD[DType.float32, 1](old_m - m_new)))[0]
     var weights = fast_exp_softmax_biased[tile](
-        scores - SIMD[DType.float32, tile](m_new))
+        max(SIMD[DType.float32, tile](-87.0),
+            scores - SIMD[DType.float32, tile](m_new)))
     return (m_new, corr, weights)
 
 

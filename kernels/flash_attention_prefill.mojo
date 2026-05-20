@@ -56,8 +56,6 @@ struct FlashPrefillSlidingKernel[
             var l = InlineArray[Float32, Self.num_q](fill=Float32(0))
             comptime for h in range(Self.num_q):
                 q_ptrs[h] = q_tok + h * Self.head_dim
-                for j in range(0, Self.head_dim, W):
-                    (acc_ptrs[h] + j).store(SIMD[DType.float32, W](0))
 
             var pos = lo
             while pos < hi:
@@ -133,8 +131,6 @@ struct FlashPrefillFullKernel[
             comptime for h in range(Self.num_q):
                 acc_ptrs[h] = partial_tok + h * Self.head_dim
                 q_ptrs[h] = q_tok + h * Self.head_dim
-                for j in range(0, Self.head_dim, W):
-                    (acc_ptrs[h] + j).store(SIMD[DType.float32, W](0))
 
             var pos = 0
             while pos < local_kv_count:
