@@ -6,9 +6,6 @@ from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.flash_attention_prefill import (
-    FlashPrefillSlidingKernel, FlashPrefillFullKernel,
-)
 from kernels.attention_dispatch_kernels import (
     dispatch_sliding_attention, dispatch_full_attention,
 )
@@ -41,6 +38,9 @@ comptime FULL_GQA = FULL_NUM_Q // FULL_NUM_KV
 comptime FULL_KV_STRIDE = FULL_NUM_KV * FULL_HEAD_DIM
 comptime FULL_CHUNK_SIZE = 512
 comptime FULL_MAX_SEQ = 4096
+
+comptime SLIDING_PSTRIDE = flash_partial_stride[SLIDING_NUM_Q, SLIDING_HEAD_DIM]()
+comptime FULL_PSTRIDE = flash_partial_stride[FULL_NUM_Q, FULL_HEAD_DIM]()
 
 comptime NUM_SLIDING_SIZES = 6
 comptime NUM_FULL_SIZES = 5
@@ -122,7 +122,8 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
                 dispatch_sliding_attention[
                     head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
                     gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
-                    window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW, tp=tp,
+                    window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
+                    partial_stride=SLIDING_PSTRIDE, tp=tp,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
@@ -140,7 +141,8 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
                 dispatch_sliding_attention[
                     head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
                     gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
-                    window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW, tp=tp,
+                    window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
+                    partial_stride=SLIDING_PSTRIDE, tp=tp,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
@@ -192,7 +194,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
                 dispatch_full_attention[
                     head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
                     local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
-                    kv_stride=FULL_KV_STRIDE, tp=tp,
+                    kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE, tp=tp,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
@@ -210,7 +212,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
                 dispatch_full_attention[
                     head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
                     local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
-                    kv_stride=FULL_KV_STRIDE, tp=tp,
+                    kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE, tp=tp,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
@@ -245,7 +247,8 @@ def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
     dispatch_sliding_attention[
         head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
         gqa_ratio=SLIDING_GQA, kv_stride=SLIDING_KV_STRIDE,
-        window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW, tp=tp,
+        window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
+        partial_stride=SLIDING_PSTRIDE, tp=tp,
         max_worker_count=MAX_WORKERS,
     ](q, k_cache, v_cache, output, worker_scratch, 0, SL, pools)
 
@@ -276,14 +279,13 @@ def section_validation_full[P: BurstThreadPool, //, tp: Int](
     comptime SL = 64
     comptime LOCAL_NUM_Q = FULL_NUM_Q // tp
     comptime OUT_STRIDE = LOCAL_NUM_Q * FULL_HEAD_DIM
-    comptime PSTRIDE = flash_partial_stride[FULL_NUM_Q, FULL_HEAD_DIM]()
     comptime M_OFF = FULL_NUM_Q * FULL_HEAD_DIM
     comptime L_OFF = M_OFF + FULL_NUM_Q
 
     dispatch_full_attention[
         head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
         local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
-        kv_stride=FULL_KV_STRIDE, tp=tp,
+        kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE, tp=tp,
         max_worker_count=MAX_WORKERS,
     ](q, k_cache, v_cache, output, partials_scratch, 0, SL, pools)
 
@@ -322,7 +324,7 @@ def section_validation_full[P: BurstThreadPool, //, tp: Int](
         + ", global_h=" + String(nan_global_h) + "):")
     for r in range(tp):
         var pr = partials_scratch[r]
-        var slot = pr + nan_tok * PSTRIDE
+        var slot = pr + nan_tok * FULL_PSTRIDE
         var m_val = (slot + M_OFF + nan_global_h)[]
         var l_val = (slot + L_OFF + nan_global_h)[]
         var acc0 = (slot + nan_global_h * FULL_HEAD_DIM)[]
@@ -336,10 +338,6 @@ def run_sliding[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
-    comptime SCRATCH_STRIDE = FlashPrefillSlidingKernel[
-        SLIDING_HEAD_DIM, SLIDING_NUM_Q, SLIDING_GQA,
-        SLIDING_KV_STRIDE, SLIDING_WINDOW, SLIDING_WINDOW,
-    ].SCRATCH_STRIDE
     var bases = arena_bases[tp](arenas)
 
     var q_ptr = arena_alloc_all[DType.bfloat16, tp](
@@ -351,7 +349,7 @@ def run_sliding[P: BurstThreadPool, //, tp: Int](
     var output_ptr = arena_alloc_all[DType.bfloat16, tp](
         arenas, SLIDING_MAX_SEQ * SLIDING_NUM_Q * SLIDING_HEAD_DIM)
     var worker_scratch_ptr = arena_alloc_all[DType.float32, tp](
-        arenas, MAX_WORKERS * SCRATCH_STRIDE)
+        arenas, MAX_WORKERS * SLIDING_PSTRIDE)
 
     var q = Binding[BFloat16, tp](q_ptr, bases)
     var k_cache = Binding[BFloat16, tp](k_cache_ptr, bases)
@@ -383,7 +381,6 @@ def run_full[P: BurstThreadPool, //, tp: Int](
     mut pools: HeapMoveArray[P],
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
-    comptime PSTRIDE = flash_partial_stride[FULL_NUM_Q, FULL_HEAD_DIM]()
     comptime LOCAL_NUM_Q = FULL_NUM_Q // tp
     var bases = arena_bases[tp](arenas)
 
@@ -396,7 +393,7 @@ def run_full[P: BurstThreadPool, //, tp: Int](
     var output_ptr = arena_alloc_all[DType.bfloat16, tp](
         arenas, FULL_MAX_SEQ * LOCAL_NUM_Q * FULL_HEAD_DIM)
     var partials_ptr = arena_alloc_all[DType.float32, tp](
-        arenas, FULL_CHUNK_SIZE * PSTRIDE)
+        arenas, FULL_CHUNK_SIZE * FULL_PSTRIDE)
 
     var q = Binding[BFloat16, tp](q_ptr, bases)
     var k_cache = Binding[BFloat16, tp](k_cache_ptr, bases)

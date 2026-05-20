@@ -6,7 +6,8 @@ from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.logsum_merge import dispatch_merge_flash_partials, FinalizeKernel
+from kernels.logsum_merge import dispatch_merge_flash_partials
+from kernels.attention_ops import flash_partial_stride
 from kernels.helpers import (
     OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
     Binding, ArenaBases,
@@ -110,7 +111,7 @@ def run_config[
     mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
     mut pools: HeapMoveArray[P],
 ):
-    comptime stride = FinalizeKernel[head_dim, num_q].PARTIAL_STRIDE
+    comptime stride = flash_partial_stride[num_q, head_dim]()
     var bases = arena_bases[tp](arenas)
     var partials = arena_alloc_all[DType.float32, tp](arenas, MAX_SOURCES * stride)
     var output = arena_alloc_all[DType.bfloat16, tp](arenas, num_q * head_dim)
@@ -138,7 +139,7 @@ def run_config[
 
         warm_pool(scratch, pools[0])
         for _ in range(WARMUP):
-            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
                 source_counts[tp](ns), pools,
@@ -148,7 +149,7 @@ def run_config[
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
                 source_counts[tp](ns), pools,
@@ -163,7 +164,7 @@ def run_config[
 
         warm_pool(scratch, pools[0])
         for _ in range(WARMUP):
-            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
                 source_counts[tp](ns), pools,
@@ -173,7 +174,7 @@ def run_config[
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_merge_flash_partials[head_dim, num_q, tp=tp](
+            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
                 source_counts[tp](ns), pools,
