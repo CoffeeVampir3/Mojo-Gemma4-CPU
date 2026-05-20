@@ -189,9 +189,7 @@ def dispatch_allreduce_inplace[
     mut pools: HeapMoveArray[P],
     inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
 ):
-    """In-place allreduce over a per-rank `Binding`. Each rank's buffer
-    acts as both an input source and the output destination — the same
-    pattern called out at 3 sites in modeling/gemma_4_moe.mojo."""
+    """In-place allreduce: each rank's `buf` is both source and destination."""
     comptime immut = ImmutOrigin(MutAnyOrigin)
     var src = RankBuffers[E.DTYPE, tp, immut](count=count)
     var dst = RankBuffers[E.DTYPE, tp, MutAnyOrigin](count=count)

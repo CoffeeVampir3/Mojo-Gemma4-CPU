@@ -16,9 +16,8 @@ from kernels.rmsnorm import fused_norm_residual_add
 from kernels.gemv import dispatch_gemv_softcap
 from kernels.gemm import dispatch_gemm, dispatch_gemm_chained_qkv
 from kernels.rope import dispatch_rope_cache_write
-from kernels.flash_attention import (
-    FlashAttentionKernel, LinearKV, RingKV,
-)
+from kernels.attention_ops import LinearKV, RingKV
+from kernels.flash_attention import FlashAttentionKernel
 from kernels.attention_dispatch_kernels import (
     dispatch_sliding_attention, dispatch_full_attention,
 )

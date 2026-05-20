@@ -3,32 +3,10 @@ from std.collections import InlineArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
     WorkerRangePartitionedKernel,
-    accumulate_scaled, scale_unrolled,
 )
 from .attention_ops import (
-    TILE, flash_partial_stride, online_softmax_tile,
+    KVSlot, TILE, flash_partial_stride, process_kv_tile,
 )
-from .dot_products import dot_to_scalar
-
-
-trait KVSlot:
-    @staticmethod
-    @always_inline
-    def slot(start_pos: Int, pos_t: Int) -> Int: ...
-
-
-struct LinearKV(KVSlot):
-    @staticmethod
-    @always_inline
-    def slot(start_pos: Int, pos_t: Int) -> Int:
-        return pos_t
-
-
-struct RingKV[window: Int](KVSlot):
-    @staticmethod
-    @always_inline
-    def slot(start_pos: Int, pos_t: Int) -> Int:
-        return (start_pos + pos_t) & (Self.window - 1)
 
 
 @fieldwise_init
@@ -66,34 +44,10 @@ struct FlashAttentionKernel[
         var pos = self.start
         while pos < self.end:
             var tile_len = min(TILE, self.end - pos)
-
-            comptime for q_idx in range(Self.num_q):
-                comptime kv_h = q_idx // Self.gqa_ratio
-
-                var scores = SIMD[DType.float32, TILE](-1e30)
-                for t in range(tile_len):
-                    var s_idx = Self.KV.slot(self.start_pos, pos + t)
-                    var k_head = self.k_base + s_idx * Self.kv_stride \
-                                 + kv_h * Self.head_dim
-                    scores[t] = dot_to_scalar[Self.head_dim](
-                        q_ptrs[q_idx], k_head)
-
-                var sm = online_softmax_tile[TILE](scores, m[q_idx])
-                var m_new = sm[0]
-                var corr = sm[1]
-                var weights = sm[2]
-
-                scale_unrolled[cols=Self.head_dim](acc_ptrs[q_idx], corr)
-                l[q_idx] = l[q_idx] * corr + weights.reduce_add()
-                m[q_idx] = m_new
-
-                for t in range(tile_len):
-                    var s_idx = Self.KV.slot(self.start_pos, pos + t)
-                    var v_head = self.v_base + s_idx * Self.kv_stride \
-                                 + kv_h * Self.head_dim
-                    accumulate_scaled[cols=Self.head_dim](
-                        v_head, weights[t], acc_ptrs[q_idx])
-
+            process_kv_tile[
+                Self.KV, Self.head_dim, Self.gqa_ratio, Self.kv_stride,
+            ](q_ptrs, self.k_base, self.v_base,
+              self.start_pos, pos, tile_len, m, l, acc_ptrs)
             pos += TILE
 
         comptime for h in range(Self.num_q):

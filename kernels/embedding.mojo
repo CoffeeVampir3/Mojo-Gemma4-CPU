@@ -73,13 +73,7 @@ def dispatch_embed_lookup[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    """Per-rank embedding scatter. Each rank writes `seq_len` rows into
-    its local `dst[r]`: owned tokens get a scale-fused lookup from
-    `embed[r]`, unowned tokens get zero. Caller follows with
-    dispatch_allreduce_inplace so every rank ends up with the replicated
-    embedded sequence. Decode (seq_len==1) takes the inline path; prefill
-    fans tokens across workers per rank — same shape as the attention
-    dispatchers, branching internally via fanout_dispatch."""
+    """Unowned tokens write zero; caller follows with allreduce to replicate."""
     comptime K = EmbedLookupKernel[tok_origin, hidden, scale, shard_rows]
 
     @parameter

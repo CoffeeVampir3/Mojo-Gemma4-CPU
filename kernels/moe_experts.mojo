@@ -25,9 +25,6 @@ def emit_gate_up_panel[
     up_part: F32Ptr,
     bucket_base: BF16Ptr,
 ):
-    """Per-tile MR-or-1 panel: gather the panel's x rows, run gate and up
-    dots column-by-column through `bf16_panel_dot_to_scalars`, then fuse
-    gelu(g) * u and store into the panel's slice of `hidden_bucket`."""
     var x_rows = InlineArray[BF16Ptr, panel](uninitialized=True)
     comptime for r in range(panel):
         x_rows[r] = x_normed + Int(routes[rec_start + r].token) * hidden
@@ -202,10 +199,6 @@ def emit_down_panel[
     down_w: BF16Ptr,
     start: Int, end: Int,
 ):
-    """Per panel: collect hm rows + per-token dst rows + weights, then
-    iterate output channels m in [start, end), dot the down weight column
-    against the panel via `bf16_panel_dot_to_scalars`, and scatter-add
-    `out * weight` into each token's accumulator."""
     var hm_rows = InlineArray[BF16Ptr, panel](uninitialized=True)
     var dst_rows = InlineArray[F32Ptr, panel](uninitialized=True)
     var weights = InlineArray[Float32, panel](uninitialized=True)

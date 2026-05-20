@@ -6,7 +6,8 @@ from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.flash_attention import FlashAttentionKernel, RingKV
+from kernels.attention_ops import RingKV
+from kernels.flash_attention import FlashAttentionKernel
 from kernels.attention_dispatch_kernels import dispatch_sliding_attention
 from kernels.helpers import Binding, ArenaBases
 from benchmarks.bench_harness import (

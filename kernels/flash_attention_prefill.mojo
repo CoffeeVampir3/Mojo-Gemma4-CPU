@@ -7,12 +7,11 @@ from .helpers import (
     BF16Ptr, F32Ptr, W,
     RangePartitionedKernel, WorkerRangePartitionedKernel,
     fanout_dispatch, Binding,
-    accumulate_scaled, scale_unrolled,
 )
 from .attention_ops import (
-    TILE, flash_partial_stride, full_local_kv_count, online_softmax_tile,
+    LinearKV, RingKV, TILE,
+    flash_partial_stride, full_local_kv_count, process_kv_tile,
 )
-from .dot_products import dot_to_scalar
 from .logsum_merge import MergeSegment, write_finalized_head
 
 
@@ -21,14 +20,7 @@ struct FlashPrefillSlidingKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int, cache_size: Int,
 ](WorkerRangePartitionedKernel):
-    """Sliding-window prefill: each worker owns a contiguous Q-token
-    range and scans the per-Q `[max(0, pos - window + 1), pos]` slice of
-    a ring KV cache of `cache_size` slots (must be a power of two and
-    >= window). The cache holds the prior chunk in one half and the
-    current chunk in the other half, so the windowed read never collides
-    with the chunk's own writes. Head-sharded across ranks, so no
-    cross-rank merge; per-Q (acc, m, l) state lives in a worker-private
-    scratch slice; the finalized row is written straight to `output`."""
+    """`cache_size` must be a power of two (slot index uses `& (cache_size - 1)`)."""
 
     comptime SCRATCH_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
@@ -44,7 +36,6 @@ struct FlashPrefillSlidingKernel[
 
     def execute(mut self):
         comptime q_stride = Self.num_q * Self.head_dim
-        comptime slot_mask = Self.cache_size - 1
 
         var scratch = self.worker_scratch \
                      + self.worker_id * Self.SCRATCH_STRIDE
@@ -71,37 +62,11 @@ struct FlashPrefillSlidingKernel[
             var pos = lo
             while pos < hi:
                 var tile_len = min(TILE, hi - pos)
-
-                comptime for q_idx in range(Self.num_q):
-                    comptime kv_h = q_idx // Self.gqa_ratio
-
-                    var scores = SIMD[DType.float32, TILE](-1e30)
-                    for tt in range(tile_len):
-                        var slot = (pos + tt) & slot_mask
-                        var k_head = self.k_base \
-                                    + slot * Self.kv_stride \
-                                    + kv_h * Self.head_dim
-                        scores[tt] = dot_to_scalar[Self.head_dim](
-                            q_ptrs[q_idx], k_head)
-
-                    var sm = online_softmax_tile[TILE](scores, m[q_idx])
-                    var m_new = sm[0]
-                    var corr = sm[1]
-                    var weights = sm[2]
-
-                    scale_unrolled[cols=Self.head_dim](
-                        acc_ptrs[q_idx], corr)
-                    l[q_idx] = l[q_idx] * corr + weights.reduce_add()
-                    m[q_idx] = m_new
-
-                    for tt in range(tile_len):
-                        var slot = (pos + tt) & slot_mask
-                        var v_head = self.v_base \
-                                    + slot * Self.kv_stride \
-                                    + kv_h * Self.head_dim
-                        accumulate_scaled[cols=Self.head_dim](
-                            v_head, weights[tt], acc_ptrs[q_idx])
-
+                process_kv_tile[
+                    RingKV[Self.cache_size],
+                    Self.head_dim, Self.gqa_ratio, Self.kv_stride,
+                ](q_ptrs, self.k_base, self.v_base,
+                  0, pos, tile_len, m, l, acc_ptrs)
                 pos += TILE
 
             comptime for h in range(Self.num_q):
@@ -131,12 +96,8 @@ struct FlashPrefillFullKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, degree: Int,
 ](RangePartitionedKernel):
-    """Full-attention prefill on a position-sharded KV cache: each
-    worker owns a Q-token range, walks this rank's `pos // degree` local
-    KV slice with causal upper bound, and writes one (acc, m, l) partial
-    per (Q-token, head) into `partials_out`. The cross-rank
-    `dispatch_merge_flash_prefill_partials` then folds the `degree`
-    partials per (Q-token, local head) via logsum into the final O."""
+    """Walks this rank's `pos // degree` local KV slice with causal upper bound;
+    writes (acc, m, l) partials for cross-rank logsum merge."""
 
     comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
@@ -178,35 +139,11 @@ struct FlashPrefillFullKernel[
             var pos = 0
             while pos < local_kv_count:
                 var tile_len = min(TILE, local_kv_count - pos)
-
-                comptime for q_idx in range(Self.num_q):
-                    comptime kv_h = q_idx // Self.gqa_ratio
-
-                    var scores = SIMD[DType.float32, TILE](-1e30)
-                    for tt in range(tile_len):
-                        var k_head = self.k_base \
-                                    + (pos + tt) * Self.kv_stride \
-                                    + kv_h * Self.head_dim
-                        scores[tt] = dot_to_scalar[Self.head_dim](
-                            q_ptrs[q_idx], k_head)
-
-                    var sm = online_softmax_tile[TILE](scores, m[q_idx])
-                    var m_new = sm[0]
-                    var corr = sm[1]
-                    var weights = sm[2]
-
-                    scale_unrolled[cols=Self.head_dim](
-                        acc_ptrs[q_idx], corr)
-                    l[q_idx] = l[q_idx] * corr + weights.reduce_add()
-                    m[q_idx] = m_new
-
-                    for tt in range(tile_len):
-                        var v_head = self.v_base \
-                                    + (pos + tt) * Self.kv_stride \
-                                    + kv_h * Self.head_dim
-                        accumulate_scaled[cols=Self.head_dim](
-                            v_head, weights[tt], acc_ptrs[q_idx])
-
+                process_kv_tile[
+                    LinearKV,
+                    Self.head_dim, Self.gqa_ratio, Self.kv_stride,
+                ](q_ptrs, self.k_base, self.v_base,
+                  0, pos, tile_len, m, l, acc_ptrs)
                 pos += TILE
 
             comptime for h in range(Self.num_q):

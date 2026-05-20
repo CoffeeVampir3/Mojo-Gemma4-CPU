@@ -51,7 +51,6 @@ def bf16_panel_dot[
         InlineArray[SIMD[DType.float32, W], port_unroll], panel,
     ],
 ):
-    """PU-unrolled BF16xBF16 -> F32 dot over `cols` BF16 elements."""
     comptime STRIDE = port_unroll * BW
     for i in range(cols // STRIDE):
         comptime for p in range(port_unroll):
@@ -87,7 +86,6 @@ def bf16_panel_dot_to_scalars[
     weight_row: BF16Ptr,
     read x_rows: InlineArray[BF16Ptr, panel],
 ) -> InlineArray[Float32, panel]:
-    """Initialize, panel-dot, reduce to scalars."""
     var accs = InlineArray[
         InlineArray[SIMD[DType.float32, W], port_unroll], panel,
     ](
@@ -108,7 +106,6 @@ def dot_f32_bf16_into_accs[
     w: BF16Ptr,
     mut accs: InlineArray[SIMD[DType.float32, W], port_unroll],
 ):
-    """F32xBF16 -> F32 dot used by the router's F32 scaled activation."""
     comptime STRIDE = port_unroll * W
     for i in range(cols // STRIDE):
         comptime for p in range(port_unroll):

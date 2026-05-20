@@ -5,10 +5,8 @@ from notstdcollections import HeapMoveArray
 from .helpers import (
     Binding, fanout_dispatch, fanout_dispatch_per_rank,
 )
-from .attention_ops import full_local_kv_count
-from .flash_attention import (
-    FlashAttentionKernel, LinearKV, RingKV,
-)
+from .attention_ops import LinearKV, RingKV, full_local_kv_count
+from .flash_attention import FlashAttentionKernel
 from .flash_attention_prefill import (
     FlashPrefillSlidingKernel, FlashPrefillFullKernel,
     dispatch_merge_flash_prefill_partials,
@@ -40,13 +38,6 @@ def dispatch_sliding_attention[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    """Sliding-window attention covering decode (`seq_len == 1`) and
-    prefill (`seq_len > 1`, up to `window`). Decode partitions the
-    `[base_pos - W + 1, base_pos]` slice across workers, writes per-worker
-    partials, and merges into `output`. Prefill partitions the Q range,
-    scans each Q's `window` of K from the 2W ring, and writes finalized
-    output directly. `partials` doubles as per-worker scratch in either
-    path."""
     if seq_len <= 0:
         return
     if seq_len == 1:
@@ -113,13 +104,8 @@ def dispatch_full_attention[
     seq_len: Int,
     mut pools: HeapMoveArray[P],
 ):
-    """Full attention covering decode (`seq_len == 1`) and prefill
-    (`seq_len > 1`). KV cache is position-sharded across ranks; both
-    paths walk each rank's local slice and cross-rank merge. Decode
-    partitions kv within each rank across workers (per-worker partials);
-    prefill partitions the Q range across workers (per-Q partials).
-    `q_local_output` receives the per-rank merged attention output (the
-    input to the column-sharded o_proj)."""
+    """`q_local_output` is the per-rank merged attention output, feeding the
+    column-sharded o_proj."""
     if seq_len <= 0:
         return
     if seq_len == 1:
