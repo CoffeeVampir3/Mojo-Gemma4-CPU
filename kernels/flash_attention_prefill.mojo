@@ -9,8 +9,7 @@ from .helpers import (
     fanout_dispatch, Binding,
 )
 from .attention_ops import (
-    LinearKV, RingKV, TILE,
-    flash_partial_stride, full_local_kv_count, process_kv_tile,
+    LinearKV, RingKV, TILE, full_local_kv_count, process_kv_tile,
 )
 from .logsum_merge import MergeSegment, write_finalized_head
 
@@ -18,17 +17,15 @@ from .logsum_merge import MergeSegment, write_finalized_head
 @fieldwise_init
 struct FlashPrefillSlidingKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, cache_size: Int,
+    kv_stride: Int, window: Int, cache_size: Int, partial_stride: Int,
 ](WorkerRangePartitionedKernel):
     """`cache_size` must be a power of two (slot index uses `& (cache_size - 1)`)."""
-
-    comptime SCRATCH_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
 
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
     var output: BF16Ptr
-    var worker_scratch: F32Ptr
+    var partials: F32Ptr
     var base_pos: Int
     var worker_id: Int
     var start: Int
@@ -37,8 +34,7 @@ struct FlashPrefillSlidingKernel[
     def execute(mut self):
         comptime q_stride = Self.num_q * Self.head_dim
 
-        var scratch = self.worker_scratch \
-                     + self.worker_id * Self.SCRATCH_STRIDE
+        var scratch = self.partials + self.worker_id * Self.partial_stride
         var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
         var q_ptrs = InlineArray[BF16Ptr, Self.num_q](uninitialized=True)
         comptime for h in range(Self.num_q):
@@ -92,17 +88,15 @@ struct FlashPrefillSlidingKernel[
 @fieldwise_init
 struct FlashPrefillFullKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, degree: Int,
+    kv_stride: Int, degree: Int, partial_stride: Int,
 ](RangePartitionedKernel):
     """Walks this rank's `pos // degree` local KV slice with causal upper bound;
     writes (acc, m, l) partials for cross-rank logsum merge."""
 
-    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
-
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
-    var partials_out: F32Ptr
+    var partials: F32Ptr
     var base_pos: Int
     var rank: Int
     var start: Int
@@ -121,8 +115,7 @@ struct FlashPrefillFullKernel[
             var local_kv_count = full_local_kv_count(
                 self.rank, abs_pos, Self.degree)
 
-            var partial_tok = self.partials_out \
-                             + t * Self.PARTIAL_STRIDE
+            var partial_tok = self.partials + t * Self.partial_stride
             var q_tok = self.q + t * q_stride
 
             var m = InlineArray[Float32, Self.num_q](fill=Float32(-1e30))
@@ -154,15 +147,13 @@ struct FlashPrefillFullKernel[
 
 @fieldwise_init
 struct PrefillMergeConfig[head_dim: Int, num_q: Int, tp: Int]:
-    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
-
     var output: Binding[BFloat16, Self.tp]
     var partials: Binding[Float32, Self.tp]
 
 
 @fieldwise_init
 struct PrefillMergeKernel[
-    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
+    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int, partial_stride: Int,
     cfg_origin: Origin,
 ](RangePartitionedKernel):
     var config: UnsafePointer[
@@ -174,9 +165,6 @@ struct PrefillMergeKernel[
     var end: Int
 
     def execute(mut self):
-        comptime PSTRIDE = PrefillMergeConfig[
-            Self.head_dim, Self.num_q, Self.tp,
-        ].PARTIAL_STRIDE
         comptime out_stride = Self.local_num_q * Self.head_dim
 
         for flat in range(self.start, self.end):
@@ -188,8 +176,8 @@ struct PrefillMergeKernel[
                 uninitialized=True)
             comptime for r in range(Self.tp):
                 segs[r] = MergeSegment(
-                    self.config[].partials[r] + t * PSTRIDE,
-                    PSTRIDE, 1)
+                    self.config[].partials[r] + t * Self.partial_stride,
+                    Self.partial_stride, 1)
 
             var dst = self.config[].output[self.q_rank] \
                       + t * out_stride + local_h * Self.head_dim
@@ -204,7 +192,7 @@ struct PrefillMergeKernel[
 
 def dispatch_merge_flash_prefill_partials[
     P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
+    head_dim: Int, num_q: Int, local_num_q: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
     output: Binding[BFloat16, tp],
@@ -219,7 +207,7 @@ def dispatch_merge_flash_prefill_partials[
     var config = UnsafePointer(to=cfg).as_immutable()
     comptime cfg_ro = ImmutOrigin(origin_of(cfg))
     comptime K = PrefillMergeKernel[
-        head_dim, num_q, local_num_q, tp, cfg_ro,
+        head_dim, num_q, local_num_q, tp, partial_stride, cfg_ro,
     ]
 
     @parameter

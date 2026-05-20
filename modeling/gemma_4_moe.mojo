@@ -16,8 +16,7 @@ from kernels.rmsnorm import fused_norm_residual_add
 from kernels.gemv import dispatch_gemv_softcap
 from kernels.gemm import dispatch_gemm, dispatch_gemm_chained_qkv
 from kernels.rope import dispatch_rope_cache_write
-from kernels.attention_ops import LinearKV, RingKV
-from kernels.flash_attention import FlashAttentionKernel
+from kernels.attention_ops import flash_partial_stride
 from kernels.attention_dispatch_kernels import (
     dispatch_sliding_attention, dispatch_full_attention,
 )
@@ -256,11 +255,9 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     comptime num_kv_heads = Self.kv_rows // Self.head_dim
     comptime num_q_heads = Self.q_rows // Self.head_dim
     comptime cache_size = 2 * C.SLIDING_WINDOW
-    comptime FlashK = FlashAttentionKernel[
-        RingKV[Self.cache_size],
-        Self.head_dim, Self.num_q_heads,
-        Self.num_q_heads // Self.num_kv_heads, Self.kv_rows,
-    ]
+    comptime PARTIAL_STRIDE = flash_partial_stride[
+        Self.num_q_heads, Self.head_dim,
+    ]()
 
     comptime PHASES = ScratchPhaseOrder[
         "gemv_qkv", "rms_norm_qkv", "rope_cache_write",
@@ -279,7 +276,7 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Float32, Self.max_worker_count * Self.FlashK.PARTIAL_STRIDE,
+        Float32, Self.max_worker_count * Self.PARTIAL_STRIDE,
     ]
 
 
@@ -293,11 +290,9 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
     comptime local_q_rows = Self.S.FullO.DATA_M
     comptime head_dim = C.HEAD_DIM_FULL
     comptime num_q_heads = Self.q_rows // Self.head_dim
-    comptime FullK = FlashAttentionKernel[
-        LinearKV,
-        Self.head_dim, Self.num_q_heads,
-        C.NUM_HEADS // C.NUM_KV_HEADS_FULL, Self.k_rows,
-    ]
+    comptime PARTIAL_STRIDE = flash_partial_stride[
+        Self.num_q_heads, Self.head_dim,
+    ]()
     comptime PARTIAL_SLOTS = (
         Self.max_worker_count
         if Self.max_worker_count >= C.SLIDING_WINDOW
@@ -321,7 +316,7 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
 
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
-        Float32, Self.PARTIAL_SLOTS * Self.FullK.PARTIAL_STRIDE,
+        Float32, Self.PARTIAL_SLOTS * Self.PARTIAL_STRIDE,
     ]
 
     var q_local_band: ScratchPhase["merge_partials", "o_proj"]
@@ -618,7 +613,8 @@ def dispatch_sliding_attention_qkv[
         head_dim=head_dim, num_q=num_q_heads,
         gqa_ratio=num_q_heads // num_kv_heads,
         kv_stride=kv_cols, window=C.SLIDING_WINDOW,
-        cache_size=cache_size, tp=degree,
+        cache_size=cache_size,
+        partial_stride=Island.PARTIAL_STRIDE, tp=degree,
         max_worker_count=max_worker_count,
     ](q_outs, k_kv, v_kv, q_outs, partials,
       base_pos, seq_len, pools)
@@ -713,7 +709,8 @@ def dispatch_full_attention_qkv[
         head_dim=head_dim, num_q=num_q_heads,
         local_num_q=local_num_q_heads,
         gqa_ratio=C.NUM_HEADS // C.NUM_KV_HEADS_FULL,
-        kv_stride=kv_cols, tp=degree,
+        kv_stride=kv_cols,
+        partial_stride=Island.PARTIAL_STRIDE, tp=degree,
         max_worker_count=max_worker_count,
     ](q_outs, k_kv, v_kv, q_local_outs, partials,
       base_pos, seq_len, pools)

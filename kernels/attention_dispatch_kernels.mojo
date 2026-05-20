@@ -26,7 +26,7 @@ def sliding_valid_len(pos: Int, window: Int) -> Int:
 def dispatch_sliding_attention[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, cache_size: Int, tp: Int,
+    kv_stride: Int, window: Int, cache_size: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
     q: Binding[BFloat16, tp],
@@ -46,7 +46,8 @@ def dispatch_sliding_attention[
             return
         var start_pos = base_pos - valid_len + 1
         comptime DecodeK = FlashAttentionKernel[
-            RingKV[cache_size], head_dim, num_q, gqa_ratio, kv_stride,
+            RingKV[cache_size],
+            head_dim, num_q, gqa_ratio, kv_stride, partial_stride,
         ]
 
         @parameter
@@ -68,12 +69,13 @@ def dispatch_sliding_attention[
         ](pools)
 
         dispatch_merge_flash_partials[
-            head_dim, num_q, tp=tp,
+            head_dim, num_q, partial_stride, tp=tp,
             max_worker_count=max_worker_count,
         ](output, partials, nws, pools)
     else:
         comptime PrefillK = FlashPrefillSlidingKernel[
             head_dim, num_q, gqa_ratio, kv_stride, window, cache_size,
+            partial_stride,
         ]
 
         @parameter
@@ -92,7 +94,7 @@ def dispatch_sliding_attention[
 def dispatch_full_attention[
     P: BurstThreadPool, //,
     head_dim: Int, num_q: Int, local_num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, tp: Int,
+    kv_stride: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
     q: Binding[BFloat16, tp],
@@ -114,7 +116,7 @@ def dispatch_full_attention[
             valid_lens[rank] = full_local_kv_count(rank, base_pos, tp)
 
         comptime DecodeK = FlashAttentionKernel[
-            LinearKV, head_dim, num_q, gqa_ratio, kv_stride,
+            LinearKV, head_dim, num_q, gqa_ratio, kv_stride, partial_stride,
         ]
 
         @parameter
@@ -137,12 +139,12 @@ def dispatch_full_attention[
 
         dispatch_merge_context_flash_partials[
             head_dim=head_dim, num_q=num_q,
-            local_num_q=local_num_q, tp=tp,
+            local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
             max_worker_count=max_worker_count,
         ](q_local_output, partials, nws, pools)
     else:
         comptime PrefillK = FlashPrefillFullKernel[
-            head_dim, num_q, gqa_ratio, kv_stride, tp,
+            head_dim, num_q, gqa_ratio, kv_stride, tp, partial_stride,
         ]
 
         @parameter
@@ -159,6 +161,6 @@ def dispatch_full_attention[
 
         dispatch_merge_flash_prefill_partials[
             head_dim=head_dim, num_q=num_q,
-            local_num_q=local_num_q, tp=tp,
+            local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
             max_worker_count=max_worker_count,
         ](q_local_output, partials, seq_len, pools)

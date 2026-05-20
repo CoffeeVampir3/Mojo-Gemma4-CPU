@@ -9,7 +9,6 @@ from .helpers import (
     RangePartitionedKernel, DispatchBuffer, tile_dispatch,
     fanout_dispatch, join_all, Binding,
 )
-from .attention_ops import flash_partial_stride
 from .dispatch_heuristics import (
     MERGE_INLINE_MAX_BYTES, MERGE_SATURATE_BYTES,
 )
@@ -129,9 +128,9 @@ def finalize_head[head_dim: Int, num_q: Int](
 
 
 @fieldwise_init
-struct FinalizeKernel[head_dim: Int, num_q: Int](RangePartitionedKernel):
-    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
-
+struct FinalizeKernel[head_dim: Int, num_q: Int, partial_stride: Int](
+    RangePartitionedKernel
+):
     var output: BF16Ptr
     var partials: F32Ptr
     var num_sources: Int
@@ -141,7 +140,7 @@ struct FinalizeKernel[head_dim: Int, num_q: Int](RangePartitionedKernel):
     def execute(mut self):
         for h in range(self.start, self.end):
             finalize_head[Self.head_dim, Self.num_q](
-                self.output, self.partials, Self.PARTIAL_STRIDE,
+                self.output, self.partials, Self.partial_stride,
                 self.num_sources, h)
 
     @always_inline
@@ -152,8 +151,6 @@ struct FinalizeKernel[head_dim: Int, num_q: Int](RangePartitionedKernel):
 
 @fieldwise_init
 struct ContextFlashMergeConfig[head_dim: Int, num_q: Int, tp: Int]:
-    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
-
     var output: Binding[BFloat16, Self.tp]
     var partials: Binding[Float32, Self.tp]
     var num_sources: InlineArray[Int, Self.tp]
@@ -161,18 +158,16 @@ struct ContextFlashMergeConfig[head_dim: Int, num_q: Int, tp: Int]:
 
 @always_inline
 def finalize_context_head[
-    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
+    head_dim: Int, num_q: Int, local_num_q: Int, partial_stride: Int, tp: Int,
 ](
     config: UnsafePointer[ContextFlashMergeConfig[head_dim, num_q, tp], _],
     q_rank: Int,
     local_h: Int,
 ):
-    comptime PSTRIDE = ContextFlashMergeConfig[head_dim, num_q, tp].PARTIAL_STRIDE
-
     var segs = InlineArray[MergeSegment, tp](uninitialized=True)
     comptime for r in range(tp):
         segs[r] = MergeSegment(
-            config[].partials[r], PSTRIDE, config[].num_sources[r])
+            config[].partials[r], partial_stride, config[].num_sources[r])
 
     var global_h = q_rank * local_num_q + local_h
     var dst = config[].output[q_rank] + local_h * head_dim
@@ -181,7 +176,8 @@ def finalize_context_head[
 
 @fieldwise_init
 struct ContextFinalizeKernel[
-    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int, cfg_origin: Origin,
+    head_dim: Int, num_q: Int, local_num_q: Int, partial_stride: Int, tp: Int,
+    cfg_origin: Origin,
 ](RangePartitionedKernel):
     var config: UnsafePointer[
         ContextFlashMergeConfig[Self.head_dim, Self.num_q, Self.tp],
@@ -194,7 +190,7 @@ struct ContextFinalizeKernel[
         for local_h in range(self.start, self.end):
             finalize_context_head[
                 Self.head_dim, Self.num_q, Self.local_num_q,
-                Self.tp,
+                Self.partial_stride, Self.tp,
             ](self.config, self.q_rank, local_h)
 
     @always_inline
@@ -212,7 +208,8 @@ def merge_workers[num_q: Int](data_bytes: Int, capacity: Int) -> Int:
 
 def dispatch_merge_flash_partials[
     P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, tp: Int, max_worker_count: Int = 128,
+    head_dim: Int, num_q: Int, partial_stride: Int, tp: Int,
+    max_worker_count: Int = 128,
 ](
     output: Binding[BFloat16, tp],
     partials_buf: Binding[Float32, tp],
@@ -220,8 +217,7 @@ def dispatch_merge_flash_partials[
     mut pools: HeapMoveArray[P],
     inline_max_bytes: Int = MERGE_INLINE_MAX_BYTES,
 ):
-    comptime K = FinalizeKernel[head_dim, num_q]
-    comptime PSTRIDE = K.PARTIAL_STRIDE
+    comptime K = FinalizeKernel[head_dim, num_q, partial_stride]
     var buf = DispatchBuffer[K, max_worker_count]()
     for r in range(tp):
         if num_sources[r] <= 0:
@@ -231,7 +227,7 @@ def dispatch_merge_flash_partials[
         if data_bytes <= inline_max_bytes:
             for h in range(num_q):
                 finalize_head[head_dim, num_q](
-                    output[r], partials_buf[r], PSTRIDE,
+                    output[r], partials_buf[r], partial_stride,
                     num_sources[r], h)
             continue
         var nw = merge_workers[num_q](
@@ -244,7 +240,7 @@ def dispatch_merge_flash_partials[
 
 def dispatch_merge_context_flash_partials[
     P: BurstThreadPool, //,
-    head_dim: Int, num_q: Int, local_num_q: Int, tp: Int,
+    head_dim: Int, num_q: Int, local_num_q: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
     output: Binding[BFloat16, tp],
@@ -265,7 +261,9 @@ def dispatch_merge_context_flash_partials[
         output, partials_buf, num_sources)
     var config = UnsafePointer(to=cfg).as_immutable()
     comptime cfg_ro = ImmutOrigin(origin_of(cfg))
-    comptime K = ContextFinalizeKernel[head_dim, num_q, local_num_q, tp, cfg_ro]
+    comptime K = ContextFinalizeKernel[
+        head_dim, num_q, local_num_q, partial_stride, tp, cfg_ro,
+    ]
 
     @parameter
     def make(q_rank: Int) -> K:

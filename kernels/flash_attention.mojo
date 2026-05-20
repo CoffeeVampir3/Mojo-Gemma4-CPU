@@ -4,18 +4,15 @@ from .helpers import (
     BF16Ptr, F32Ptr,
     WorkerRangePartitionedKernel,
 )
-from .attention_ops import (
-    KVSlot, TILE, flash_partial_stride, process_kv_tile,
-)
+from .attention_ops import KVSlot, TILE, process_kv_tile
 
 
 @fieldwise_init
 struct FlashAttentionKernel[
     KV: KVSlot,
     head_dim: Int, num_q: Int, gqa_ratio: Int, kv_stride: Int,
+    partial_stride: Int,
 ](WorkerRangePartitionedKernel):
-    comptime PARTIAL_STRIDE = flash_partial_stride[Self.num_q, Self.head_dim]()
-
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
@@ -26,7 +23,7 @@ struct FlashAttentionKernel[
     var end: Int
 
     def execute(mut self):
-        var my_partial = self.partials + self.worker_id * Self.PARTIAL_STRIDE
+        var my_partial = self.partials + self.worker_id * Self.partial_stride
         comptime m_off = Self.num_q * Self.head_dim
         comptime l_off = m_off + Self.num_q
 

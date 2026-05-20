@@ -6,8 +6,7 @@ from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from notstdcollections import HeapMoveArray
-from kernels.attention_ops import LinearKV
-from kernels.flash_attention import FlashAttentionKernel
+from kernels.attention_ops import flash_partial_stride
 from kernels.attention_dispatch_kernels import dispatch_full_attention
 from kernels.helpers import Binding, ArenaBases
 from benchmarks.bench_harness import (
@@ -27,6 +26,7 @@ comptime GLOBAL_GQA = GLOBAL_NUM_Q // NUM_KV
 comptime KV_STRIDE = 1024
 comptime MAX_SEQ = 4096
 comptime MAX_WORKERS = 128
+comptime PSTRIDE = flash_partial_stride[GLOBAL_NUM_Q, HEAD_DIM]()
 
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
@@ -85,7 +85,7 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     dispatch_full_attention[
         head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
         local_num_q=LOCAL_NUM_Q, gqa_ratio=GLOBAL_GQA,
-        kv_stride=KV_STRIDE, tp=tp,
+        kv_stride=KV_STRIDE, partial_stride=PSTRIDE, tp=tp,
     ](
         Binding[BFloat16, tp](q, bases),
         Binding[BFloat16, tp](k_cache, bases),
@@ -130,7 +130,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
             dispatch_full_attention[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                 local_num_q=LOCAL_NUM_Q, gqa_ratio=GLOBAL_GQA,
-                kv_stride=KV_STRIDE, tp=tp,
+                kv_stride=KV_STRIDE, partial_stride=PSTRIDE, tp=tp,
             ](
                 Binding[BFloat16, tp](q, bases),
                 Binding[BFloat16, tp](k_cache, bases),
@@ -146,7 +146,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
             dispatch_full_attention[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                 local_num_q=LOCAL_NUM_Q, gqa_ratio=GLOBAL_GQA,
-                kv_stride=KV_STRIDE, tp=tp,
+                kv_stride=KV_STRIDE, partial_stride=PSTRIDE, tp=tp,
             ](
                 Binding[BFloat16, tp](q, bases),
                 Binding[BFloat16, tp](k_cache, bases),
@@ -171,9 +171,7 @@ def run_all[P: BurstThreadPool, //, tp: Int](
 ):
     var bases = arena_bases[tp](arenas)
     comptime LOCAL_NUM_Q = GLOBAL_NUM_Q // tp
-    comptime PSTRIDE = FlashAttentionKernel[
-        LinearKV, HEAD_DIM, GLOBAL_NUM_Q, GLOBAL_GQA, KV_STRIDE,
-    ].PARTIAL_STRIDE
+    comptime PSTRIDE = flash_partial_stride[GLOBAL_NUM_Q, HEAD_DIM]()
     var q = arena_alloc_all[DType.bfloat16, tp](arenas, GLOBAL_NUM_Q * HEAD_DIM)
     var k_cache = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_SEQ * KV_STRIDE)
     var v_cache = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_SEQ * KV_STRIDE)
