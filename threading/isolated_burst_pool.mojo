@@ -227,7 +227,7 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool):
             )
             var tid = sys.sys_clone3_with_entry(UnsafePointer(to=clone_args), size_of[linux.Clone3Args]())
             if tid < 0:
-                print("clone3 failed for worker", i)
+                print(t"clone3 failed for worker {i}")
                 abort("IsolatedBurstPool.spawn_workers: clone3 failed")
         self.workers_alive = True
 
@@ -240,23 +240,13 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool):
         if jobs <= 0:
             return
         if jobs > self.capacity:
-            print(
-                "IsolatedBurstPool.dispatch invalid job count jobs",
-                jobs,
-                "capacity",
-                self.capacity,
-            )
+            print(t"IsolatedBurstPool.dispatch invalid job count jobs {jobs} capacity {self.capacity}")
             abort("IsolatedBurstPool.dispatch: num_jobs exceeds pool capacity")
 
         debug_assert(jobs <= self.capacity, "num_jobs must be <= pool capacity")
         debug_assert(jobs <= len(kernels), "num_jobs must be <= len(kernels)")
         if self.active_jobs != 0:
-            print(
-                "IsolatedBurstPool.dispatch invalid while jobs active active_jobs",
-                self.active_jobs,
-                "capacity",
-                self.capacity,
-            )
+            print(t"IsolatedBurstPool.dispatch invalid while jobs active active_jobs {self.active_jobs} capacity {self.capacity}")
             abort("IsolatedBurstPool.dispatch: previous dispatch still in flight")
 
         debug_assert(self.active_jobs == 0,

@@ -22,7 +22,7 @@ def select_tensor_parallel_degree[
         if tp == degree:
             dispatch[degree](pools^)
             return
-    print("unsupported tp=" + String(tp))
+    print(t"unsupported tp={tp}")
 
 
 def with_topological_rank_dispatch[
@@ -42,8 +42,7 @@ def with_topological_rank_dispatch[
         var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
         for i in range(tp):
             pools.push(IsolatedBurstPool[].for_rank(topo, i))
-            print("  node " + String(topo.node(i)) + ": "
-                + String(pools[i].get_capacity()) + " workers")
+            print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
         print("")
 
         select_tensor_parallel_degree[
@@ -55,8 +54,7 @@ def with_topological_rank_dispatch[
         var pools = HeapMoveArray[BurstPool[]](tp)
         for i in range(tp):
             pools.push(BurstPool[].for_rank(topo, i))
-            print("  node " + String(topo.node(i)) + ": "
-                + String(pools[i].get_capacity()) + " workers")
+            print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
         print("")
 
         select_tensor_parallel_degree[
