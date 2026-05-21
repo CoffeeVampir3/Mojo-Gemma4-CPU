@@ -664,7 +664,7 @@ def load_tokenizer_with_capabilities[
     try:
         file_bytes = path.read_bytes()
     except e:
-        print("tokenizer: failed to read file:", e)
+        print(t"tokenizer: failed to read file: {e}")
         return None
 
     var parser = Parser(Span(file_bytes))
@@ -711,13 +711,13 @@ def load_tokenizer_with_capabilities[
             if not parser.delimited_next(RBRACE):
                 break
     except e:
-        print("tokenizer: parse error at pos", e.pos, ":", e.message)
+        print(t"tokenizer: parse error at pos {e.pos}: {e.message}")
         return None
 
     try:
         validate_token_ids(added_tokens, "added token id does not fit BPE pair key", 0)
     except e:
-        print("tokenizer: parse error at pos", e.pos, ":", e.message)
+        print(t"tokenizer: parse error at pos {e.pos}: {e.message}")
         return None
 
     var bos_token_id = -1
@@ -775,21 +775,19 @@ def load_tokenizer(path: Path) -> Optional[BPETokenizer[AutoPreTokenizer, AutoBy
             use_piece_cache=(flavor != TOKENIZER_FLAVOR_GEMMA4),
         )
 
-    print("tokenizer: unsupported pre-tokenizer semantics in", path)
+    print(t"tokenizer: unsupported pre-tokenizer semantics in {path}")
     return None
 
 
 def load_gpt2_tokenizer(path: Path) -> Optional[
     BPETokenizer[GPT2PreTokenizer, GPT2ByteTransform]
 ]:
-    """Load a BPETokenizer using GPT-2 pre-tokenizer semantics."""
     return load_tokenizer_with_capabilities(path, GPT2PreTokenizer(), GPT2ByteTransform())
 
 
 def load_deepseek_v3_tokenizer(path: Path) -> Optional[
     BPETokenizer[DeepSeekV3PreTokenizer, DeepSeekV3ByteTransform]
 ]:
-    """Load a BPETokenizer using DeepSeek V3 pre-tokenizer semantics."""
     return load_tokenizer_with_capabilities(
         path,
         DeepSeekV3PreTokenizer(),
@@ -800,7 +798,6 @@ def load_deepseek_v3_tokenizer(path: Path) -> Optional[
 def load_gpt_oss_tokenizer(path: Path) -> Optional[
     BPETokenizer[GptOssPreTokenizer, GptOssByteTransform]
 ]:
-    """Load a BPETokenizer using GPT-OSS pre-tokenizer semantics."""
     return load_tokenizer_with_capabilities(
         path,
         GptOssPreTokenizer(),
@@ -811,7 +808,6 @@ def load_gpt_oss_tokenizer(path: Path) -> Optional[
 def load_gemma4_tokenizer(path: Path) -> Optional[
     BPETokenizer[Gemma4PreTokenizer, Gemma4ByteTransform]
 ]:
-    """Load a BPETokenizer using Gemma 4 tokenizer semantics."""
     return load_tokenizer_with_capabilities(
         path,
         Gemma4PreTokenizer(),

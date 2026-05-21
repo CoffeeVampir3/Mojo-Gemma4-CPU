@@ -1,8 +1,8 @@
 """Expert-output accumulation: serial vs port-saturated variants.
 
-Shape mirrors `accumulate_expert_outputs` (experimental3/kernels/rmsnorm.mojo):
-per width-wide output chunk, sum `local_count` bf16 expert outputs (stride =
-hidden) into f32 and store as bf16.
+Assembly probe for summing `local_count` bf16 expert-output rows into one
+bf16 destination row. Each output chunk is WIDTH lanes; expert rows are laid
+out with `hidden` stride.
 
 Build:
     pixi run mojo build -D ASSERT=none expert_sum_port_saturation.mojo
@@ -32,7 +32,7 @@ def accumulate_serial(
     expert_buf: UnsafePointer[BFloat16, MutAnyOrigin],
     dst: UnsafePointer[BFloat16, MutAnyOrigin],
 ):
-    """Single-accumulator chain across experts — mirrors current kernel."""
+    """Single-accumulator chain across experts."""
     for i in range(0, HIDDEN, WIDTH):
         var acc = SIMD[DType.float32, WIDTH](0)
         for e in range(LOCAL_COUNT):

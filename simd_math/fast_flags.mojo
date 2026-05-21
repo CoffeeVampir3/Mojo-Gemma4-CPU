@@ -14,7 +14,6 @@ def set_subnormal_zeroing():
 
 
 def get_mxcsr() -> UInt32:
-    """Read the current MXCSR register value."""
     var mxcsr = UInt32(0)
     var ptr = UnsafePointer(to=mxcsr)
     llvm_intrinsic["llvm.x86.sse.stmxcsr", NoneType](ptr)

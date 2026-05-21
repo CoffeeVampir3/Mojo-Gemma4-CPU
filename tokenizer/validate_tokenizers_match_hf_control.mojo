@@ -16,7 +16,7 @@ def print_ids(ids: List[Int]):
     for i in range(len(ids)):
         if i > 0:
             s += ", "
-        s += String(ids[i])
+        s.write(ids[i])
     s += "]"
     print(s)
 
@@ -672,61 +672,65 @@ def run_tokenizer_validation() -> Tuple[Int, Int]:
     var total_pass = 0
     var total_fail = 0
 
-    # SmolLM2 (GPT-2 pre-tokenizer)
     print("=== SmolLM2 (GPT-2) ===")
     var smol_opt = load_tokenizer(Path("checkpoints/SmolLM2/tokenizer.json"))
     if not smol_opt:
         print("FAILED to load SmolLM2 tokenizer")
     else:
         var smol = smol_opt.take()
-        print("Vocab:", smol.vocab_size(), "Merges:", smol.num_merges())
+        var v = smol.vocab_size()
+        var m = smol.num_merges()
+        print(t"Vocab: {v} Merges: {m}")
         var result = test_smollm2(smol)
-        print("SmolLM2:", result[0], "passed,", result[1], "failed")
+        print(t"SmolLM2: {result[0]} passed, {result[1]} failed")
         total_pass += result[0]
         total_fail += result[1]
 
     print()
 
-    # DeepSeek V3
     print("=== DeepSeek V3 ===")
     var ds_opt = load_tokenizer(Path("checkpoints/deepseekv3/tokenizer.json"))
     if not ds_opt:
         print("FAILED to load DeepSeek V3 tokenizer")
     else:
         var ds = ds_opt.take()
-        print("Vocab:", ds.vocab_size(), "Merges:", ds.num_merges())
+        var v = ds.vocab_size()
+        var m = ds.num_merges()
+        print(t"Vocab: {v} Merges: {m}")
         var result = test_deepseek_v3(ds)
-        print("DeepSeek V3:", result[0], "passed,", result[1], "failed")
+        print(t"DeepSeek V3: {result[0]} passed, {result[1]} failed")
         total_pass += result[0]
         total_fail += result[1]
 
     print()
 
-    # GPT-OSS
     print("=== GPT-OSS ===")
     var gpt_opt = load_tokenizer(Path("checkpoints/gpt-oss-20b/tokenizer.json"))
     if not gpt_opt:
         print("FAILED to load GPT-OSS tokenizer")
     else:
         var gpt = gpt_opt.take()
-        print("Vocab:", gpt.vocab_size(), "Merges:", gpt.num_merges())
+        var v = gpt.vocab_size()
+        var m = gpt.num_merges()
+        print(t"Vocab: {v} Merges: {m}")
         var result = test_gpt_oss(gpt)
-        print("GPT-OSS:", result[0], "passed,", result[1], "failed")
+        print(t"GPT-OSS: {result[0]} passed, {result[1]} failed")
         total_pass += result[0]
         total_fail += result[1]
 
     print()
 
-    # Gemma 4
     print("=== Gemma 4 ===")
     var g4_opt = load_tokenizer(Path("checkpoints/gemma4/tokenizer.json"))
     if not g4_opt:
         print("FAILED to load Gemma 4 tokenizer")
     else:
         var g4 = g4_opt.take()
-        print("Vocab:", g4.vocab_size(), "Merges:", g4.num_merges())
+        var v = g4.vocab_size()
+        var m = g4.num_merges()
+        print(t"Vocab: {v} Merges: {m}")
         var result = test_gemma4(g4)
-        print("Gemma 4:", result[0], "passed,", result[1], "failed")
+        print(t"Gemma 4: {result[0]} passed, {result[1]} failed")
         total_pass += result[0]
         total_fail += result[1]
 
@@ -738,12 +742,14 @@ def run_tokenizer_validation() -> Tuple[Int, Int]:
         print("FAILED to load MiniMax-M2.7 tokenizer")
     else:
         var mm = mm_opt.take()
-        print("Vocab:", mm.vocab_size(), "Merges:", mm.num_merges())
+        var v = mm.vocab_size()
+        var m = mm.num_merges()
+        print(t"Vocab: {v} Merges: {m}")
         var result = test_minimax_m27(mm)
-        print("MiniMax-M2.7:", result[0], "passed,", result[1], "failed")
+        print(t"MiniMax-M2.7: {result[0]} passed, {result[1]} failed")
         total_pass += result[0]
         total_fail += result[1]
 
     print()
-    print("=== TOTAL:", total_pass, "passed,", total_fail, "failed ===")
+    print(t"=== TOTAL: {total_pass} passed, {total_fail} failed ===")
     return (total_pass, total_fail)

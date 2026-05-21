@@ -68,13 +68,11 @@ def fill_weight(ptr: BF16ExtPtr, count: Int, seed: Int):
             Float32(1.0) + Float32((i + seed) % 64) * 0.001)
 
 
-def assert_same(a: BF16ExtPtr, b: BF16ExtPtr, count: Int, label: String):
+def assert_same(a: BF16ExtPtr, b: BF16ExtPtr, count: Int, label: StringSlice):
     for i in range(count):
         var got = Float32(a[i])
         var expected = Float32(b[i])
-        check(got == expected,
-            label + " [" + String(i) + "] expected="
-            + String(expected) + " got=" + String(got))
+        check(got == expected, String(t"{label} [{i}] expected={expected} got={got}"))
 
 
 def check_rms_norm_seq(count: Int):

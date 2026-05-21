@@ -94,18 +94,18 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
         Binding[Float32, tp](partials, bases),
         VL - 1, 1, pools)
 
-    print("  output[0..3]: "
-        + String(output[0].cast[DType.float32]()) + " "
-        + String(output[1].cast[DType.float32]()) + " "
-        + String(output[2].cast[DType.float32]()) + " "
-        + String(output[3].cast[DType.float32]()))
+    var o0 = output[0].cast[DType.float32]()
+    var o1 = output[1].cast[DType.float32]()
+    var o2 = output[2].cast[DType.float32]()
+    var o3 = output[3].cast[DType.float32]()
+    print(t"  output[0..3]: {o0} {o1} {o2} {o3}")
     var ok = True
     for i in range(LOCAL_NUM_Q * HEAD_DIM):
         var v = output[i].cast[DType.float32]()
         if v != v:
             ok = False
             break
-    print("  " + ("OK (no NaN)" if ok else "FAIL: NaN detected"))
+    print("  ", "OK (no NaN)" if ok else "FAIL: NaN detected")
 
 
 def section_context_sweep[P: BurstThreadPool, //, tp: Int](
@@ -162,7 +162,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
         var ks = compute_stats(samples.kernel_ns, samples.n)
         var ws = compute_stats(samples.wall_ns, samples.n)
         var kv_bytes = vl * KV_STRIDE * 2 * 2
-        print_row("seq=" + String(vl), ks, ws, kv_bytes)
+        print_row(String(t"seq={vl}"), ks, ws, kv_bytes)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -188,10 +188,11 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
-    print("pool capacity: " + String(cap) + " workers")
-    print("head_dim=" + String(HEAD_DIM) + " num_q=" + String(LOCAL_NUM_Q)
-        + " num_kv=" + String(NUM_KV) + " gqa=" + String(GLOBAL_GQA)
-        + " max_seq=" + String(MAX_SEQ))
+    print(t"pool capacity: {cap} workers")
+    print(
+        t"head_dim={HEAD_DIM} num_q={LOCAL_NUM_Q} num_kv={NUM_KV} "
+        t"gqa={GLOBAL_GQA} max_seq={MAX_SEQ}"
+    )
 
     section_validation[tp=tp](pools, q, k_cache, v_cache, output, partials, bases)
     section_context_sweep[tp=tp](pools, q, k_cache, v_cache, output, partials, bases)
@@ -202,8 +203,8 @@ def main():
     var tp = len(topo)
 
     print("Full attention benchmark (replicated Q + context-local attention + merge)")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)

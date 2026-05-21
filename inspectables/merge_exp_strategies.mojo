@@ -50,8 +50,6 @@ def fast_exp_softmax_biased[width: Int](
     return k * (QC_A + f * (QC_B + f * QC_C))
 
 
-# === Variant A: runtime num_active, scalar exp, serial accumulator chain ===
-
 @no_inline
 def merge_runtime_scalar(
     output: BF16Ptr,
@@ -95,8 +93,6 @@ def merge_runtime_scalar(
                 (dst + i * STRIDE + p * W).store(
                     (acc * SIMD[DType.float32, W](inv_l)).cast[DType.bfloat16]())
 
-
-# === Variant B: comptime sources, batched exp, independent accumulators ===
 
 @no_inline
 def merge_comptime_batched(

@@ -124,7 +124,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
         var ks = compute_stats(samples.kernel_ns, samples.n)
         var ws = compute_stats(samples.wall_ns, samples.n)
         var kv_bytes = vl * KV_STRIDE * 2 * 2
-        print_row("seq=" + String(vl), ks, ws, kv_bytes)
+        print_row(String(t"seq={vl}"), ks, ws, kv_bytes)
 
 
 def section_validation[P: BurstThreadPool, //, tp: Int](
@@ -147,18 +147,18 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     ](q, k_cache, v_cache, output, partials, pos, 1, pools)
 
     var out0 = output[0]
-    print("  output[0..3]: "
-        + String(out0[0].cast[DType.float32]()) + " "
-        + String(out0[1].cast[DType.float32]()) + " "
-        + String(out0[2].cast[DType.float32]()) + " "
-        + String(out0[3].cast[DType.float32]()))
+    var o0 = out0[0].cast[DType.float32]()
+    var o1 = out0[1].cast[DType.float32]()
+    var o2 = out0[2].cast[DType.float32]()
+    var o3 = out0[3].cast[DType.float32]()
+    print(t"  output[0..3]: {o0} {o1} {o2} {o3}")
     var ok = True
     for i in range(NUM_Q * HEAD_DIM):
         var v = out0[i].cast[DType.float32]()
         if v != v:
             ok = False
             break
-    print("  " + ("OK (no NaN)" if ok else "FAIL: NaN detected"))
+    print("  ", "OK (no NaN)" if ok else "FAIL: NaN detected")
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -188,10 +188,11 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
-    print("pool capacity: " + String(cap) + " workers")
-    print("head_dim=" + String(HEAD_DIM) + " num_q=" + String(NUM_Q)
-        + " num_kv=" + String(NUM_KV) + " gqa=" + String(GQA_RATIO)
-        + " window=" + String(WINDOW))
+    print(t"pool capacity: {cap} workers")
+    print(
+        t"head_dim={HEAD_DIM} num_q={NUM_Q} num_kv={NUM_KV} "
+        t"gqa={GQA_RATIO} window={WINDOW}"
+    )
 
     section_validation[tp=tp](pools, q, k_cache, v_cache, output, partials)
     section_context_sweep[tp=tp](pools, q, k_cache, v_cache, output, partials)
@@ -202,8 +203,8 @@ def main():
     var tp = len(topo)
 
     print("Sliding attention benchmark (dispatch_sliding_attention)")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)

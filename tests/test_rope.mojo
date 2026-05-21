@@ -13,18 +13,16 @@ comptime HEAD_DIM = 512
 comptime F32Ptr = UnsafePointer[Float32, MutExternalOrigin]
 
 
-def check(ok: Bool, msg: String):
+def check(ok: Bool, msg: StringSlice):
     if not ok:
-        abort("FAIL: " + msg)
+        abort(String(t"FAIL: {msg}"))
 
 
-def check_same(a: F32Ptr, b: F32Ptr, count: Int, label: String):
+def check_same(a: F32Ptr, b: F32Ptr, count: Int, label: StringSlice):
     for i in range(count):
         var av = Float32(a[i])
         var bv = Float32(b[i])
-        check(av == bv,
-            label + " [" + String(i) + "] expected="
-            + String(av) + " got=" + String(bv))
+        check(av == bv, String(t"{label} [{i}] expected={av} got={bv}"))
 
 
 def main():
@@ -48,10 +46,10 @@ def main():
         var sharded_off = (rank * ROWS + row) * HALF
         check_same(
             direct_cos + pos * HALF, sharded_cos + sharded_off,
-            HALF, "full rope cos pos=" + String(pos))
+            HALF, String(t"full rope cos pos={pos}"))
         check_same(
             direct_sin + pos * HALF, sharded_sin + sharded_off,
-            HALF, "full rope sin pos=" + String(pos))
+            HALF, String(t"full rope sin pos={pos}"))
 
     direct_cos.free()
     direct_sin.free()

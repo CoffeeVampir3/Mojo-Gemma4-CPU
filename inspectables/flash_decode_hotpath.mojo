@@ -118,8 +118,6 @@ def accumulate_v_corrected[head_dim: Int](
             (acc + i * S_ + p * W).store(a.fma(c_vec, v * w_vec))
 
 
-# === Variant A: original per-position (scalar exp) ===
-
 @no_inline
 def flash_decode_original(
     q: BF16Ptr,
@@ -175,8 +173,6 @@ def flash_decode_original(
         (partials + m_off + h)[] = m[h]
         (partials + l_off + h)[] = l[h]
 
-
-# === Variant B: tiled (vector exp, amortized correction) ===
 
 @no_inline
 def flash_decode_tiled(

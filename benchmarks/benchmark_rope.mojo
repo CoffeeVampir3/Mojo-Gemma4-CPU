@@ -167,7 +167,7 @@ def section_token_scaling(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr):
         var data_bytes = nh * HEAD_DIM_SLIDING * 2
         var ks = compute_stats(samples.kernel_ns, samples.n)
         var ws = compute_stats(samples.wall_ns, samples.n)
-        print_row("heads=" + String(nh), ks, ws, data_bytes * 2)
+        print_row(String(t"heads={nh}"), ks, ws, data_bytes * 2)
 
 
 def section_sliding_cache_write[
@@ -287,8 +287,7 @@ def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
     cos_sl: F32Ptr, sin_sl: F32Ptr, cos_fl: F32Ptr, sin_fl: F32Ptr,
     bases: ArenaBases[tp],
 ):
-    print("\n=== dispatch_rope_cache_write model path (seq_len=1, TP="
-        + String(tp) + ") ===")
+    print(t"\n=== dispatch_rope_cache_write model path (seq_len=1, TP={tp}) ===")
 
     section_sliding_cache_write[tp=tp](
         pools, sliding_q, sliding_k, sliding_v,
@@ -355,7 +354,7 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
-    print("pool capacity: " + String(cap) + " workers")
+    print(t"pool capacity: {cap} workers")
     print("sliding: head_dim=256, half=128, theta=10000")
     print("full:    head_dim=512, rotary_half=64, theta=1000000")
 
@@ -373,8 +372,8 @@ def main():
     var tp = len(topo)
 
     print("RoPE kernel benchmark")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)

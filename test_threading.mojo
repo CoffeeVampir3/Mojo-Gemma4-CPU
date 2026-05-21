@@ -102,32 +102,33 @@ def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
                 best_j = j
                 best_overhead = o
 
-        print("  " + label + "\t   "
-            + String(best_d // 1000) + " us\t   "
-            + String(best_j // 1000) + " us\t   "
-            + String(best_overhead) + " ns")
+        var d_us = best_d // 1000
+        var j_us = best_j // 1000
+        print(t"  {label}\t   {d_us} us\t   {j_us} us\t   {best_overhead} ns")
 
 
 def main():
     var topo = NumaTopology()
     var num_nodes = topo.num_nodes()
 
-    print(String(num_nodes) + " NUMA nodes, "
-        + String(len(topo.isolated_cpus)) + " isolated cpus")
+    var iso = len(topo.isolated_cpus)
+    print(t"{num_nodes} NUMA nodes, {iso} isolated cpus")
 
     if topo.has_isolation():
         print("mode: isolated (spin-only)")
         var pools = HeapMoveArray[IsolatedBurstPool[]](num_nodes)
         for i in range(num_nodes):
             pools.push(IsolatedBurstPool[].for_rank(topo, i))
-            print("  node " + String(topo.node(i)) + ": "
-                + String(pools[i].get_capacity()) + " workers")
+            var node = topo.node(i)
+            var workers = pools[i].get_capacity()
+            print(t"  node {node}: {workers} workers")
         run_bench(pools, num_nodes)
     else:
         print("mode: cold (spin-backoff)")
         var pools = HeapMoveArray[BurstPool[]](num_nodes)
         for i in range(num_nodes):
             pools.push(BurstPool[].for_rank(topo, i))
-            print("  node " + String(topo.node(i)) + ": "
-                + String(pools[i].get_capacity()) + " workers")
+            var node = topo.node(i)
+            var workers = pools[i].get_capacity()
+            print(t"  node {node}: {workers} workers")
         run_bench(pools, num_nodes)

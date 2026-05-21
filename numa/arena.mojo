@@ -18,10 +18,6 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
     var node: Int
 
     def __init__(out self, node: Int, size: Int):
-        """Args:
-            node: NUMA node ID to bind memory to.
-            size: Total arena size in bytes.
-        """
         self.node = node
         self.size = size
         self.offset = 0
@@ -35,7 +31,6 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
             _ = sys.sys_munmap(Int(self.base.value()), self.size)
 
     def __bool__(self) -> Bool:
-        """True if arena memory was allocated."""
         return self.base != None
 
     def alloc[T: AnyType](mut self, count: Int = 1) -> Optional[UnsafePointer[T, MutAnyOrigin]]:
@@ -58,20 +53,13 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         return ptr
 
     def mark(self) -> Int:
-        """Current allocation offset in bytes."""
         return self.offset
 
     def reset_to(mut self, watermark: Int):
-        """Reset allocation offset.
-
-        Args:
-            watermark: Offset in bytes.
-        """
         if watermark >= 0 and watermark <= self.offset:
             self.offset = watermark
 
     def reset(mut self):
-        """Invalidate entire arena."""
         self.offset = 0
 
     def prefault(self, offset: Int = 0, length: Int = -1) -> Bool:
@@ -96,11 +84,9 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         return result == 0
 
     def remaining(self) -> Int:
-        """Remaining (bytes)."""
         return self.size - self.offset
 
     def used(self) -> Int:
-        """Allocated (bytes)."""
         return self.offset
 
     def verify_placement(self) -> Bool:

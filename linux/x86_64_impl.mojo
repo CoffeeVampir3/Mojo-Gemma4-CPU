@@ -4,10 +4,6 @@ from std.memory import UnsafePointer
 
 from .linux_sys import *
 
-# =============================================================================
-# x86_64-specific types
-# =============================================================================
-
 comptime SA_RESTORER: UInt64 = 0x04000000
 
 def rt_sigreturn_restorer():
@@ -31,15 +27,7 @@ struct KernelSigInfoX86_64(TrivialRegisterPassable):
     var pad0: Int32
     var si_addr: Int
 
-# =============================================================================
-# X86_64LinuxSys — conforms to LinuxSys.
-#
-# Provides: syscall numbers, raw syscall mechanism, and arch-specific ops.
-# Inherits: all shared syscall wrappers from LinuxSys defaults.
-# =============================================================================
-
 struct X86_64LinuxSys(LinuxSys):
-    # Syscall numbers.
     comptime NR_write = 1
     comptime NR_mmap = 9
     comptime NR_mprotect = 10
@@ -71,8 +59,6 @@ struct X86_64LinuxSys(LinuxSys):
     def __init__(out self):
         pass
 
-    # --- Raw syscall mechanism (x86_64 register ABI) ---
-
     def syscall[*Ts: Intable](self, nr: Int, *args: *Ts) -> Int:
         comptime count = args.__len__()
         comptime assert count <= 6, "syscall supports 0-6 arguments"
@@ -95,8 +81,6 @@ struct X86_64LinuxSys(LinuxSys):
             Int, Int, Int, Int, Int, Int, Int, Int,
             constraints="={rax},{rax},{rdi},{rsi},{rdx},{rcx},{r8},{r9},~{rcx},~{r10},~{r11},~{memory}",
         ](nr, a0, a1, a2, a3, a4, a5))
-
-    # --- Architecture-specific operations ---
 
     def arch_cpu_relax(self):
         inlined_assembly["pause", NoneType, constraints="~{memory}"]()

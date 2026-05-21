@@ -371,7 +371,6 @@ struct IoUringFeat(TrivialRegisterPassable):
 comptime FUTEX_BITSET_MATCH_ANY: Int = 0xFFFFFFFF
 
 trait ArchLinux:
-    # Syscall numbers (comptime, per-arch).
     comptime NR_write: Int
     comptime NR_mmap: Int
     comptime NR_mprotect: Int
@@ -400,10 +399,8 @@ trait ArchLinux:
     comptime NR_futex_wake: Int
     comptime NR_futex_wait: Int
 
-    # Raw syscall mechanism (arch-specific register ABI).
     def syscall[*Ts: Intable](self, nr: Int, *args: *Ts) -> Int: ...
 
-    # Architecture-specific operations — functional design differs per target.
     def arch_cpu_relax(self): ...
     def arch_thread_pointer(self) -> Int: ...
     def arch_tls_load_i64[offset: Int](self) -> Int: ...
@@ -425,8 +422,6 @@ trait ArchLinux:
 
 
 trait LinuxSys(ArchLinux):
-
-    # --- Memory management ---
 
     def sys_mmap[
         prot: Int = Prot.RW,
@@ -465,16 +460,12 @@ trait LinuxSys(ArchLinux):
     def sys_mprotect(self, addr: Int, length: Int, prot: Int) -> Int:
         return self.syscall(Self.NR_mprotect, addr, length, prot)
 
-    # --- I/O ---
-
     def sys_openat(self, dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> Int:
         var cstr = pathname.as_c_string_slice()
         return self.syscall(Self.NR_openat, dirfd, Int(cstr.unsafe_ptr()), flags, mode)
 
     def sys_close(self, fd: Int) -> Int:
         return self.syscall(Self.NR_close, fd)
-
-    # --- Signal handling ---
 
     def sys_sigaltstack(
         self,
@@ -484,15 +475,11 @@ trait LinuxSys(ArchLinux):
         return self.syscall(Self.NR_sigaltstack, Int(ss),
                             Int(old.value()) if old else 0)
 
-    # --- Futex ---
-
     def sys_futex_wait(self, addr: Int, expected: Int, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
         return self.syscall(Self.NR_futex_wait, addr, expected, FUTEX_BITSET_MATCH_ANY, flags, 0, 0)
 
     def sys_futex_wake(self, addr: Int, nr_wake: Int = 1, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
         return self.syscall(Self.NR_futex_wake, addr, FUTEX_BITSET_MATCH_ANY, nr_wake, flags)
-
-    # --- Process / thread ---
 
     def sys_exit(self, code: Int = 0):
         _ = self.syscall(Self.NR_exit, code)
@@ -522,8 +509,6 @@ trait LinuxSys(ArchLinux):
 
     def sys_sched_setaffinity(self, tid: Int, mask_size: Int, mask_ptr: Int) -> Int:
         return self.syscall(Self.NR_sched_setaffinity, tid, mask_size, mask_ptr)
-
-    # --- io_uring ---
 
     def sys_io_uring_setup(self, entries: UInt32, params: UnsafePointer[IoUringParams, _]) -> Int:
         return self.syscall(Self.NR_io_uring_setup, Int(entries), Int(params))

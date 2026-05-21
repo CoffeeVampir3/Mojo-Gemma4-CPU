@@ -233,11 +233,11 @@ def pre_tokenize_deepseek_v3(text: String) -> List[String]:
     # Stage 2: Isolate CJK/Japanese runs
     var stage2 = List[String]()
     for piece in stage1:
-        split_cjk_piece(String(piece), stage2)
+        split_cjk_piece(piece, stage2)
 
     # Stage 3: Main pattern split
     for piece in stage2:
-        split_main_piece(String(piece), ctx, result)
+        split_main_piece(piece, ctx, result)
 
     return result^
 

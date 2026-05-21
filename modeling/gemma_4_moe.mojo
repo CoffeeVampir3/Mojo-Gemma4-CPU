@@ -469,7 +469,7 @@ def build_gemma4_plan[
 
     for i in range(C.NUM_LAYERS):
         var entry = LAYER_SCHEDULE[i]
-        var prefix = "model.language_model.layers." + String(entry.idx) + "."
+        var prefix = String(t"model.language_model.layers.{entry.idx}.")
         if entry.kind == LayerKind.FULL:
             _ = emit_descs[FullLayerRefs[degree]](
                 prefix, fl_off + entry.local_idx * fl_stride, descs)
@@ -1074,9 +1074,10 @@ struct Gemma4[
     ) -> Optional[Self]:
         var shards = discover_shards(dir_path)
         if len(shards) == 0:
-            print("no safetensors shards found in", String(dir_path))
+            print(t"no safetensors shards found in {dir_path}")
             return None
-        print("found", len(shards), "shard(s)")
+        var n_shards = len(shards)
+        print(t"found {n_shards} shard(s)")
 
         var descs = List[WeightDesc]()
         var layout = build_gemma4_plan[
@@ -1084,16 +1085,21 @@ struct Gemma4[
         ](descs)
 
         var size = layout.arena.host_arena_bytes()
-        print("allocating", size // (1024 * 1024), "MB x " + String(Self.degree) + " rank(s) (" +
-              String(layout.arena.distributed_bytes // (1024 * 1024)) + " MB weights + " +
-              String(layout.arena.state_bytes // (1024 * 1024)) + " MB state each)")
+        var size_mb = size // (1024 * 1024)
+        var weights_mb = layout.arena.distributed_bytes // (1024 * 1024)
+        var state_mb = layout.arena.state_bytes // (1024 * 1024)
+        print(
+            t"allocating {size_mb} MB x {Self.degree} rank(s) "
+            t"({weights_mb} MB weights + {state_mb} MB state each)"
+        )
 
         var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.degree)
         var arena_bases = List[Int]()
         for rank in range(Self.degree):
             arenas.push(NumaArena[alignment=DEFAULT_ALIGNMENT](topo.node(rank), size))
             if not arenas[rank]:
-                print("arena allocation failed on node", topo.node(rank))
+                var node = topo.node(rank)
+                print(t"arena allocation failed on node {node}")
                 return None
             arena_bases.append(Int(arenas[rank].base.value()))
 
@@ -1102,7 +1108,8 @@ struct Gemma4[
             print("weight loading failed")
             return None
         var loaded = load_result.take()
-        print("loaded", loaded.bytes_loaded // (1024 * 1024), "MB in", loaded.num_ops, "ops")
+        var loaded_mb = loaded.bytes_loaded // (1024 * 1024)
+        print(t"loaded {loaded_mb} MB in {loaded.num_ops} ops")
 
         for rank in range(Self.degree):
             _ = arenas[rank].prefault(layout.arena.distributed_bytes, layout.arena.state_bytes)

@@ -168,7 +168,7 @@ def section_phase1[
 
     var ks = compute_stats(samples.kernel_ns, samples.n)
     var ws = compute_stats(samples.wall_ns, samples.n)
-    print_row("phase1 seq=" + String(seq_len), ks, ws, 0)
+    print_row(String(t"phase1 seq={seq_len}"), ks, ws, 0)
 
 
 def section_phase2[
@@ -207,7 +207,7 @@ def section_phase2[
 
     var ks = compute_stats(samples.kernel_ns, samples.n)
     var ws = compute_stats(samples.wall_ns, samples.n)
-    print_row("phase2 seq=" + String(seq_len), ks, ws, 0)
+    print_row(String(t"phase2 seq={seq_len}"), ks, ws, 0)
 
 
 def section_combined[
@@ -261,7 +261,7 @@ def section_combined[
 
     var ks = compute_stats(samples.kernel_ns, samples.n)
     var ws = compute_stats(samples.wall_ns, samples.n)
-    print_row("p1+p2 seq=" + String(seq_len), ks, ws, 0)
+    print_row(String(t"p1+p2 seq={seq_len}"), ks, ws, 0)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -314,10 +314,10 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 
-    print("hidden=" + String(HIDDEN)
-        + " intermediate=" + String(INTERMEDIATE)
-        + " experts/rank=" + String(experts_per_rank)
-        + " top_k=" + String(TOP_K))
+    print(
+        t"hidden={HIDDEN} intermediate={INTERMEDIATE} "
+        t"experts/rank={experts_per_rank} top_k={TOP_K}"
+    )
 
     var samples = SampleBuffer(SAMPLES)
 
@@ -363,8 +363,8 @@ def main():
     var tp = len(topo)
 
     print("MoE kernel benchmark")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
     var bytes = arena_bytes_for(tp)

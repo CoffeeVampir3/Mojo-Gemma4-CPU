@@ -73,11 +73,9 @@ def fill_rank_bf16[tp: Int](ptrs: InlineArray[BF16Ptr, tp], n: Int):
             ptrs[r][i] = BFloat16(Float32(r * 10 + i % 32))
 
 
-def check_bf16(ptr: BF16Ptr, idx: Int, expected: Float32, msg: String):
+def check_bf16(ptr: BF16Ptr, idx: Int, expected: Float32, msg: StringSlice):
     var got = Float32(ptr[idx])
-    check(got == expected,
-        msg + " [" + String(idx) + "] expected=" + String(expected)
-        + " got=" + String(got))
+    check(got == expected, String(t"{msg} [{idx}] expected={expected} got={got}"))
 
 
 # ---- Exact correctness tests (logic bugs) ----
@@ -103,16 +101,16 @@ def test_allreduce_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
         for r in range(tp):
             expected += Float32(r * 10 + i % 32)
         for r in range(tp):
-            check_bf16(out[r], i, expected, label + " r" + String(r))
+            check_bf16(out[r], i, expected, String(t"{label} r{r}"))
     for r in range(tp):
         raw[r].free()
         out[r].free()
 
 
-def run_exact_suite[tp: Int](n: Int, tag: String):
-    var d = "tp=" + String(tp) + " n=" + String(n) + " " + tag
-    test_allreduce_exact[tp](n, "allreduce inline " + d, 16384)
-    test_allreduce_exact[tp](n, "allreduce parallel " + d, 0)
+def run_exact_suite[tp: Int](n: Int, tag: StringSlice):
+    var d = String(t"tp={tp} n={n} {tag}")
+    test_allreduce_exact[tp](n, String(t"allreduce inline {d}"), 16384)
+    test_allreduce_exact[tp](n, String(t"allreduce parallel {d}"), 0)
 
 
 # ---- Accuracy tests (numerical error measurement) ----
@@ -160,14 +158,12 @@ def accuracy_allreduce[tp: Int](
 
     var mean_ulp = sum_ulp / Float64(total) if total > 0 else Float64(0)
     var accepted = max_ulp <= hypothesis_ulp
-    var status = "ACCEPT" if accepted else "REJECT"
     print(label)
-    print("  hypothesis: max error <= " + String(hypothesis_ulp) + " ULP")
-    print("  measured:   max_ulp=" + String(max_ulp) + "  mean_ulp="
-        + String(mean_ulp) + "  max_abs=" + String(max_abs))
-    print("  " + status)
+    print(t"  hypothesis: max error <= {hypothesis_ulp} ULP")
+    print(t"  measured:   max_ulp={max_ulp}  mean_ulp={mean_ulp}  max_abs={max_abs}")
+    print("  ", "ACCEPT" if accepted else "REJECT")
     if not accepted:
-        abort("hypothesis rejected: " + label)
+        abort(String(t"hypothesis rejected: {label}"))
 
     for r in range(tp):
         raw[r].free()
@@ -206,13 +202,13 @@ def accuracy_crosspath[tp: Int](n: Int, label: String):
             if Float32(out_inline[r][i]) != Float32(out_parallel[r][i]):
                 mismatches += 1
 
+    var total_compare = n * tp
     print(label)
     print("  hypothesis: inline == parallel (bitwise)")
-    print("  measured:   mismatches=" + String(mismatches) + " / "
-        + String(n * tp))
-    print("  " + ("ACCEPT" if mismatches == 0 else "REJECT"))
+    print(t"  measured:   mismatches={mismatches} / {total_compare}")
+    print("  ", "ACCEPT" if mismatches == 0 else "REJECT")
     if mismatches > 0:
-        abort("crosspath mismatch: " + label)
+        abort(String(t"crosspath mismatch: {label}"))
 
     for r in range(tp):
         raw[r].free()
@@ -220,11 +216,11 @@ def accuracy_crosspath[tp: Int](n: Int, label: String):
         out_parallel[r].free()
 
 
-def run_accuracy_suite[tp: Int](n: Int, tag: String):
-    var d = "tp=" + String(tp) + " n=" + String(n) + " " + tag
-    accuracy_allreduce[tp](n, "allreduce bf16 inline " + d, 1.0, 16384)
-    accuracy_allreduce[tp](n, "allreduce bf16 parallel " + d, 1.0, 0)
-    accuracy_crosspath[tp](n, "allreduce crosspath " + d)
+def run_accuracy_suite[tp: Int](n: Int, tag: StringSlice):
+    var d = String(t"tp={tp} n={n} {tag}")
+    accuracy_allreduce[tp](n, String(t"allreduce bf16 inline {d}"), 1.0, 16384)
+    accuracy_allreduce[tp](n, String(t"allreduce bf16 parallel {d}"), 1.0, 0)
+    accuracy_crosspath[tp](n, String(t"allreduce crosspath {d}"))
 
 
 def main():

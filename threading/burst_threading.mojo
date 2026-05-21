@@ -15,10 +15,6 @@ from .threading_shared import (
 )
 
 
-# ============================================================================
-# Per-worker mailbox — lives on the worker's NUMA node
-# ============================================================================
-
 @align(64)
 struct WorkerMailbox:
     """Dispatch slot on the worker's NUMA node.
@@ -39,10 +35,6 @@ struct WorkerMailbox:
         self.data = InlineArray[Int, MAILBOX_DATA_SLOTS](fill=0)
 
 
-# ============================================================================
-# Shared state — lives on worker's NUMA node
-# ============================================================================
-
 @align(64)
 struct SharedState:
     var shutdown: AtomicInt32
@@ -50,10 +42,6 @@ struct SharedState:
     def __init__(out self):
         self.shutdown = AtomicInt32(0)
 
-
-# ============================================================================
-# Worker ID from TLS
-# ============================================================================
 
 @always_inline
 def current_worker_id() -> Int:
@@ -64,10 +52,6 @@ def current_worker_id() -> Int:
         return -1
     return sys.arch_tls_load_i64[offset=SlotLayout.WORKER_ID_FROM_FS]()
 
-
-# ============================================================================
-# SIGSEGV handler
-# ============================================================================
 
 def burst_sigsegv_handler(signo: Int32, info: Int, ucontext: Int):
     var sys = linux.linux_sys()
@@ -102,10 +86,6 @@ def install_burst_sigsegv_handler():
     _ = sys.sys_rt_sigaction(linux.Signal.SEGV, UnsafePointer(to=act))
 
 
-# ============================================================================
-# Worker slot — tracks one worker's memory region
-# ============================================================================
-
 struct WorkerSlot(Movable, ImplicitlyDestructible):
     var base: UnsafePointer[UInt8, MutAnyOrigin]
     var child_tid: UnsafePointer[Int32, MutAnyOrigin]
@@ -123,10 +103,6 @@ struct WorkerSlot(Movable, ImplicitlyDestructible):
         return self.child_tid[] != 0
 
 
-# ============================================================================
-# Worker stack head — passed to worker via stack pointer
-# ============================================================================
-
 @fieldwise_init
 struct WorkerStackHead[mask_size: Int]:
     var entry: Int
@@ -142,10 +118,6 @@ struct WorkerStackHead[mask_size: Int]:
     var pinned: Int
     var cpu_mask: CpuMask[Self.mask_size]
 
-
-# ============================================================================
-# BurstPool
-# ============================================================================
 
 comptime SPIN_LIMIT = 100_000
 
@@ -178,10 +150,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     var futex_flags: Int
     var pinned: Bool
 
-    # ----------------------------------------------------------------
-    # Construction
-    # ----------------------------------------------------------------
-
     def __init__(out self, capacity: Int,
                  var cpu_mask: CpuMask[Self.mask_size] = CpuMask[Self.mask_size](),
                  numa_node: Optional[Int] = None,
@@ -208,7 +176,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
 
         var sys = linux.linux_sys()
 
-        # --- Worker arena: stacks + shared + mailboxes (on worker's NUMA node) ---
         var mailbox_bytes = capacity * size_of[WorkerMailbox]()
         self.worker_arena_size = (self.slot_size * capacity
             + size_of[SharedState]() + mailbox_bytes)
@@ -238,7 +205,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         for i in range(capacity):
             (self.mailboxes + i)[] = WorkerMailbox()
 
-        # Guard pages per slot
         for i in range(capacity):
             var slot_base = self.worker_arena + i * self.slot_size
             if sys.sys_mprotect(slot_base + SlotLayout.HEADER,
@@ -257,7 +223,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
             slot.child_tid[] = 0
             self.slots.push(slot^)
 
-        # --- Join arena: join flags (on main thread's NUMA node) ---
         self.join_arena_size = capacity * size_of[JoinFlag]()
         self.join_arena = sys.sys_mmap[
             prot=linux.Prot.RW,
@@ -276,16 +241,8 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
 
         self.spawn_workers()
 
-    # ----------------------------------------------------------------
-    # Bool
-    # ----------------------------------------------------------------
-
     def __bool__(self) -> Bool:
         return self.worker_arena != 0 and self.join_arena != 0
-
-    # ----------------------------------------------------------------
-    # Dispatch — two-pass write + Dekker wake check
-    # ----------------------------------------------------------------
 
     def dispatch[K: BurstKernel, origin: MutOrigin](
         mut self, kernels: Span[K, origin], num_jobs: Int = -1):
@@ -334,10 +291,9 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
             AtomicInt32.store[ordering=Ordering.RELEASE](
                 UnsafePointer(to=(self.mailboxes + i)[].job_ready.value), 1)
 
-        # This is forced, we need to ensure that memory ordering is published here to avoid
-        # an edge-case race between our dekker handshake, as it's possible both sides can
-        # be in a state where the other side wasn't observed yet, and thus not wake and
-        # simultaneously sleep, ending in a deadlock.
+        # Sequential fence closes the Dekker store-load race: job_ready must be
+        # published before the dispatcher observes sleeping, or the worker can
+        # miss the job and park without a wake.
         fence[ordering=Ordering.SEQUENTIAL]()
 
         # Pass 3: Dekker wake — check sleeping, futex_wake if needed
@@ -352,10 +308,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
                 _ = sys.sys_futex_wake(
                     Int(UnsafePointer(to=(self.mailboxes + i)[].job_ready.value)),
                     1, self.futex_flags)
-
-    # ----------------------------------------------------------------
-    # Join — poll local JoinFlags
-    # ----------------------------------------------------------------
 
     def join(mut self):
         """Wait for all dispatched jobs. Polls JoinFlags on main's NUMA node."""
@@ -386,10 +338,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     def sleep(mut self):
         pass
 
-    # ----------------------------------------------------------------
-    # Shutdown
-    # ----------------------------------------------------------------
-
     def __del__(deinit self):
         if self.worker_arena == 0:
             return
@@ -411,10 +359,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
             _ = sys.sys_munmap(self.worker_arena, self.worker_arena_size)
         if self.join_arena != 0:
             _ = sys.sys_munmap(self.join_arena, self.join_arena_size)
-
-    # ----------------------------------------------------------------
-    # Spawn workers
-    # ----------------------------------------------------------------
 
     def spawn_workers(mut self):
         var sys = linux.linux_sys()
@@ -486,22 +430,16 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         return Self(cap, mask, node, stack_size)
 
 
-# ============================================================================
-# Worker entry point
-# ============================================================================
-
 def worker_main[mask_size: Int](stack_head_ptr: Int):
     var head = ptr[WorkerStackHead[mask_size]](stack_head_ptr)
     var sys = linux.linux_sys()
 
-    # Signal stack for SIGSEGV handler
     var ss = linux.StackT()
     ss.ss_sp = head[].altstack_base
     ss.ss_size = UInt64(head[].altstack_size)
     ss.ss_flags = 0
     _ = sys.sys_sigaltstack(UnsafePointer(to=ss))
 
-    # TLS setup
     var slot_base = head[].slot_base
     var tcb_addr = slot_base + SlotLayout.TCB
     comptime TLS_TCB_SIZE = SlotLayout.TLS_SIZE + SlotLayout.TCB_SIZE
@@ -514,7 +452,6 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
     ptr[Int](slot_base + SlotLayout.WORKER_ID)[] = head[].worker_id
     ptr[Int](slot_base + SlotLayout.WORKER_MAGIC)[] = SlotLayout.WORKER_MAGIC_VALUE
 
-    # Pin to assigned cores
     if head[].pinned != 0:
         _ = sys.sys_sched_setaffinity(
             0, CpuMask[mask_size].byte_size(), head[].cpu_mask.unsafe_address())
@@ -527,7 +464,7 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
     var sleeping_ptr = UnsafePointer(to=mailbox[].sleeping.value)
     var done_ptr = UnsafePointer(to=join_flag[].done.value)
 
-    # --- Main loop: spin on local mailbox, backoff to futex_wait ---
+    # Main loop: spin on local mailbox, back off to futex_wait.
     # Shutdown checked before job_ready: destructor sets both flags to wake
     # sleeping workers, and stale job_ready must not trigger execution of
     # a freed dispatch.

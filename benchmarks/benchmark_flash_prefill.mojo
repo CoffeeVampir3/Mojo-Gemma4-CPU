@@ -99,8 +99,7 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
     output: Binding[BFloat16, tp],
     worker_scratch: Binding[Float32, tp],
 ):
-    print("\n=== Sliding-window prefill sweep "
-        + "(chunk_size=" + String(SLIDING_CHUNK_SIZE) + ") ===")
+    print(t"\n=== Sliding-window prefill sweep (chunk_size={SLIDING_CHUNK_SIZE}) ===")
 
     var sizes = InlineArray[Int, NUM_SLIDING_SIZES](fill=0)
     sizes[0] = 64; sizes[1] = 256; sizes[2] = 1024
@@ -158,7 +157,7 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
         var ws = compute_stats(samples.wall_ns, samples.n)
         var per_q_kv = seq_len if seq_len < SLIDING_WINDOW else SLIDING_WINDOW
         var kv_bytes = seq_len * per_q_kv * SLIDING_KV_STRIDE * 2
-        print_row("seq=" + String(seq_len), ks, ws, kv_bytes)
+        print_row(String(t"seq={seq_len}"), ks, ws, kv_bytes)
 
 
 def section_full_sweep[P: BurstThreadPool, //, tp: Int](
@@ -169,8 +168,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
     output: Binding[BFloat16, tp],
     partials_scratch: Binding[Float32, tp],
 ):
-    print("\n=== Full-attention prefill sweep "
-        + "(chunk_size=" + String(FULL_CHUNK_SIZE) + ") ===")
+    print(t"\n=== Full-attention prefill sweep (chunk_size={FULL_CHUNK_SIZE}) ===")
     comptime LOCAL_NUM_Q = FULL_NUM_Q // tp
 
     var sizes = InlineArray[Int, NUM_FULL_SIZES](fill=0)
@@ -230,7 +228,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
         # Average local KV scan per Q ≈ seq_len / (2 * tp); total scans = seq_len.
         var per_rank_kv = (seq_len * (seq_len + 1) // 2) // tp
         var kv_bytes = per_rank_kv * FULL_KV_STRIDE * 2
-        print_row("seq=" + String(seq_len), ks, ws, kv_bytes)
+        print_row(String(t"seq={seq_len}"), ks, ws, kv_bytes)
 
 
 def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
@@ -253,18 +251,18 @@ def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
     ](q, k_cache, v_cache, output, worker_scratch, 0, SL, pools)
 
     var out0 = output[0]
-    print("  output[0..3]: "
-        + String(out0[0].cast[DType.float32]()) + " "
-        + String(out0[1].cast[DType.float32]()) + " "
-        + String(out0[2].cast[DType.float32]()) + " "
-        + String(out0[3].cast[DType.float32]()))
+    var o0 = out0[0].cast[DType.float32]()
+    var o1 = out0[1].cast[DType.float32]()
+    var o2 = out0[2].cast[DType.float32]()
+    var o3 = out0[3].cast[DType.float32]()
+    print(t"  output[0..3]: {o0} {o1} {o2} {o3}")
     var ok = True
     for i in range(SL * SLIDING_NUM_Q * SLIDING_HEAD_DIM):
         var v = out0[i].cast[DType.float32]()
         if v != v:
             ok = False
             break
-    print("  " + ("OK (no NaN)" if ok else "FAIL: NaN detected"))
+    print("  ", "OK (no NaN)" if ok else "FAIL: NaN detected")
 
 
 def section_validation_full[P: BurstThreadPool, //, tp: Int](
@@ -290,11 +288,11 @@ def section_validation_full[P: BurstThreadPool, //, tp: Int](
     ](q, k_cache, v_cache, output, partials_scratch, 0, SL, pools)
 
     var out0 = output[0]
-    print("  output[0..3]: "
-        + String(out0[0].cast[DType.float32]()) + " "
-        + String(out0[1].cast[DType.float32]()) + " "
-        + String(out0[2].cast[DType.float32]()) + " "
-        + String(out0[3].cast[DType.float32]()))
+    var o0 = out0[0].cast[DType.float32]()
+    var o1 = out0[1].cast[DType.float32]()
+    var o2 = out0[2].cast[DType.float32]()
+    var o3 = out0[3].cast[DType.float32]()
+    print(t"  output[0..3]: {o0} {o1} {o2} {o3}")
 
     var first_nan = -1
     for i in range(SL * OUT_STRIDE):
@@ -311,27 +309,25 @@ def section_validation_full[P: BurstThreadPool, //, tp: Int](
     var nan_in_tok = first_nan % OUT_STRIDE
     var nan_local_h = nan_in_tok // FULL_HEAD_DIM
     var nan_lane = nan_in_tok % FULL_HEAD_DIM
-    print("  FAIL: first NaN at flat=" + String(first_nan)
-        + " token=" + String(nan_tok)
-        + " local_h=" + String(nan_local_h)
-        + " lane=" + String(nan_lane))
+    print(
+        t"  FAIL: first NaN at flat={first_nan} token={nan_tok} "
+        t"local_h={nan_local_h} lane={nan_lane}"
+    )
 
     var nan_global_h = nan_local_h
-    print("  global_h = q_rank(0) * local(" + String(LOCAL_NUM_Q)
-        + ") + " + String(nan_local_h) + " = " + String(nan_global_h))
+    print(
+        t"  global_h = q_rank(0) * local({LOCAL_NUM_Q}) + "
+        t"{nan_local_h} = {nan_global_h}"
+    )
 
-    print("  per-rank partial m/l at (t=" + String(nan_tok)
-        + ", global_h=" + String(nan_global_h) + "):")
+    print(t"  per-rank partial m/l at (t={nan_tok}, global_h={nan_global_h}):")
     for r in range(tp):
         var pr = partials_scratch[r]
         var slot = pr + nan_tok * FULL_PSTRIDE
         var m_val = (slot + M_OFF + nan_global_h)[]
         var l_val = (slot + L_OFF + nan_global_h)[]
         var acc0 = (slot + nan_global_h * FULL_HEAD_DIM)[]
-        print("    rank=" + String(r)
-            + " m=" + String(m_val)
-            + " l=" + String(l_val)
-            + " acc[0]=" + String(acc0))
+        print(t"    rank={r} m={m_val} l={l_val} acc[0]={acc0}")
 
 
 def run_sliding[P: BurstThreadPool, //, tp: Int](
@@ -365,11 +361,10 @@ def run_sliding[P: BurstThreadPool, //, tp: Int](
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 
-    print("sliding: head_dim=" + String(SLIDING_HEAD_DIM)
-        + " num_q=" + String(SLIDING_NUM_Q)
-        + " num_kv=" + String(SLIDING_NUM_KV)
-        + " gqa=" + String(SLIDING_GQA)
-        + " window=" + String(SLIDING_WINDOW))
+    print(
+        t"sliding: head_dim={SLIDING_HEAD_DIM} num_q={SLIDING_NUM_Q} "
+        t"num_kv={SLIDING_NUM_KV} gqa={SLIDING_GQA} window={SLIDING_WINDOW}"
+    )
 
     section_validation_sliding[tp=tp](
         pools, q, k_cache, v_cache, output, worker_scratch)
@@ -409,12 +404,11 @@ def run_full[P: BurstThreadPool, //, tp: Int](
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 
-    print("full: head_dim=" + String(FULL_HEAD_DIM)
-        + " num_q=" + String(FULL_NUM_Q)
-        + " local_num_q=" + String(LOCAL_NUM_Q)
-        + " num_kv=" + String(FULL_NUM_KV)
-        + " gqa=" + String(FULL_GQA)
-        + " max_seq=" + String(FULL_MAX_SEQ))
+    print(
+        t"full: head_dim={FULL_HEAD_DIM} num_q={FULL_NUM_Q} "
+        t"local_num_q={LOCAL_NUM_Q} num_kv={FULL_NUM_KV} "
+        t"gqa={FULL_GQA} max_seq={FULL_MAX_SEQ}"
+    )
 
     section_validation_full[tp=tp](
         pools, q, k_cache, v_cache, output, partials_scratch)
@@ -428,7 +422,7 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     mut arenas_full: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
 ):
     var cap = pools[0].get_capacity()
-    print("pool capacity: " + String(cap) + " workers")
+    print(t"pool capacity: {cap} workers")
     run_sliding[tp=tp](pools, arenas_sliding)
     run_full[tp=tp](pools, arenas_full)
 
@@ -438,8 +432,8 @@ def main():
     var tp = len(topo)
 
     print("Flash-attention prefill benchmark")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 512 * 1024 * 1024
     var arenas_sliding = HeapMoveArray[

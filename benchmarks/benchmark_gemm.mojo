@@ -91,8 +91,7 @@ def measure_gemm_m[
     var ks = compute_stats(samples.kernel_ns, samples.n)
     var wsx = compute_stats(samples.wall_ns, samples.n)
     var bytes_payload = (m * cols + rows * cols) * 2
-    print_row("M=" + String(m) + " MR=" + String(MR),
-              ks, wsx, bytes_payload)
+    print_row(String(t"M={m} MR={MR}"), ks, wsx, bytes_payload)
 
 
 def section_m_sweep[
@@ -102,9 +101,7 @@ def section_m_sweep[
     x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
     bases: ArenaBases[tp], label: String,
 ):
-    print("\n=== GEMM M-sweep, " + label
-        + " (rows=" + String(rows) + " cols=" + String(cols)
-        + " tp=" + String(tp) + ") ===")
+    print(t"\n=== GEMM M-sweep, {label} (rows={rows} cols={cols} tp={tp}) ===")
     var xs = Binding[BFloat16, tp](x, bases)
     var ws = Binding[BFloat16, tp](weight, bases)
     var outs = Binding[BFloat16, tp](output, bases)
@@ -127,9 +124,9 @@ def section_mr_sweep[
     x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
     bases: ArenaBases[tp], label: String,
 ):
-    print("\n=== GEMM MR-sweep at M=64, " + label
-        + " (rows=" + String(rows) + " cols=" + String(cols)
-        + " tp=" + String(tp) + ") ===")
+    print(
+        t"\n=== GEMM MR-sweep at M=64, {label} (rows={rows} cols={cols} tp={tp}) ==="
+    )
     var xs = Binding[BFloat16, tp](x, bases)
     var ws = Binding[BFloat16, tp](weight, bases)
     var outs = Binding[BFloat16, tp](output, bases)
@@ -170,7 +167,7 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
-    print("pool capacity: " + String(cap) + " workers")
+    print(t"pool capacity: {cap} workers")
 
     section_m_sweep[rows=gate_up_rows, cols=gate_up_cols, tp=tp](
         pools, x, w, o, bases, "FFN gate/up shape")
@@ -186,8 +183,8 @@ def main():
     var tp = len(topo)
 
     print("GEMM kernel benchmark")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 1024 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)

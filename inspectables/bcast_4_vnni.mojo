@@ -22,8 +22,6 @@ def vpdpbusd[width: Int](
     ](acc, a, b)
 
 
-# === Variant A: original hand-unrolled join chain ===
-
 @always_inline
 def bcast_join_chain[width: Int](
     b4: SIMD[DType.uint8, 4],
@@ -39,8 +37,6 @@ def bcast_join_chain[width: Int](
     return b64.slice[width * 4]()
 
 
-# === Variant C: comptime for + insert into a fixed-width register ===
-
 @always_inline
 def bcast_insert[width: Int](
     b4: SIMD[DType.uint8, 4],
@@ -50,8 +46,6 @@ def bcast_insert[width: Int](
         out = out.insert[offset = lane * 4](b4)
     return out
 
-
-# === Loaders that pull 4 bytes from memory then call each variant ===
 
 @no_inline
 def use_join_chain(

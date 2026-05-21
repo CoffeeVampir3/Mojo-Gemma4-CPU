@@ -88,7 +88,7 @@ def fill_ones_all[tp: Int](
 
 
 def section_row_primitives(src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr):
-    print("\n=== Row primitives (single token, HIDDEN=" + String(HIDDEN) + ") ===")
+    print(t"\n=== Row primitives (single token, HIDDEN={HIDDEN}) ===")
 
     var samples = SampleBuffer(SAMPLES)
 
@@ -246,7 +246,7 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
         keep(dst[0])
         var ks_in = compute_stats(samples.kernel_ns, samples.n)
         var ws_in = compute_stats(samples.wall_ns, samples.n)
-        print_row("seq=" + String(seq) + " inline", ks_in, ws_in, seq * HIDDEN * 2)
+        print_row(String(t"seq={seq} inline"), ks_in, ws_in, seq * HIDDEN * 2)
 
         for _ in range(WARMUP):
             dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
@@ -268,7 +268,7 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
         keep(dst[0])
         var ks_d = compute_stats(samples.kernel_ns, samples.n)
         var ws_d = compute_stats(samples.wall_ns, samples.n)
-        print_row("seq=" + String(seq) + " dispatch", ks_d, ws_d, seq * HIDDEN * 2)
+        print_row(String(t"seq={seq} dispatch"), ks_d, ws_d, seq * HIDDEN * 2)
 
 
 def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
@@ -312,7 +312,7 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
         keep(res_dst[0])
         var ks_in = compute_stats(samples.kernel_ns, samples.n)
         var ws_in = compute_stats(samples.wall_ns, samples.n)
-        print_row("seq=" + String(seq) + " inline", ks_in, ws_in, seq * HIDDEN * 4)
+        print_row(String(t"seq={seq} inline"), ks_in, ws_in, seq * HIDDEN * 4)
 
         for _ in range(WARMUP):
             fused_norm_residual_add[
@@ -340,7 +340,7 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
         keep(res_dst[0])
         var ks_d = compute_stats(samples.kernel_ns, samples.n)
         var ws_d = compute_stats(samples.wall_ns, samples.n)
-        print_row("seq=" + String(seq) + " dispatch", ks_d, ws_d, seq * HIDDEN * 4)
+        print_row(String(t"seq={seq} dispatch"), ks_d, ws_d, seq * HIDDEN * 4)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -367,9 +367,10 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
-    print("pool capacity: " + String(cap) + " workers")
-    print("hidden: " + String(HIDDEN) + " (" + String(HIDDEN * 2) + " bytes bf16)")
-    print("sqrt(N): " + String(SQRT_N) + ", N*eps: " + String(N_EPS))
+    print(t"pool capacity: {cap} workers")
+    var hidden_bytes = HIDDEN * 2
+    print(t"hidden: {HIDDEN} ({hidden_bytes} bytes bf16)")
+    print(t"sqrt(N): {SQRT_N}, N*eps: {N_EPS}")
 
     section_row_primitives(src, dst, weight)
     section_fused_primitives(partial, residual, res_dst, weight)
@@ -383,8 +384,8 @@ def main():
     var tp = len(topo)
 
     print("RMSNorm kernel benchmark")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)

@@ -34,7 +34,6 @@ struct Gemma4BaseConfig:
 
 
 struct LayerKind:
-    """Tag for a layer's attention flavor in `LAYER_SCHEDULE`."""
     comptime FULL = 0
     comptime SLIDING = 1
 

@@ -82,44 +82,53 @@ def compute_stats(p: UnsafePointer[Int64, MutAnyOrigin], n: Int) -> Stats:
     )
 
 
-def pick_unit(p50: Int64) -> Tuple[Int64, String]:
+def pick_unit(p50: Int64) -> Tuple[Int64, StaticString]:
     if p50 < 1_000:
-        return (Int64(1), String("ns"))
+        return (Int64(1), StaticString("ns"))
     if p50 < 1_000_000:
-        return (Int64(1_000), String("us"))
-    return (Int64(1_000_000), String("ms"))
+        return (Int64(1_000), StaticString("us"))
+    return (Int64(1_000_000), StaticString("ms"))
 
 
 def fmt_scaled(ns: Int64, divisor: Int64) -> String:
     var whole = ns // divisor
     var frac = (ns * 10 // divisor) % 10
-    return String(whole) + "." + String(frac)
+    return String(t"{whole}.{frac}")
 
 
-def fmt_stats_line(label: String, s: Stats, divisor: Int64, unit: String) -> String:
-    return ("    " + label + " (" + unit + "):  "
-        + "min=" + fmt_scaled(s.min, divisor)
-        + " p50=" + fmt_scaled(s.p50, divisor)
-        + " p90=" + fmt_scaled(s.p90, divisor)
-        + " p99=" + fmt_scaled(s.p99, divisor)
-        + " mean=" + fmt_scaled(s.mean, divisor)
-        + " σ=" + fmt_scaled(s.stddev, divisor))
+def fmt_stats_line(
+    label: StringSlice, s: Stats, divisor: Int64, unit: StringSlice
+) -> String:
+    var f_min = fmt_scaled(s.min, divisor)
+    var f_p50 = fmt_scaled(s.p50, divisor)
+    var f_p90 = fmt_scaled(s.p90, divisor)
+    var f_p99 = fmt_scaled(s.p99, divisor)
+    var f_mean = fmt_scaled(s.mean, divisor)
+    var f_std = fmt_scaled(s.stddev, divisor)
+    return String(
+        t"    {label} ({unit}):  "
+        t"min={f_min} p50={f_p50} p90={f_p90} "
+        t"p99={f_p99} mean={f_mean} σ={f_std}"
+    )
 
 
 def print_row(
-    row_label: String, kernel: Stats, wall: Stats, payload_bytes: Int = 0,
+    row_label: StringSlice, kernel: Stats, wall: Stats, payload_bytes: Int = 0,
 ):
     var unit = pick_unit(kernel.p50)
     var div = unit[0]
     var u = unit[1]
-    var bw_suffix = String("")
+    print(row_label)
+    var kernel_line = fmt_stats_line("kernel", kernel, div, u)
+    print(t"{kernel_line}  (n={kernel.n})")
+    var wall_line = fmt_stats_line("wall  ", wall, div, u)
     if payload_bytes > 0 and wall.p50 > 0:
         var bw_100 = Int64(payload_bytes) * 100 // wall.p50
-        bw_suffix = "  | " + String(bw_100 // 100) + "." \
-                  + String(bw_100 % 100) + " GB/s"
-    print(row_label)
-    print(fmt_stats_line("kernel", kernel, div, u) + "  (n=" + String(kernel.n) + ")")
-    print(fmt_stats_line("wall  ", wall,   div, u) + bw_suffix)
+        var whole = bw_100 // 100
+        var frac = bw_100 % 100
+        print(t"{wall_line}  | {whole}.{frac} GB/s")
+    else:
+        print(wall_line)
 
 
 def max_last_ts[P: BurstThreadPool, //, tp: Int](

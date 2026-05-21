@@ -2,8 +2,6 @@ from std.collections import Dict
 from std.memory import Span, UnsafePointer
 from std.bit import count_trailing_zeros
 
-# --- JSON byte constants ---
-
 comptime QUOTE = Byte(34)
 comptime BACKSLASH = Byte(92)
 comptime CHAR_SLASH = Byte(47)
@@ -26,8 +24,6 @@ comptime CHAR_t = Byte(116)
 comptime CHAR_u = Byte(117)
 comptime CHAR_E = Byte(69)
 comptime CHAR_e = Byte(101)
-
-# --- Lookup tables ---
 
 def make_escape_table() -> InlineArray[Byte, 256]:
     var table = InlineArray[Byte, 256](fill=0)
@@ -70,14 +66,10 @@ def make_char_class_table() -> InlineArray[Byte, 256]:
 
 comptime CHAR_CLASS = make_char_class_table()
 
-# --- Error type ---
-
 @fieldwise_init
 struct ParseError(Copyable, Writable):
     var message: String
     var pos: Int
-
-# --- Scalar classification helpers ---
 
 @always_inline
 def is_whitespace(b: Byte) -> Bool:
@@ -90,8 +82,6 @@ def is_digit(b: Byte) -> Bool:
 @always_inline
 def is_number_start(b: Byte) -> Bool:
     return (materialize[CHAR_CLASS]()[Int(b)] & CHAR_NUMBER_START) != 0
-
-# --- SIMD classification helpers ---
 
 @always_inline
 def simd_whitespace[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
@@ -125,8 +115,6 @@ def append_block_prefix[w: Int](
         if i < count:
             out.append(block[i])
 
-# --- Scalar string helpers ---
-
 @always_inline
 def hex_value(b: Byte) -> Int:
     return Int(materialize[HEX_TABLE]()[Int(b)])
@@ -157,8 +145,6 @@ def match_literal_at[lit: StringLiteral](
         if ptr[pos + i] != bytes[i]:
             return False
     return True
-
-# --- Generic JSON parser ---
 
 struct Parser[origin: Origin, simd_width: Int = 16, max_depth: Int = 256]:
     var data: Span[Byte, Self.origin]
@@ -408,7 +394,6 @@ struct Parser[origin: Origin, simd_width: Int = 16, max_depth: Int = 256]:
         raise ParseError("expected 'true' or 'false'", self.pos)
 
     def parse_string_array(mut self) raises ParseError -> List[String]:
-        """Parse a JSON array of strings."""
         if not self.consume(LBRACKET):
             raise ParseError("expected '['", self.pos)
         self.skip_whitespace()
@@ -422,7 +407,6 @@ struct Parser[origin: Origin, simd_width: Int = 16, max_depth: Int = 256]:
         return result^
 
     def parse_uint_array(mut self) raises ParseError -> List[Int]:
-        """Parse a JSON array of unsigned integers."""
         if not self.consume(LBRACKET):
             raise ParseError("expected '['", self.pos)
         self.skip_whitespace()
@@ -436,7 +420,6 @@ struct Parser[origin: Origin, simd_width: Int = 16, max_depth: Int = 256]:
         return result^
 
     def parse_string_uint_dict(mut self) raises ParseError -> Dict[String, Int]:
-        """Parse a JSON object mapping strings to unsigned ints."""
         if not self.consume(LBRACE):
             raise ParseError("expected '{'", self.pos)
         self.skip_whitespace()

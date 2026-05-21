@@ -8,11 +8,6 @@ from threading.burst_threading import BurstPool
 from threading.threading_traits import BurstKernel
 
 
-# =============================================================================
-# File mode traits
-# =============================================================================
-
-
 trait FileMode:
     comptime OPEN_FLAGS: Int
     comptime CREATE_MODE: Int
@@ -37,11 +32,6 @@ struct ReadWriteMode(IOReadWrite):
 struct AppendMode(IOAppend):
     comptime OPEN_FLAGS = linux.OpenFlags.WRONLY | linux.OpenFlags.CREAT | linux.OpenFlags.APPEND | linux.OpenFlags.CLOEXEC
     comptime CREATE_MODE = 0o644
-
-
-# =============================================================================
-# IoOp trait + concrete ops
-# =============================================================================
 
 
 trait IoOp(TrivialRegisterPassable):
@@ -76,7 +66,6 @@ def fill_sqe[Op: IoOp](sqe: UnsafePointer[linux.IoUringSqe, MutAnyOrigin], op: O
 
 @fieldwise_init
 struct ReadOp[T: AnyType = UInt8](IoOp, Writable):
-    """Read from file into buffer at `dest` for `length` bytes."""
     comptime OPCODE = linux.IoUringOp.READ
     comptime FLAGS = linux.IoUringSqeFlags.FIXED_FILE
     var file_idx: Int
@@ -95,7 +84,6 @@ struct ReadOp[T: AnyType = UInt8](IoOp, Writable):
 
 @fieldwise_init
 struct WriteOp[T: AnyType = UInt8](IoOp, Writable):
-    """Write `length` bytes from buffer at `src` into file."""
     comptime OPCODE = linux.IoUringOp.WRITE
     comptime FLAGS = linux.IoUringSqeFlags.FIXED_FILE
     var file_idx: Int
@@ -112,42 +100,25 @@ struct WriteOp[T: AnyType = UInt8](IoOp, Writable):
     def expected_bytes(self) -> Int: return self.length
 
 
-# =============================================================================
-# Completion
-# =============================================================================
-
-
 @fieldwise_init
 struct Completion(TrivialRegisterPassable, Writable):
     var id: Int
     var result: Int32
 
 
-# =============================================================================
-# Error traits
-# =============================================================================
-
-
 trait IoRingError(Writable, Copyable, ImplicitlyCopyable):
     def error_message(self) -> String: ...
     def error_op_id(self) -> Int: ...
 
-# Severity
 trait Fatal(IoRingError): ...
 trait Retryable(IoRingError): ...
 
-# Context
 trait ShortTransfer(IoRingError):
     def transfer_expected(self) -> Int: ...
     def transfer_actual(self) -> Int: ...
 
 trait SystemError(IoRingError):
     def sys_errno(self) -> Int: ...
-
-
-# =============================================================================
-# Concrete error types
-# =============================================================================
 
 
 @fieldwise_init
@@ -162,11 +133,6 @@ struct RingError(SystemError):
 
     def error_op_id(self) -> Int: return self.op_id
     def sys_errno(self) -> Int: return self.errno
-
-
-# =============================================================================
-# Ring queues
-# =============================================================================
 
 
 struct SubmissionQueue(Movable):
@@ -208,11 +174,6 @@ struct CompletionQueue(Movable):
 
     def ready(self) -> Int:
         return Int(self.tail.value()[] - self.head.value()[])
-
-
-# =============================================================================
-# IoRing
-# =============================================================================
 
 
 struct IoRing[queue_depth: Int = 2048](Movable):
@@ -498,7 +459,6 @@ struct IoRing[queue_depth: Int = 2048](Movable):
         return count
 
     def drain_one(mut self) raises RingError -> Completion:
-        """Block until one CQE is available, return it on the stack."""
         if self.ring_fd < 0:
             raise RingError(-1, self.ring_fd, "wait")
 
@@ -530,11 +490,6 @@ struct IoRing[queue_depth: Int = 2048](Movable):
         return c
 
 
-# =============================================================================
-# File opening for registered-file tables
-# =============================================================================
-
-
 def open_files_for_ring[M: FileMode = ReadMode](
     paths: Span[Path, _],
 ) raises RingError -> List[Int32]:
@@ -553,11 +508,6 @@ def open_files_for_ring[M: FileMode = ReadMode](
             raise RingError(-1, fd, "open")
         fds.append(Int32(fd))
     return fds^
-
-
-# =============================================================================
-# Read-completion queue processing (module-private)
-# =============================================================================
 
 
 struct LoadError(Copyable, Writable):
@@ -637,11 +587,6 @@ def process_read_queue[
             return LoadError(err_msg^)
 
     return None
-
-
-# =============================================================================
-# Multi-worker read dispatch
-# =============================================================================
 
 
 def close_fds(var fds: List[Int32]):

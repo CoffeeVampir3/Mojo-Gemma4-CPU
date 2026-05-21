@@ -14,11 +14,6 @@ comptime MAILBOX_DATA_SLOTS = 32
 comptime MAILBOX_DATA_BYTES = 256
 
 
-# ============================================================================
-# Kernel dispatch trampoline
-# ============================================================================
-
-
 def kernel_trampoline[K: BurstKernel](data_ptr: Int):
     """Reconstruct K from mailbox data pointer, call execute().
 
@@ -27,10 +22,6 @@ def kernel_trampoline[K: BurstKernel](data_ptr: Int):
     """
     UnsafePointer[K, MutAnyOrigin](unsafe_from_address=data_ptr)[].execute()
 
-
-# ============================================================================
-# Join flag — lives on the main thread's NUMA node
-# ============================================================================
 
 @align(64)
 struct JoinFlag:
@@ -43,10 +34,6 @@ struct JoinFlag:
         self.done = AtomicInt32(0)
         self.timestamp = 0
 
-
-# ============================================================================
-# Stack / slot layout
-# ============================================================================
 
 struct SlotLayout(TrivialRegisterPassable):
     comptime TLS_SIZE = 256
@@ -73,10 +60,6 @@ def compute_slot_size(stack_size: Int) -> Int:
              + SlotLayout.ALT_GUARD + SlotLayout.ALTSTACK_SIZE)
     return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
 
-
-# ============================================================================
-# Helpers
-# ============================================================================
 
 @always_inline
 def ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:

@@ -654,7 +654,7 @@ comptime assert TypeList[Trait=AnyType, Int, String]().contains[Int]
 
 Variadic parameter lists can be indexed, iterated, and forwarded directly. Type variadics are exposed through `TypeList`.
 
-Variadic keyword parameters (for example, **kwparams) are not supported yet.
+Variadic keyword parameters (for example, **kwparams) are not supported.
 Infer-only parameters
 
 Sometimes you need to declare functions where parameters depend on other parameters. Because the signature is processed left to right, a parameter can only depend on a parameter earlier in the parameter list. For example:
@@ -1372,17 +1372,24 @@ The Mojo standard library includes many traits. They're implemented by a number 
     Comparable
     Copyable
     Defaultable
+    Equatable
     Hashable
+    ImplicitlyCopyable
     ImplicitlyDestructible
     Indexer
     Intable
     IntableRaising
+    Iterable
+    IterableOwned
+    Iterator
     KeyElement
     Movable
     PathLike
     Powable
-    Sized
+    RegisterPassable
     Roundable
+    Sized
+    TrivialRegisterPassable
     Writable
     Writer
 
@@ -1427,35 +1434,49 @@ True
 
 The Writable trait
 
-The Writable trait describes a type that can produce a human-readable text representation by writing to a Writer object. The print() function requires that its arguments conform to the Writable trait. This enables efficient stream-based writing by default, avoiding unnecessary intermediate String heap allocations.
+`Writable` describes any type that can produce a UTF-8 text representation by streaming bytes into a `Writer`. This is the single trait that powers all text output in Mojo: `print()`, file writes, logging, and `String` construction all consume `Writable` arguments. Because it is stream-based, no intermediate `String` is allocated to format a value.
 
-The Writable trait requires a type to implement a write_to() method. This method receives a mut writer: Some[Writer] argument. A generic Writer that represents anything that can be written to, such as a String buffer, a file, or a network stream. You invoke the Writer instance's write() method to write a sequence of Writable arguments constituting the string representation of your type.
+A type implements `Writable` by defining `write_to(self, mut writer: Some[Writer])`. The argument is a generic writer that can be any sink — a `String` buffer, a file descriptor, a network stream, or another t-string being composed. The body pushes bytes into the writer; it should *not* build and return a `String`.
 
-An important feature of the Writer trait is that it only accepts valid UTF-8 text. This means that when you write data to a Writer, you can only use StringSlice values (via the write_string() method) or other Writable types; you can't write arbitrary bytes. This guarantee ensures that types like String can safely implement the Writer trait without risking corruption of their internal UTF-8 data.
+The `Writer` side accepts only valid UTF-8: `StringSlice` values (via `write_string()`) and other `Writable` types. Arbitrary raw bytes are not allowed. This is what lets `String` itself safely implement `Writer` — no path through the formatting machinery can corrupt its internal UTF-8 invariant.
 
-Writable also provides a write_repr_to() method for producing the "official" string representation of a type—the kind you would see when calling repr() or using the {!r} format specifier. If at all possible, this should look like a valid Mojo expression that could be used to recreate a struct instance with the same value. write_repr_to() has a default implementation that uses reflection, so you only need to override it if your type needs a distinct debug representation.
+`Writable` also defines `write_repr_to()` for the "official" debug representation (what `repr()` and `{!r}` produce). It should ideally look like a Mojo expression that reconstructs the value. There is a reflection-based default implementation, so override it only when you want something different from the auto-derived form.
 
-Here is a simple example of a type that implements Writable with a custom write_repr_to():
+The idiomatic way to implement `write_to` is with t-strings — they stream directly into the provided writer with zero intermediate allocations, even when the value composes other writables:
 
 @fieldwise_init
 struct Dog(Copyable, Writable):
     var name: String
     var age: Int
 
-    # Allows the type to be written into any `Writer`
+    # Writes into the caller's writer with no temporary String.
     def write_to(self, mut writer: Some[Writer]):
         t"Dog({self.name}, {self.age})".write_to(writer)
 
-    # Official representation when calling `repr`
+    # Override to get a distinct debug form (otherwise the default reflection
+    # impl produces something like `Dog(name="Rex", age=5)`).
     def write_repr_to(self, mut writer: Some[Writer]):
         t"Dog(name={self.name}, age={self.age})".write_to(writer)
 
 dog = Dog("Rex", 5)
-print(repr(dog))
-print(dog)
+print(repr(dog))                # Dog(name=Rex, age=5)
+print(dog)                      # Dog(Rex, 5)
+String(dog)                     # Allocates a String via the same path
 
-Dog(name=Rex, age=5)
-Dog(Rex, 5)
+If your type wraps a list, mix t-strings with explicit per-element writes — every literal segment and field flows through one writer:
+
+@fieldwise_init
+struct Tensor(Copyable, Writable):
+    var name: String
+    var shape: List[Int]
+
+    def write_to(self, mut writer: Some[Writer]):
+        t"Tensor({self.name}, shape=[".write_to(writer)
+        for i in range(len(self.shape)):
+            if i:
+                ", ".write_to(writer)
+            String(self.shape[i]).write_to(writer)
+        t"])".write_to(writer)
 
 Lifetime management traits
 
@@ -1724,31 +1745,23 @@ struct ExampleStruct:
     ) -> String:
 
 By convention, Mojo uses lower_snake_case for parameter names that define compile-time values. This helps distinguish them from type parameters.
-Downcasting safely: conforms_to + trait_downcast()
+Type refinement with conforms_to
 
-Sometimes a generic parameter's bound is broader than what you actually need. You may require operations from a specific trait that a parameter's bound doesn't guarantee. In those cases, Mojo provides a guarded downcast pattern using conforms_to() and trait_downcast().
-
-Downcasting is valid when the value's underlying type actually implements the target trait. Check for that conformance first. Once it's confirmed, you can safely downcast and treat the value as having that trait.
-
-This pattern keeps your code correct and makes fallback behavior explicit:
+Sometimes a generic parameter's bound is broader than what you actually need. You may require operations from a specific trait that a parameter's bound doesn't guarantee. The compiler narrows types inside scopes guarded by `conforms_to()` — in a `where` clause, a `comptime if`, or a `comptime assert` — and within the refined scope you can call the trait's methods directly:
 
 def process[T: AnyType](value: T):
     comptime if conforms_to(T, Writable & ImplicitlyCopyable):
-        var w = trait_downcast[Writable & ImplicitlyCopyable](value)
-        print(w)
+        print(value)
     else:
         print("<not writable>")
-        # Alternatively, you can fail at compile time using assertions
-        # with `comptime assert`
+        # Alternatively, you can fail at compile time with `comptime assert`.
 
 Key points:
 
-    conforms_to(T, Writable & ImplicitlyCopyable) checks whether type T conforms to the given trait composition.
-    trait_downcast() rebinds a value to a trait-bounded view at compile time.
+    `conforms_to(T, Writable & ImplicitlyCopyable)` checks whether type `T` conforms to the given trait composition.
+    Inside the refined branch, Mojo treats `T` as if it had the additional bounds, so `value`'s trait methods (here `Writable`'s `write_to`, used by `print`) are callable directly.
 
-Only call trait_downcast() inside the guarded branch. Use the else branch to handle non-conforming values. If a trait is always required, apply the bound directly, such as T: Writable, instead of using a guarded downcast.
-
-Limit trait_downcast() to cases where you can't express the requirement as a generic bound. This pattern most often appears in reflection code, where you need to handle values conditionally based on their traits. See reflection for details.
+If a trait is always required, apply the bound directly, such as `T: Writable`, instead of using a guarded refinement. Reach for `conforms_to()` only when the requirement is conditional — most often in reflection code that branches per field. See reflection for details.
 When generics get more complex
 
 The examples on this page focus on the most common and useful cases for working with generics. As you progress to larger APIs and more abstract code, you'll likely encounter a few more generic patterns. Here's a quick summary of the most likely ones you'll see:
@@ -1870,7 +1883,7 @@ struct Wrapper[T: BaseTraits](
 
     # New method
     def __bool__(self) -> Bool where conforms_to(Self.T, Boolable):
-        return trait_downcast[Boolable](self.value).__bool__()
+        return self.value.__bool__()
 
 In this example, the condition on __bool__() is the same as the one used for the Boolable conditional conformance. The where clause gates the method. If the condition is true, the method is available. If not, it isn't.
 
@@ -2524,18 +2537,13 @@ Both String and StaticString can be implicitly created from a StringLiteral, but
 Reflection
 
 Reflection helps you write code that inspects its own structure at compile time and reports information about types. This makes it possible to build features like structural validation, automatic comparisons, serialization, safer assertions, and richer error messages without hardcoding details for specific type implementations.
-Caution
-
-Mojo reflection is newly introduced and currently incomplete. Some reflection capabilities are limited, unstable, or not yet fully exposed through the language interface. This page describes the direction of the feature as well as the parts that are available today.
-
-All examples reflect the state of the language at the time this page was published. They may change as reflection support matures.
 Why reflection matters
 
 Reflection is often used for serialization, such as converting values to JSON or MessagePack regardless of type. It also supports common structural tasks. Instead of writing equality, hashing, or copy logic by hand, reflection can apply those operations to all fields automatically.
 
 In Mojo, reflection happens entirely at compile time. The compiler uses type information to generate specialized code, which avoids runtime cost while keeping the code flexible.
 
-With this in mind, this page will introduce reflection through examples, so you can see working code to study and use. Reflection code is intentionally parameterized and compile-time heavy. The examples below show the patterns you can use in real reflection-based code.
+Reflection code is intentionally parameterized and compile-time heavy. The examples below show the patterns you can use in real reflection-based code.
 Static vs. dynamic reflection
 
 Mojo's reflection is static, meaning it runs at compile time. Mojo generates reflection information during compilation. It uses the type information in your code, including types, fields, and methods. This contrasts with dynamic reflection, which inspects program state at runtime.
@@ -2543,39 +2551,32 @@ Mojo's reflection is static, meaning it runs at compile time. Mojo generates ref
 Static reflection's timing affects what you can and cannot do. Reflection can only operate on types known to the compiler. If a variable's type depends on runtime conditions, reflection can't access it. However, since all reflection runs during compilation, there's no runtime overhead.
 
 Mojo reflection operates on program structure, not live program state. Use it to serialize types, implement generic operations over struct fields (comparison, copying, arithmetic), and validate structural constraints at compile time.
+The reflect handle
+
+The reflection entry point is `reflect[T]`, a comptime alias for the handle type `Reflected[T]`. Spell it with no trailing parentheses — `reflect[T].method()` — because the handle carries `T` as its only parameter and every method is a `@staticmethod` keyed off it. The `reflect` alias is auto-imported through the prelude.
+
+Methods on the handle return either a runtime value (call with parens) or a type (no parens):
+
+    Value-returning: `field_count()`, `field_names()`, `field_types()`, `name()`, `base_name()`, `is_struct()`, `field_index[name]()`, `field_offset[name=lit]()`, `field_offset[index=N]()`, `field_ref[i](instance)`.
+    Type-returning (parametric comptime member alias): `field_type[name]` — yields `Reflected[FieldT]`, fully composable (e.g. `reflect[T].field_type["x"].name()`).
+
+A function-side reflection handle is also available via `reflect_fn[func]`, exposing `display_name()` and `linkage_name()`.
 Example: Present a type
 
-This example demonstrates how to use reflection to inspect a type at compile time. It shows how to retrieve a type's name and iterate over a struct's fields, including their names and types. This pattern is the foundation for most reflection-based utilities, such as validation, copying, and equality checks.
-Compile-time inputs
-
-Mojo reflection APIs run at compile time and accept compile-time inputs.
-
-Although reflection happens during compile time, it can drive behavior for runtime values. Knowing a value's type opens the door to retrieving type-specific metadata such as field counts, names, and types. That metadata can then be used to safely access and manipulate fields on concrete instances at runtime, as long as the access itself is guided by compile-time information.
-Reflection calls
-
-The reflection calls used in the following example include:
-
-    get_type_name[](): Returns the name of a type.
-    struct_field_count[](), struct_field_names[](), and struct_field_types[](): Return the count, names, and types of a struct's fields.
-
-from std.reflection import (
-    struct_field_count, struct_field_names,
-    get_type_name, struct_field_types
-)
+This example demonstrates how to use reflection to inspect a type at compile time. It retrieves a type's name and iterates a struct's fields, including their names and types. This pattern is the foundation for most reflection-based utilities, such as validation, copying, and equality checks.
 
 def show_type[T: AnyType]():
-    comptime type_name = get_type_name[T]()
-    comptime field_count = struct_field_count[T]() # count of fields
-    comptime field_names = struct_field_names[T]() # indexed list of field names
-    comptime field_types = struct_field_types[T]() # indexed list of field types
+    comptime type_name = reflect[T].name()
+    comptime field_count = reflect[T].field_count()
+    comptime field_names = reflect[T].field_names()
 
     print("struct", type_name)
 
     comptime for idx in range(field_count):
         comptime field_name = field_names[idx]
-        comptime field_type = get_type_name[field_types[idx]]()
+        comptime field_type_name = reflect[T].field_types()[idx].name()
         var intro = "├──" if idx < (field_count - 1) else "└──"
-        print(intro, " var ", field_name, ": ", field_type, sep="")
+        print(intro, " var ", field_name, ": ", field_type_name, sep="")
 
 @fieldwise_init
 struct MyStruct:
@@ -2597,14 +2598,11 @@ def main():
 
 Insights
 
-    When working with reflection, you must use parameterized types in the square parameter brackets for calls that use reflection features, such as show_type[](). These elements can be concrete types like MyStruct or generic type parameters like T.
-    This example uses a T: AnyType parameter for the show_type[]() function. This is the least restrictive constraint and allows the function to work with any type passed at the call site.
-    Reflection functions are themselves parameterized. That means you do not call foo(). You call foo[T]() to reflect on a type.
-    All processing of reflected information happens at compile time. For that reason, these reflection examples use comptime for and comptime if.
-        In this example, comptime for allows the loop index to be used across iterations.
-        Later examples show comptime if.
+    Calls that pass a type to `reflect` must use the square-bracket parameter syntax: `reflect[MyStruct]`, `reflect[T]`, etc. The bracketed slot accepts concrete types and generic type parameters alike.
+    `field_types()` returns a list of `Reflected[FieldT]` handles. Chain a method (`.name()`, `.field_count()`, ...) to read its properties.
+    All reflected information is processed at compile time. The example uses `comptime for` so the loop index is available across iterations.
 
-Using sep="" in show_type allows the colon to be flush left with the field name.
+Using `sep=""` in `show_type` keeps the colon flush against the field name.
 Program output
 
 The following output shows the result of calling show_type[]() on three different types in main(). Each call prints the compiler's view of the type, including its fully resolved name and the structure of its fields:
@@ -2639,33 +2637,23 @@ When a struct conforms to MakeCopyable, it gains the copy_to() method that uses 
 
 Its behavior is similar in spirit to ImplicitlyCopyable, but copy_to() limits copying to fields whose types conform to Copyable. It requires an already initialized target, avoiding matching values to __init__ arguments.
 
-from std.reflection import struct_field_count, struct_field_types
-
 trait MakeCopyable:
     def copy_to(self, mut other: Self):
-        comptime field_count = struct_field_count[Self]()
-        comptime field_types = struct_field_types[Self]()
+        comptime for idx in range(reflect[Self].field_count()):
+            comptime FT = reflect[Self].field_types()[idx]
 
-        comptime for idx in range(field_count):
-            comptime field_type = field_types[idx]
-
-            # Guard: field type must be copyable
-            comptime if not conforms_to(field_type, Copyable): continue
-
-            # Perform the copy
-            ref p_value = __struct_field_ref(idx, self)
-            trait_downcast[Copyable & ImplicitlyDestructible](
-                __struct_field_ref(idx, other)
-            ) = trait_downcast[Copyable & ImplicitlyDestructible](
-                p_value
-            ).copy()
+            # Guard: field type must be copyable and destructible
+            comptime if conforms_to(FT, Copyable & ImplicitlyDestructible):
+                ref src = reflect[Self].field_ref[idx](self)
+                ref dst = reflect[Self].field_ref[idx](other)
+                dst = src.copy()
 
 Insights
 
     The function iterates over reflected fields and checks each one for Copyable conformance, skipping any field that cannot be copied.
     As a method, copy_to() does not require a type parameter such as copy_to[T](). It has direct access to Self, which is enabled by MakeCopyable trait adoption.
-    The copy_to() implementation is heavily parameterized and evaluated at compile time. It uses comptime for and comptime if together with reflection calls.
-    The __struct_field_ref(idx, self) and __struct_field_ref(idx, other) calls return references to fields by index, which allows both reading from the source instance and writing to the destination instance.
+    The implementation is heavily parameterized and evaluated at compile time. It uses comptime for and comptime if together with reflection calls.
+    `reflect[Self].field_ref[idx](self)` returns a reference to a field by index, on both the source and destination instances. Inside the `comptime if conforms_to(FT, Copyable & ImplicitlyDestructible)` branch the compiler knows each field reference satisfies those traits, so the `.copy()` call and the assignment resolve directly.
 
 Create a struct
 
@@ -2678,8 +2666,8 @@ struct MultiType(Writable, MakeCopyable):
     var y: Bool
     var z: Float64
 
-    def write_to[W: Writer](self, mut writer: W):
-        writer.write("[{}, {}, {}, {}]".format(self.w, self.x, self.y, self.z))
+    def write_to(self, mut writer: Some[Writer]):
+        t"[{self.w}, {self.x}, {self.y}, {self.z}]".write_to(writer)
 
 Use the copying functionality
 
@@ -2701,32 +2689,25 @@ This example demonstrates how reflection can be used to implement structural equ
 
 In each iteration, test_equality checks for Equatable conformance and retrieves field value references from the lhs and rhs arguments. It uses early return for the first inequality (False), otherwise returning True:
 
-from std.reflection import struct_field_count, struct_field_types
-
 def test_equality[T: AnyType](lhs: T, rhs: T) -> Bool:
-    comptime field_count = struct_field_count[T]()
-    comptime field_types = struct_field_types[T]()
+    comptime for idx in range(reflect[T].field_count()):
+        comptime FT = reflect[T].field_types()[idx]
 
-    comptime for idx in range(field_count):
-        # Guard: field type must be equatable
-        comptime field_type = field_types[idx]
-        comptime if not conforms_to(field_type, Equatable): continue
+        # Skip fields whose types aren't equatable.
+        comptime if conforms_to(FT, Equatable):
+            ref lhs_value = reflect[T].field_ref[idx](lhs)
+            ref rhs_value = reflect[T].field_ref[idx](rhs)
 
-        # Fetch values
-        ref lhs_value = __struct_field_ref(idx, lhs)
-        ref rhs_value = __struct_field_ref(idx, rhs)
-
-        # Early exit with `False` when inequality found
-        if trait_downcast[Equatable](lhs_value) != trait_downcast[Equatable](rhs_value): return False
+            # Early exit with `False` when inequality found.
+            if lhs_value != rhs_value:
+                return False
 
     return True
 
 Insights
 
-    This example uses two key elements to ensure smooth operation: conforms_to() and trait_downcast[]().
-    conforms_to() ensures each field's type is Equatable and therefore works with the inequality operator (!=).
-    trait_downcast is used with parameter input types. It rebinds a typed value, returning a value that conforms to the specified Trait. If its type, after resolution, does not conform to that trait, it will produce a compilation error. Checking for conformance first ensures that error won't occur.
-    As its name suggests, __struct_field_ref() is limited to use with struct types.
+    `conforms_to(FT, Equatable)` ensures each field's type is `Equatable`. Inside that refined `comptime if` branch, the compiler narrows the field references' type so the direct `!=` call resolves without any downcast.
+    `reflect[T].field_ref[idx](instance)` is limited to struct types — it walks the struct's reflected field layout.
 
 Calling the tests
 
@@ -2751,7 +2732,7 @@ Advanced default method patterns
 The "Default method implementations" section above shows simple defaults like printing a string or negating an equality check. In practice, trait defaults are far more powerful — a default method body is ordinary Mojo code and can do anything a regular method can. This section documents patterns that go beyond simple one-liners.
 Default methods calling abstract methods
 
-A default method can call other methods required by the same trait, even if those methods are abstract (not yet implemented). The compiler guarantees that any conforming struct will have provided an implementation, so the call is always valid at monomorphization time.
+A default method can call other methods required by the same trait, even if those methods are abstract (have no body on the trait itself). The compiler guarantees that any conforming struct will have provided an implementation, so the call is always valid at monomorphization time.
 
 ```mojo
 trait Codec:
@@ -2967,4 +2948,3 @@ Learn more
 
     Visit the reflection package documentation to explore additional Mojo reflection capabilities.
     Learn more about traits.
-    (Coming soon): Dive into generics, trait conformance tests with conforms_to(), and downcasts with trait_downcast[]().

@@ -54,32 +54,43 @@ def validate_weight(
     desc: WeightDesc, found_dtype: DType, found_shape: List[Int],
 ) -> Bool:
     if desc.dtype != found_dtype:
-        print("dtype mismatch for", desc.name + ":",
-            "expected", desc.dtype, "got", found_dtype)
+        print(
+            t"dtype mismatch for {desc.name}: expected {desc.dtype} "
+            t"got {found_dtype}"
+        )
         return False
 
     if len(found_shape) == 1:
         var expected = desc.global_rows * desc.global_cols
-        if expected != found_shape[0]:
-            print("shape mismatch for", desc.name + ":",
-                "expected [" + String(expected) + "]",
-                "got [" + String(found_shape[0]) + "]")
+        var got = found_shape[0]
+        if expected != got:
+            print(t"shape mismatch for {desc.name}: expected [{expected}] got [{got}]")
             return False
     elif len(found_shape) == 2:
         if desc.global_rows != found_shape[0] or desc.global_cols != found_shape[1]:
-            print("shape mismatch for", desc.name + ":",
-                "expected [" + String(desc.global_rows) + ", " + String(desc.global_cols) + "]",
-                "got [" + String(found_shape[0]) + ", " + String(found_shape[1]) + "]")
+            var s0 = found_shape[0]
+            var s1 = found_shape[1]
+            print(
+                t"shape mismatch for {desc.name}: "
+                t"expected [{desc.global_rows}, {desc.global_cols}] "
+                t"got [{s0}, {s1}]"
+            )
             return False
     elif len(found_shape) == 3:
         var folded_rows = found_shape[0] * found_shape[1]
         if desc.global_rows != folded_rows or desc.global_cols != found_shape[2]:
-            print("shape mismatch for", desc.name + ":",
-                "expected [" + String(desc.global_rows) + ", " + String(desc.global_cols) + "]",
-                "got [" + String(found_shape[0]) + ", " + String(found_shape[1]) + ", " + String(found_shape[2]) + "]")
+            var s0 = found_shape[0]
+            var s1 = found_shape[1]
+            var s2 = found_shape[2]
+            print(
+                t"shape mismatch for {desc.name}: "
+                t"expected [{desc.global_rows}, {desc.global_cols}] "
+                t"got [{s0}, {s1}, {s2}]"
+            )
             return False
     else:
-        print("unexpected rank for", desc.name + ":", len(found_shape))
+        var rank = len(found_shape)
+        print(t"unexpected rank for {desc.name}: {rank}")
         return False
 
     return True
@@ -155,7 +166,7 @@ def resolve_and_emit(
 ) -> Bool:
     var found = find_tensor(w.name, headers)
     if not found:
-        print("missing tensor:", w.name)
+        print(t"missing tensor: {w.name}")
         return False
     var loc = found.value().copy()
     if not validate_weight(w, loc.meta.dtype, loc.meta.shape):
@@ -187,7 +198,8 @@ def load_weights_from_descs[
     for i in range(len(paths)):
         var header_opt = parse_safetensors_header(paths[i])
         if not header_opt:
-            print("failed to parse:", String(paths[i]))
+            var p = paths[i]
+            print(t"failed to parse: {p}")
             return None
         headers.push(header_opt.take())
 
@@ -247,7 +259,7 @@ def run_load[
         load_pools.push(BurstPool[mask_size](
             capacity=1, cpu_mask=mask, numa_node=topo.node(r)))
         if not load_pools[r]:
-            print("load pool setup failed for rank", r)
+            print(t"load pool setup failed for rank {r}")
             return None
 
     var pools_span = Span[BurstPool[mask_size], MutAnyOrigin](

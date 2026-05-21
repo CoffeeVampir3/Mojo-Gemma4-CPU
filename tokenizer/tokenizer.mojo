@@ -31,11 +31,6 @@ from .bpe import (
 )
 
 
-# =============================================================================
-# Capability traits
-# =============================================================================
-
-
 def bytes_to_gpt2(data: Span[Byte, _]) -> String:
     var cp_table = materialize[BYTE_TO_CODEPOINT]()
     var out = List[Byte]()
@@ -83,11 +78,6 @@ trait Tokenizer(Movable):
     def id_to_token(self, id: Int) -> Optional[String]: ...
 
 
-# =============================================================================
-# GPT2 byte encoding tables
-# =============================================================================
-
-
 def make_byte_to_codepoint() -> InlineArray[Int, 256]:
     var table = InlineArray[Int, 256](fill=0)
     var n = 256
@@ -112,21 +102,11 @@ comptime BYTE_TO_CODEPOINT = make_byte_to_codepoint()
 comptime CODEPOINT_TO_BYTE = make_codepoint_to_byte()
 
 
-# =============================================================================
-# UnicodeContext — bundled range table pointers
-# =============================================================================
-
-
 struct UnicodeContext(TrivialRegisterPassable):
     """Zero-size marker passed to classification functions. All table
     access goes through comptime indexing — no pointers, no lifetime issues."""
     def __init__(out self):
         pass
-
-
-# =============================================================================
-# Unicode classification
-# =============================================================================
 
 
 comptime ASCII_TAB: Byte = 0x09
@@ -265,11 +245,6 @@ def is_number_start_at(data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContex
 def is_whitespace_start_at(data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContext) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
     return is_unicode_whitespace_cp(parsed[0], ctx)
-
-
-# =============================================================================
-# Shared utilities
-# =============================================================================
 
 
 @always_inline
@@ -462,11 +437,6 @@ def split_numbers(
         out.append(span_to_string(data, chunk_start, n))
 
 
-# =============================================================================
-# Byte fallback
-# =============================================================================
-
-
 comptime HEX_DIGITS = "0123456789ABCDEF"
 
 
@@ -480,11 +450,6 @@ def byte_to_hex_token(b: Byte) -> String:
     buf.append(hex[Int(b) & 0xF])
     buf.append(Byte(0x3E))
     return String(unsafe_from_utf8=buf^)
-
-
-# =============================================================================
-# BPETokenizer
-# =============================================================================
 
 
 struct BPETokenizer[
@@ -537,7 +502,6 @@ struct BPETokenizer[
         var pretokenizer: Self.pretokenizer_type,
         var byte_transform: Self.byte_transform_type,
     ):
-        # Determine the max ID across vocab and added tokens to size vocab_rev
         var max_id = vocab_size - 1
         for item in vocab.items():
             if item.value > max_id:
@@ -637,9 +601,8 @@ struct BPETokenizer[
             if found:
                 symbol_ids.append(found.value())
             elif self.byte_fallback:
-                var ch_str = String(slice)
-                var ch_bytes = ch_str.as_bytes()
-                for j in range(ch_str.byte_length()):
+                var ch_bytes = slice.as_bytes()
+                for j in range(slice.byte_length()):
                     var fb = self.vocab.get(self.hex_token_cache[Int(ch_bytes[j])])
                     if fb:
                         symbol_ids.append(fb.value())
@@ -661,7 +624,7 @@ struct BPETokenizer[
         var chunk = span_to_string(data, start, end)
         var pieces = self.pretokenizer.pre_tokenize(chunk)
         for piece in pieces:
-            self.encode_piece(String(piece), ids)
+            self.encode_piece(piece, ids)
 
     def encode(mut self, text: String) -> List[Int]:
         var ids = List[Int]()
@@ -696,7 +659,7 @@ struct BPETokenizer[
 
     def decode(self, ids: List[Int]) -> String:
         var encoded_parts = List[Byte]()
-        var decoded = String("")
+        var decoded = String()
         for id in ids:
             if id < 0 or id >= len(self.vocab_rev):
                 continue
@@ -707,9 +670,9 @@ struct BPETokenizer[
                     var raw_bytes = self.byte_transform.decode_bytes(
                         String(unsafe_from_utf8=Span(encoded_parts))
                     )
-                    decoded = decoded + String(from_utf8_lossy=Span(raw_bytes))
+                    decoded += String(from_utf8_lossy=Span(raw_bytes))
                     encoded_parts.resize(unsafe_uninit_length=0)
-                decoded = decoded + tok.copy()
+                decoded += tok
                 continue
 
             var tok_data = tok.as_bytes()
@@ -717,6 +680,8 @@ struct BPETokenizer[
                 encoded_parts.append(tok_data[j])
 
         if len(encoded_parts) > 0:
-            var raw_bytes = self.byte_transform.decode_bytes(String(unsafe_from_utf8=Span(encoded_parts)))
-            decoded = decoded + String(from_utf8_lossy=Span(raw_bytes))
+            var raw_bytes = self.byte_transform.decode_bytes(
+                String(unsafe_from_utf8=Span(encoded_parts))
+            )
+            decoded += String(from_utf8_lossy=Span(raw_bytes))
         return decoded^

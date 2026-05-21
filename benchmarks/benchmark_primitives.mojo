@@ -170,23 +170,23 @@ def section_local_bw[P: BurstThreadPool, //, tp: Int](
     count: Int,
 ):
     var mb = count * 2 // 1024 // 1024
-    print("\n=== Local BW per node (" + String(mb) + " MB bf16) ===")
+    print(t"\n=== Local BW per node ({mb} MB bf16) ===")
     var samples = SampleBuffer(SAMPLES)
     for n in range(tp):
         timed_read(pools[n], src[n], count, samples)
         var rk = compute_stats(samples.kernel_ns, samples.n)
         var rw = compute_stats(samples.wall_ns, samples.n)
-        print_row("n" + String(n) + " read", rk, rw, count * 2)
+        print_row(String(t"n{n} read"), rk, rw, count * 2)
 
         timed_write(pools[n], dst[n], count, samples)
         var wk = compute_stats(samples.kernel_ns, samples.n)
         var ww = compute_stats(samples.wall_ns, samples.n)
-        print_row("n" + String(n) + " write", wk, ww, count * 2)
+        print_row(String(t"n{n} write"), wk, ww, count * 2)
 
         timed_copy(pools[n], dst[n], src[n], count, samples)
         var ck = compute_stats(samples.kernel_ns, samples.n)
         var cw = compute_stats(samples.wall_ns, samples.n)
-        print_row("n" + String(n) + " copy", ck, cw, count * 4)
+        print_row(String(t"n{n} copy"), ck, cw, count * 4)
 
 
 def section_remote_cached[P: BurstThreadPool, //, tp: Int](
@@ -207,7 +207,7 @@ def section_remote_cached[P: BurstThreadPool, //, tp: Int](
             var ks = compute_stats(samples.kernel_ns, samples.n)
             var ws = compute_stats(samples.wall_ns, samples.n)
             print_row(
-                "reader=n" + String(reader) + " owner=n" + String(owner),
+                String(t"reader=n{reader} owner=n{owner}"),
                 ks, ws, count * 2)
 
 
@@ -249,7 +249,7 @@ def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
             var ks = compute_stats(samples.kernel_ns, samples.n)
             var ws = compute_stats(samples.wall_ns, samples.n)
             print_row(
-                "reader=n" + String(reader) + " owner=n" + String(owner),
+                String(t"reader=n{reader} owner=n{owner}"),
                 ks, ws, count * 2)
 
 
@@ -261,8 +261,7 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
     comptime
     if tp <= 1:
         return
-    print("\n=== Contended read BW (" + String(tp)
-        + " pools read one node, chunked) ===")
+    print(t"\n=== Contended read BW ({tp} pools read one node, chunked) ===")
     var chunk = count // tp
     var samples = SampleBuffer(SAMPLES)
     for src_node in range(tp):
@@ -286,7 +285,7 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
         var ks = compute_stats(samples.kernel_ns, samples.n)
         var ws = compute_stats(samples.wall_ns, samples.n)
         print_row(
-            "src=n" + String(src_node) + " (" + String(tp) + " readers)",
+            String(t"src=n{src_node} ({tp} readers)"),
             ks, ws, count * 2)
 
 
@@ -314,8 +313,7 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
         samples.push(t_done - t0, t1 - t0)
     var ks = compute_stats(samples.kernel_ns, samples.n)
     var ws = compute_stats(samples.wall_ns, samples.n)
-    print_row("noop dispatch+join (" + String(tp) + " pools x 1 job)",
-        ks, ws, 0)
+    print_row(String(t"noop dispatch+join ({tp} pools x 1 job)"), ks, ws, 0)
 
     for _ in range(WARMUP):
         var buf = DispatchBuffer[NoopKernel]()
@@ -340,8 +338,9 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
         samples.push(t_done - t0, t1 - t0)
     var ks2 = compute_stats(samples.kernel_ns, samples.n)
     var ws2 = compute_stats(samples.wall_ns, samples.n)
-    print_row("noop dispatch+join (" + String(tp) + " pools x all workers)",
-        ks2, ws2, 0)
+    print_row(
+        String(t"noop dispatch+join ({tp} pools x all workers)"), ks2, ws2, 0
+    )
 
 
 def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
@@ -350,8 +349,8 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
     count: Int,
 ):
     var cap = pools[0].get_capacity()
-    print("\n=== Worker scaling on node 0 (capacity=" + String(cap)
-        + ", " + String(count * 2 // 1024 // 1024) + " MB) ===")
+    var mb = count * 2 // 1024 // 1024
+    print(t"\n=== Worker scaling on node 0 (capacity={cap}, {mb} MB) ===")
 
     var samples = SampleBuffer(SAMPLES)
     var n = 1
@@ -374,7 +373,7 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
             samples.push(t_done - t0, t1 - t0)
         var dk = compute_stats(samples.kernel_ns, samples.n)
         var dw = compute_stats(samples.wall_ns, samples.n)
-        print_row("workers=" + String(n) + " noop dispatch", dk, dw, 0)
+        print_row(String(t"workers={n} noop dispatch"), dk, dw, 0)
 
         var read_buf = DispatchBuffer[ReadSweepKernel]()
         for _ in range(WARMUP):
@@ -396,7 +395,7 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
             samples.push(t_done - t0, t1 - t0)
         var rk = compute_stats(samples.kernel_ns, samples.n)
         var rw = compute_stats(samples.wall_ns, samples.n)
-        print_row("workers=" + String(n) + " read", rk, rw, count * 2)
+        print_row(String(t"workers={n} read"), rk, rw, count * 2)
 
         if n < 4:
             n *= 2
@@ -411,7 +410,7 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
     src: InlineArray[BF16Ptr, tp],
     dst: InlineArray[BF16Ptr, tp],
 ):
-    print("\n=== Allreduce bf16 sweep (tp=" + String(tp) + ") ===")
+    print(t"\n=== Allreduce bf16 sweep (tp={tp}) ===")
     comptime immut = ImmutOrigin(MutAnyOrigin)
 
     comptime NUM_SIZES = 18
@@ -461,9 +460,10 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
         var sz_kb = count * 2 // 1024
         var label: String
         if sz_kb < 1024:
-            label = "allreduce " + String(sz_kb) + "KB"
+            label = String(t"allreduce {sz_kb}KB")
         else:
-            label = "allreduce " + String(sz_kb // 1024) + "MB"
+            var sz_mb = sz_kb // 1024
+            label = String(t"allreduce {sz_mb}MB")
         var ks = compute_stats(samples.kernel_ns, samples.n)
         var ws = compute_stats(samples.wall_ns, samples.n)
         print_row(label, ks, ws, total_bytes)
@@ -494,8 +494,8 @@ def main():
     var tp = len(topo)
 
     print("Primitives benchmark")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 512 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)

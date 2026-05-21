@@ -123,8 +123,8 @@ def run_config[
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 
-    print("\n=== head_dim=" + String(head_dim) + " num_q=" + String(num_q)
-        + " pool_capacity=" + String(pools[0].get_capacity()) + " ===")
+    var pool_cap = pools[0].get_capacity()
+    print(t"\n=== head_dim={head_dim} num_q={num_q} pool_capacity={pool_cap} ===")
 
     var counts = InlineArray[Int, 7](fill=0)
     counts[0] = 2; counts[1] = 4; counts[2] = 8
@@ -160,7 +160,7 @@ def run_config[
 
         var iks = compute_stats(samples.kernel_ns, samples.n)
         var iws = compute_stats(samples.wall_ns, samples.n)
-        print_row("sources=" + String(ns) + " inline", iks, iws, data_bytes)
+        print_row(String(t"sources={ns} inline"), iks, iws, data_bytes)
 
         warm_pool(scratch, pools[0])
         for _ in range(WARMUP):
@@ -186,7 +186,7 @@ def run_config[
 
         var dks = compute_stats(samples.kernel_ns, samples.n)
         var dws = compute_stats(samples.wall_ns, samples.n)
-        print_row("sources=" + String(ns) + " dispatched", dks, dws, data_bytes)
+        print_row(String(t"sources={ns} dispatched"), dks, dws, data_bytes)
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
@@ -202,8 +202,8 @@ def main():
     var tp = len(topo)
 
     print("logsum_merge worker count sweep")
-    print(String(tp) + " NUMA node(s), "
-        + String(len(topo.isolated_cpus)) + " isolated cpus\n")
+    var iso = len(topo.isolated_cpus)
+    print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 128 * 1024 * 1024
     var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)

@@ -77,6 +77,45 @@ def example():
     takes_raising_float(returns_int)  # Valid: Int -> Float32, non-raising -> raising
 ```
 
+### Closures and Function Effects
+
+Closures use an explicit capture list `{...}` after the parameter list and before the return type. Function effects (`raises`, `thin`, `abi("C")`) precede the capture list. A closure with no captures is *stateless* and auto-lifts to a top-level function — usable as an FFI callback.
+
+```mojo
+def main():
+    var a, b = 1, 2
+    var x = "hi"
+
+    # Stateless: empty capture list. Lifts to a top-level fn pointer.
+    def add_one(n: Int) {} -> Int: return n + 1
+
+    # Explicit capture list with a default capture convention. `a` is captured
+    # by mut reference, `b` and `x` follow the default `read` convention.
+    def use_them() {mut a, read}:
+        a += b
+        print(x)
+
+    # `ref` capture binds parametric mutability.
+    def show_x() {ref x}: print(x)
+
+    # Effects come before the capture list:
+    def maybe_fail() raises {}: raise "nope"
+
+    use_them()
+    show_x()
+
+# `thin` declares a plain function pointer type that carries no captured
+# state. Stateless closures and top-level functions are compatible.
+var fn_ptr: def(Int) thin -> Int = add_one
+
+# `abi("C")` declares the platform C calling convention — safe as a callback
+# passed into C, and required by DLHandle.get_function().
+def c_add(a: Int32, b: Int32) abi("C") -> Int32: return a + b
+var c_fn: def(Float64) abi("C") -> Float64 = handle.get_function[
+    def(Float64) abi("C") -> Float64
+]("sqrt")
+```
+
 ### Lifetimes, Origins, and References
 
 The Mojo compiler includes a **lifetime checker**, a compiler pass that analyzes dataflow through your program. It identifies when variables are valid and inserts destructor calls when a variable's lifetime ends (**ASAP destruction**).
@@ -118,13 +157,14 @@ struct ParametricRef[origin: Origin]:
     pass
 
 # Origin conversion
-comptime o: MutOrigin = MutOrigin.external
-comptime immut: ImmutOrigin = ImmutOrigin(o)            # Safe: drop mutability
-comptime mut: MutOrigin = MutOrigin(unsafe_cast=immut)  # Unsafe: add mutability
+def example(mut s: String):
+    comptime mut_o = origin_of(s)
+    comptime immut_o: ImmutOrigin = ImmutOrigin(mut_o)              # Safe: drop mutability
+    comptime mut_back: MutOrigin = MutOrigin(unsafe_cast=immut_o)   # Unsafe: add mutability
 
 from std.memory import Pointer
 def use_pointer():
-    a = 10
+    var a = 10
     ptr = Pointer(to=a)  # origin inferred from a
 ```
 
@@ -139,7 +179,7 @@ def use_pointer():
 | `StaticConstantOrigin` | Immutable values lasting program duration (e.g., string literals) |
 | `origin_of(value)` | Derived origin from value(s), returns `Origin` type |
 | Inferred | Captured from function argument via parameter inference |
-| `MutOrigin.external` / `ImmutOrigin.external` | Untracked memory (e.g., dynamic allocation) |
+| `MutExternalOrigin` / `ImmutExternalOrigin` | Untracked memory (e.g. dynamically-allocated buffers) |
 | `MutAnyOrigin` / `ImmutAnyOrigin` | Wildcard - might access any live value (disables ASAP destruction) |
 
 ```mojo
@@ -162,7 +202,7 @@ struct BoxedString:
 
 **Origin unions**: Union of origins extends all constituent lifetimes. Mutable only if all constituents are mutable.
 
-**External origins**: For memory not owned by any variable (e.g., `alloc()` returns `MutOrigin.external`). You manage the lifetime.
+**External origins**: For memory not owned by any variable (e.g. `alloc()` returns a pointer with `MutExternalOrigin`). You manage the lifetime.
 
 **Wildcard origins**: Discouraged. Using a wildcard-origin pointer disables ASAP destruction for all values in scope while the pointer is live.
 
@@ -300,7 +340,7 @@ Reference bindings: `ref value_ref = list[0]`
 **Three transfer modes:**
 
 1. **With `^`**: Ends caller variable lifetime, transfers ownership
-2. **Without `^`**: Copies value (requires `__copyinit__()`), caller retains ownership
+2. **Without `^`**: Copies value (requires a `__init__(out self, *, copy: Self)` copy constructor), caller retains ownership
 3. **Rvalue**: Direct transfer of newly-created values (no variable owns it)
 
 **Destruction**: `var` value destroyed at function exit unless transferred elsewhere (e.g., `list.append(name^)`)
@@ -311,11 +351,11 @@ Reference bindings: `ref value_ref = list[0]`
 
 Ownership transfer ≠ guaranteed move operation. Three mechanisms:
 
-1. `__moveinit__()` if implemented
-2. `__copyinit__()` then destroy original if no `__moveinit__()`
+1. The take constructor `__init__(out self, *, deinit take: Self)` if implemented
+2. The copy constructor `__init__(out self, *, copy: Self)` then destroy original, if no take constructor
 3. Optimization: ownership update without constructor invocation
 
-**Requirement**: Type must have `__copyinit__()` for `var` without `^`
+**Requirement**: Type must have a `__init__(out self, *, copy: Self)` constructor for `var` without `^`
 
 ---
 
@@ -351,9 +391,9 @@ ptr.scatter[width=8](vals, offsets)
 
 ```mojo
 def __init__(out self, args)
+def __init__(out self, *, copy: Self)
+def __init__(out self, *, deinit take: Self)
 def __del__(deinit self)
-def __copyinit__(out self, existing: Self)
-def __moveinit__(out self, deinit existing: Self)
 
 @fieldwise_init
 struct MyType(Copyable, ImplicitlyCopyable)
@@ -442,7 +482,7 @@ speak[5]()                                 # woof 5
 speak[msg="meow"]()                        # meow 3
 
 # Flexible default arguments - can infer parameters from defaults
-def take_string_slice[o: ImmOrigin](str: StringSlice[o] = ""): ...
+def take_string_slice[o: ImmutOrigin](str: StringSlice[o] = ""): ...
 def use_it():
     take_string_slice()                    # Defaults to "", infers "o"
 ```
@@ -604,7 +644,7 @@ def generic[nelts: Int](x: SIMD[DType.float32, nelts]):
         take_simd8(rebind[SIMD[DType.float32, 8]](x))  # Assert types match
 ```
 
-**where Clauses (Experimental):**
+**where Clauses:**
 ```mojo
 # DType constraints (equality, inequality, predicates)
 def foo[dt: DType]() -> Int where dt == DType.int32:
@@ -616,6 +656,11 @@ def foo[dt: DType]() -> Int where dt == DType.int32:
 # SIMD constraints (construction, comparison, arithmetic, bitwise)
 def bar[dt: DType, x: Int]() -> Int where SIMD[dt, 4](x) + 2 > SIMD[dt, 4](0):
     return 42
+
+# where + conforms_to drives type refinement: inside the refined scope the
+# compiler narrows T to include the trait, so its methods are callable directly.
+def write_thing[T: AnyType](mut w: String, value: T) where conforms_to(T, Writable):
+    value.write_to(w)
 ```
 
 ### Structs
@@ -754,31 +799,34 @@ trait VeryTrivial(TrivialRegisterPassable):  # Conformers must be TrivialRegiste
 | `Sized` | `__len__(self) -> Int` |
 | `Intable` | `__int__(self) -> Int` |
 | `IntableRaising` | `__int__(self) raises -> Int` |
-| `Stringable` | Deprecated in favor of `Writable`. `__str__(self) -> String` |
-| `Representable` | Deprecated in favor of `Writable`. `__repr__(self) -> String` |
 | `Writable` | `write_to(self, mut writer: Some[Writer])` + optional `write_repr_to()` for `repr()`/`{!r}`. Has reflection-based default impl. |
 | `Boolable` | `__bool__(self) -> Bool` |
 | `Hashable` | `__hash__(self) -> UInt`. Has reflection-based default impl (hashes all fields). |
 | `Equatable` | `__eq__(self, other: Self) -> Bool`. Has reflection-based default impl (compares all fields). |
 | `Comparable` | `__lt__`, `__le__`, `__gt__`, `__ge__` |
-| `Movable` | `__moveinit__(out self, deinit existing: Self)` |
-| `Copyable` | `__copyinit__(out self, existing: Self)` (refines `Movable`) |
+| `Movable` | `__init__(out self, *, deinit take: Self)` |
+| `Copyable` | `__init__(out self, *, copy: Self)` (refines `Movable`) |
+| `ImplicitlyCopyable` | Allows implicit copies via `Copyable` machinery (refines `Copyable`) |
 | `Defaultable` | `__init__(out self)` |
 | `AnyType` | Base trait, no `__del__()` required (supports explicitly-destroyed types) |
-| `ImplicitlyDestructible` | `__del__()` callable by compiler. `struct` auto-inherits this; `trait` must opt-in explicitly. |
+| `ImplicitlyDestructible` | `__del__(deinit self)` callable by compiler. `struct` auto-inherits this; `trait` must opt-in explicitly. |
 | `RegisterPassable` | Type is register-passable (passed in registers) |
-| `TrivialRegisterPassable` | Type is trivially register-passable (no copy/move/destroy) |
+| `TrivialRegisterPassable` | Type is trivially register-passable (no take/copy/destroy) |
 | `KeyElement` | `Copyable & Hashable & Equatable` |
+| `IterableOwned` | `__iter__(var self)` — consumes the collection and yields owned elements |
 
 ```mojo
-# Writable pattern (Stringable and Representable are deprecated; prefer Writable)
+# Writable pattern (the canonical "convert to text" trait).
+# The idiomatic body is a t-string streamed into the caller's writer - no
+# intermediate String allocation. Override `write_repr_to` only if you want
+# a different debug form (otherwise the reflection-based default is used).
 @fieldwise_init
 struct Dog(Copyable, Writable):
     var name: String
     var age: Int
 
     def write_to(self, mut writer: Some[Writer]):
-        writer.write("Dog(", self.name, ", ", self.age, ")")
+        t"Dog({self.name}, {self.age})".write_to(writer)
 
 # Traits with reflection-based default implementations
 # Simple structs just need fields that conform to the same trait:
@@ -792,11 +840,13 @@ hash(Point(1.5, 2.7))                     # Works automatically
 print(Point(1.5, 2.7))                    # Point(x=1.5, y=2.7)
 Point(1, 2) == Point(1, 2)                # True
 
-# Compile-time trait conformance check and downcast
+# Compile-time trait conformance check with type refinement.
+# Inside the refined branch, T is narrowed to Writable, so its methods are
+# callable directly — no separate downcast step.
 def maybe_print[T: AnyType](value: T):
     comptime
     if conforms_to(T, Writable):
-        print(trait_downcast[Writable](value))
+        print(value)
     else:
         print("[UNPRINTABLE]")
 ```
@@ -869,68 +919,333 @@ t.reverse()
 ```
 
 ### Strings
+
+Mojo's text APIs are UTF-8 throughout. There are five primary string types plus a validated codepoint type. Pick the cheapest one that satisfies your ownership and lifetime requirements.
+
+| Type            | Owns bytes? | Mutable? | Known at...   | Allocates? |
+|-----------------|-------------|----------|---------------|------------|
+| `StringLiteral` | n/a (encoded in the type) | no | compile time | no |
+| `StaticString`  | no (view)   | no       | runtime       | no |
+| `StringSlice`   | no (view)   | parametric | runtime    | no |
+| `String`        | yes         | yes      | runtime       | maybe (SSO) |
+| `TString`       | no (view of literal + refs to values) | no | compile time + runtime | no when streamed |
+| `CStringSlice`  | no (view)   | no       | runtime       | no |
+
+`StringLiteral` is comptime-only — the bytes are encoded in the type parameter (`!kgen.string`). It's marked `@__nonmaterializable(String)`, so when a literal flows into a runtime variable without a target type it materializes to `String`; in slice/view contexts it materializes to `StaticString`.
+
+`StaticString` is an alias: `StaticString = StringSlice[StaticConstantOrigin]`. The origin promises the referent lives for the program's duration, so it can be stored long-term without lifetime annotations.
+
+`StringSlice[mut, origin]` is the general non-owning view: pointer + length, register-passable, ABI-compatible with `llvm::StringRef`. The origin parameter ties the view's lifetime to the owner.
+
+`String` owns its bytes. It is 24 bytes wide on 64-bit and uses the top byte of the capacity word for flags. There are three storage forms, chosen lazily and switched on first mutation:
+
+- **Inline (SSO)** — up to 23 bytes packed inside the struct itself. No heap, no atomic. The default for short owned strings constructed via `String("...")` after first mutation.
+- **Static-pointer** — a borrowed pointer into static data (e.g. when constructed from a `StringLiteral` or `StaticString`). No allocation, no refcount; mutation copies out to inline or refcounted form.
+- **Refcounted heap** — atomic refcount prepended to the data; copy-on-write via uniqueness check. Used when bytes exceed inline capacity.
+
 ```mojo
-s = "Hello" + " World"
-s *= 3
-if "sub" in s: pass
-char = s[0]                # Returns full Unicode codepoint; panics if index falls mid-codepoint
-substring = s[start:end:step]
-
-comptime CONST = "compile time"
-comptime MULTI = """multiline"""
-
-# String Methods
+# String construction (UTF-8 throughout)
 String() | String(capacity=1024) | String(unsafe_uninit_length=n)
-String(from_utf8=span)                     # Validates UTF-8, raises on error
-String(from_utf8_lossy=span)               # Replaces invalid UTF-8 with U+FFFD (&#65533;)
-String(unsafe_from_utf8=span)              # No validation (unsafe)
-String(unsafe_from_utf8_ptr=ptr)
+String(t"hello {name}")                    # Collapse a t-string into an owned String
+String("a", 1, ", ", 3.14, sep="")         # Variadic Writable constructor
+String(from_utf8=span) raises              # Validates UTF-8, raises on bad bytes
+String(from_utf8_lossy=span)               # Replaces invalid UTF-8 with U+FFFD (�)
+String(unsafe_from_utf8=span)              # No validation - caller's responsibility
+String(unsafe_from_utf8_ptr=ptr)           # From a UTF-8 nul-terminated pointer
+String(copy=other)                         # Explicit copy
+String(py=python_obj) raises               # From PythonObject
 
-str.capacity() -> Int | byte_length() | count_codepoints()
-len(str.codepoints())
-str.unsafe_ptr() | unsafe_ptr_mut(capacity) | unsafe_cstr_ptr() | as_bytes()
-str.reserve(capacity: Int) | resize(unsafe_uninit_length=n)
-str.resize(length, fill_byte)              # Panics if truncating a codepoint or fill_byte >= 128
+# Static factory methods (avoid the implicit no-arg constructor when name matters)
+String.write(value)                        # Single-Writable factory
+String.write(1, " ", 2.0, sep="", end="\n") # Variadic factory
 
-str += other
-str.join(list) | split(sep) | strip() | lower() | upper()
-str.replace(old, new) | find(substr, start) | count(substr)
-str.startswith(prefix, start, end) | format(*args)  # format args must be Writable
-str.ascii_ljust(width, fill) | ascii_rjust(width, fill) | ascii_center(width, fill)
-str.codepoints() | codepoint_slices() | codepoints_reversed()
+# Length and indexing
+s.byte_length()                            # O(1) - UTF-8 bytes (preferred over len(s))
+s.count_codepoints()                       # O(n) - Unicode scalar values
+s.count_graphemes()                        # O(n) - UAX #29 grapheme clusters
+len(s.codepoints())                        # Same as count_codepoints() via Sized iterator
+# `len(s)` works but the compiler emits a warning steering you to byte_length()
+# or count_codepoints() - it's ambiguous which one you mean.
+s.is_codepoint_boundary(i)                 # On StringSlice; aborts mid-codepoint slicing
 
-# StringLiteral.format emits compile-time constraint error for invalid format strings
-"Hello, {!invalid}".format("world")  # Compile error: Conversion flag "invalid" not recognized
+# Three index spaces - pick the unit you mean
+b = s[byte=0]                              # One byte; aborts mid-codepoint
+sub = s[byte=0:5]                          # O(1) byte-indexed substring (StringSlice)
+# Codepoint and grapheme subscripts live on StringSlice. The current surface:
+#   - codepoint=N      single codepoint (O(n) forward scan)
+#   - grapheme=N:M     grapheme-cluster range slice (O(n))
+# `codepoint=N:M` slicing and single `grapheme=N` indexing are not exposed;
+# use the iterators (codepoint_slices(), graphemes(), nth_grapheme(n),
+# split_at_grapheme(n)) when you need them.
+cp = StringSlice(s)[codepoint=0]           # One codepoint (variable byte width)
+gp_range = StringSlice(s)[grapheme=0:3]    # First 3 graphemes
 
-atol(str), atof(str), chr(codepoint), ord(str)
+# Iteration
+for cp in s.codepoints(): pass             # Yields Codepoint values
+for slc in s.codepoint_slices(): pass      # Yields one-codepoint StringSlices
+for slc in s.codepoint_slices_reversed(): pass
+for g in s.graphemes(): pass               # Yields one-grapheme StringSlices
+for g in s.graphemes_reversed(): pass
+for off, g in s.grapheme_indices(): pass   # (byte_offset, grapheme) pairs
+s.nth_grapheme(n)                          # Optional[StringSlice]
+prefix, suffix = s.split_at_grapheme(n)
 
-# StringSlice
-slice = StringSlice(str)                   # Propagates mutability from source String
-slice.codepoints() | codepoint_slices() | codepoints_reversed()
-slice[idx] | slice[start:end]              # Panics if index falls mid-codepoint; returns full codepoint
+# Mutation (in place)
+s += "more"                                # __iadd__ takes any StringSlice
+s.write("a", " ", 1, " ", 2.0)             # Variadic in-place write
+s.write_string(slice)                      # Append a StringSlice
+s.append(codepoint)                        # Append one Codepoint
+s.reserve(n)                               # Ensure capacity
+s.resize(n, fill_byte=0)                   # Asserts: fill_byte < 128 and codepoint boundary
+s.resize(unsafe_uninit_length=n)           # Leaves new bytes uninitialized
 
-slice = StringSlice("literal")
-slice = StringSlice(*, unsafe_from_utf8: Span[UInt8])
-slice = StringSlice(*, from_utf8: Span[UInt8])
-slice = StringSlice(*, ptr: UnsafePointer[UInt8], length: Int)
+# Search and predicates
+"sub" in s                                 # __contains__
+s.find(substr, start=0) | s.rfind(substr, start=0)
+s.count(substr)
+s.startswith(prefix, start=0, end=-1) | s.endswith(suffix, ...)
+s.removeprefix(prefix) | s.removesuffix(suffix)
+s.is_ascii_digit() | s.is_ascii_printable() | s.isupper() | s.islower() | s.isspace()
 
-slice[0:5]                                 # StringSlice[byte=] returns StringSlice (not String)
-slice.byte_length() | count_codepoints() | is_codepoint_boundary(index)
-slice.split(sep) | strip() | codepoints() | as_bytes()
+# Transformations (return new String or non-owning StringSlice as marked)
+new_s: String = s.replace(old, new)
+slc: StringSlice = s.strip() | s.lstrip() | s.rstrip()
+slc = s.strip(chars) | s.lstrip(chars) | s.rstrip(chars)
+new_s = s.lower() | s.upper()
+new_s = s.ascii_ljust(width, fillchar=" ")
+new_s = s.ascii_rjust(width, fillchar=" ")
+new_s = s.ascii_center(width, fillchar=" ")
+new_s = s * 3                              # __mul__ - repeat
 
-# CStringSlice - nul-terminated C-style strings (non-null)
-cslice = CStringSlice(ptr)
-var maybe_cslice: Optional[CStringSlice] = None
-cslice.byte_length() | as_string_slice()
+# Split/Join
+parts: List[StringSlice] = s.split(sep)                      # Explicit separator
+parts = s.split(sep, maxsplit=2)
+parts = s.split()                                            # Whitespace, drops empties
+parts = s.split(maxsplit=2)                                  # Whitespace + cap
+lines: List[StringSlice] = s.splitlines(keepends=False)      # Universal newlines
+joined: String = ", ".join(parts)                            # Delimiter joins Writables
 
-# Codepoint
-cp = Codepoint.from_u32(val) | ord("a") | Codepoint(unsafe_unchecked_codepoint=val)
-cp.to_u32() | utf8_byte_length() -> Int | unsafe_write_utf8[optimize_ascii=True](ptr) -> Int
-Codepoint.unsafe_decode_utf8_codepoint(span)
-cp.is_ascii() | is_ascii_digit() | is_ascii_upper() | is_ascii_lower()
-cp.is_python_space() | is_posix_space()
-cp1 < cp2 | cp1 == cp2 | cp1 <= cp2
+# Conversion / interop
+buf = s.as_bytes()                         # Span[Byte, ...] - immutable
+mbuf = s.as_bytes_mut()                    # Span[Byte, ...] - mutable; corrupting UTF-8 is on you
+p = s.unsafe_ptr()                         # UnsafePointer[Byte, ...]
+p = s.unsafe_ptr_mut(capacity=0)           # Mutable pointer, may reallocate
+c = s.as_c_string_slice()                  # CStringSlice with a guaranteed nul terminator
+i = Int(s) raises | f = Float64(s) raises
+hashed = hash(s)
+
+# String constants (comptime members on String)
+String.ASCII_LOWERCASE | ASCII_UPPERCASE | ASCII_LETTERS
+String.DIGITS | HEX_DIGITS | OCT_DIGITS | PUNCTUATION | PRINTABLE
+
+# Prelude helpers
+ord(s_one_char) -> Int                     # Codepoint of a single-character string
+chr(c: Int) -> String                      # Aborts on invalid scalar value
+atol(s, base: Int = 10) raises -> Int      # base=0 sniffs 0b/0o/0x prefixes
+atof(s) raises -> Float64
+ascii(s) -> String                         # Python-style repr-ish ASCII rendering
 ```
+
+#### `StringSlice` — the universal view
+
+```mojo
+slice = StringSlice(owned_string)          # Propagates mutability from source
+slice = StaticString("literal")            # Implicit from any string literal
+slice = StringSlice(ptr=p, length=n)       # From pointer + length (unsafe contract)
+slice = StringSlice(unsafe_from_utf8=byte_span)
+slice = StringSlice(from_utf8=byte_span) raises          # Validating constructor
+slice = StringSlice(unsafe_from_utf8=cstring_slice)      # From CStringSlice
+slice = StringSlice(unsafe_from_utf8_ptr=ptr)            # From nul-terminated ptr
+
+# Slicing and indexing
+slice[byte=0]                              # Single byte (Indexer or IntLiteral)
+slice[byte=0:5]                            # O(1) byte slice; aborts mid-codepoint
+slice[codepoint=N]                         # Single codepoint (O(n))
+slice[grapheme=0:5]                        # O(n) UAX #29 grapheme range slice
+slice.is_codepoint_boundary(i)
+imut = slice.get_immutable()               # Strip mutability
+
+# All of String's search/transform/predicate methods are mirrored here.
+slice.split(sep) | strip() | lower() | upper() | find(...) | replace(old, new) ...
+slice.byte_length() | count_codepoints() | count_graphemes()
+slice.codepoints() | codepoint_slices() | codepoint_slices_reversed()
+slice.graphemes() | graphemes_reversed() | grapheme_indices()
+slice.as_bytes() | unsafe_ptr()
+StaticString(...).as_c_string_slice()      # Only on the StaticConstantOrigin form
+```
+
+A function taking `StringSlice` infers the origin from the caller — same function body accepts owned `String`, `StaticString`, `StringLiteral`, and re-slices of any of them without copying. To return a sub-slice whose lifetime ties to the input, name the origin:
+
+```mojo
+def first_word(s: StringSlice) -> StringSlice[s.origin]:
+    var i = s.find(" ")
+    return s if i < 0 else s[byte=0:i]
+```
+
+#### `StringLiteral` — the comptime carrier
+
+```mojo
+comptime CONST = "compile time"            # Type is StringLiteral[<bytes>]
+comptime MULTI = """multiline"""           # Triple-quoted
+ESCAPED = "é \U0001F389"                   # \uHHHH and \UHHHHHHHH escape forms
+RAW = r"C:\path\with\backslashes"          # Raw prefix - escapes are literal
+
+# Adjacent literals concatenate at compile time
+JOIN = "hello, " "world"                   # "hello, world"
+
+# Materialization happens automatically:
+var owned: String = "hi"                   # StringLiteral -> String
+var view: StaticString = "hi"              # StringLiteral -> StaticString
+var sl: StringSlice = "hi"                 # StringLiteral -> StaticString
+
+# StringLiteral.format() is checked at compile time
+"{0} {1} {0}".format("Mojo", 1.125)        # "Mojo 1.125 Mojo"
+# "{!invalid}".format("x")                 # Compile error: unknown conversion flag
+```
+
+`StringLiteral` is `@__nonmaterializable(String)`. You almost never declare it as a variable type — let the compiler pick the materialization. Use it only as a struct/function parameter type when you genuinely want the bytes carried as a compile-time value (e.g. naming experimental slots, encoding flags).
+
+#### `TString` — template strings (`t"..."`)
+
+T-strings are the preferred way to format text in Mojo. They are a literal syntax, not a runtime call:
+
+```mojo
+var name = "Nate"
+print(t"Hello, {name}!")                   # "Hello, Nate!"
+```
+
+Mechanically, `t"a={x} b={y}"` lowers at compile time to a `TString[format_string, *Ts: Writable]` value. The struct holds exactly one field: a variadic pack of *immutable references* to the captured expressions. The format template is compiled to a NUL-separated byte sequence in static read-only memory — `{}` becomes a `\0` boundary, `{{`/`}}` resolve to literal `{`/`}`, and any malformed template is a compile-time error.
+
+This produces three properties that distinguish t-strings from Python f-strings and from `"...".format(...)`:
+
+1. **Compile-time checking.** The template is parsed by the compiler. Unmatched braces, empty replacement fields with mismatched argument counts, and unknown conversions become compilation errors, not runtime crashes.
+2. **Lazy / zero-allocation when streamed.** A `TString` does not allocate. Writing it to a sink that already implements `Writer` — `print`, a file, a logger, an existing `String` — emits literal segments interleaved with the captured values directly through that sink. No intermediate `String`.
+3. **Arbitrary expressions inside `{}`.** The braces accept any expression, not just names: `t"{a + b}"`, `t"{list[i]}"`, `t"{f(x).field}"`. There are no positional indices or named-field rules; what is between the braces *is* the value to write.
+
+```mojo
+# Lazy: no allocation - streams directly to stdout
+var x = 41
+print(t"answer = {x + 1}")
+
+# Capture is fine; the template is just a value with refs.
+var name = "world"
+var greeting = t"Hello, {name}!"
+print(greeting)                            # No alloc
+print(greeting)                            # No alloc (reused)
+var owned = String(greeting)               # Alloc happens here, only if you ask for it
+
+# Literal braces via doubling
+print(t"Use {{braces}} around {name}")     # "Use {braces} around world"
+
+# Arbitrary expressions
+var nums = [1, 2, 3]
+print(t"{nums[0] + nums[1]}")              # "3"
+
+# Nested t-strings (TString is Writable, so it streams into outer t-strings)
+print(t"Hello, {t"dear {name}"}!")         # Up to 20 levels of nesting
+
+# Raw t-strings: backslashes literal, interpolation still works
+var base = "/home/user"
+print(rt"Path: {base}\subdir\file")        # "Path: /home/user\subdir\file"
+# tr"..." / rT"..." / Rt"..." etc. all work
+
+# Triple-quoted t-strings - multi-line with interpolation
+print(t"""
+  name = {name}
+  count = {len(nums)}
+""")
+```
+
+`TString` is `Movable` and `Writable`, but **not** `Copyable` or `ImplicitlyCopyable`, and it pins to the origins of its captured values. Treat it as a short-lived expression, not a storable field — if you need to keep the formatted text, collapse it with `String(template)`.
+
+**Idiomatic `write_to`** uses t-strings to compose representations without ever allocating an intermediate `String`. The bytes flow straight from the literal template and the field values into the caller's writer.
+
+```mojo
+@fieldwise_init
+struct Tensor(Copyable, Writable):
+    var name: String
+    var shape: List[Int]
+
+    def write_to(self, mut writer: Some[Writer]):
+        t"Tensor({self.name}, shape=[".write_to(writer)
+        for i in range(len(self.shape)):
+            if i:
+                ", ".write_to(writer)
+            String(self.shape[i]).write_to(writer)
+        t"])".write_to(writer)
+```
+
+**When to reach for which template form:**
+
+- `t"..."`: anything you can write directly — `print`, logging, building up a `String`, implementing `write_to`. This is the default.
+- `String.format(template, *args)` / `"{}".format(*args)` (`raises`): only when the template itself is chosen at runtime (e.g. read from config). Always allocates a new `String`. Supports `{0}` manual indexing, `{}` automatic indexing, `{!r}` for `repr`, `{!s}` for `str`. No format specifiers (`{:.2f}` etc.) yet.
+
+#### `Codepoint` — validated Unicode scalar values
+
+A `Codepoint` is a Unicode scalar value (0..0xD7FF or 0xE000..0x10FFFF, excluding the UTF-16 surrogate range).
+
+```mojo
+from std.collections.string import Codepoint
+
+cp = Codepoint.ord("a")                    # From a single-char slice
+cp_opt = Codepoint.from_u32(0x1F44B)        # Optional[Codepoint]; None for invalid scalars
+cp = Codepoint(UInt8(b))                    # From any byte (always valid)
+cp = Codepoint(unsafe_unchecked_codepoint=u) # Unsafe: caller asserts validity
+
+u: UInt32 = cp.to_u32()
+n: Int = cp.utf8_byte_length()             # 1..4
+written: Int = cp.unsafe_write_utf8(ptr)   # Writes UTF-8 bytes to ptr, returns count
+
+cp.is_ascii() | is_ascii_digit() | is_ascii_upper() | is_ascii_lower()
+cp.is_ascii_printable() | is_python_space() | is_posix_space()
+
+# Decode one codepoint from a known-valid UTF-8 byte span
+cp2, nbytes = Codepoint.unsafe_decode_utf8_codepoint(byte_span)
+```
+
+#### `CStringSlice` — nul-terminated FFI view
+
+```mojo
+from std.ffi import CStringSlice, c_char
+
+cs = CStringSlice(unsafe_from_ptr=c_char_ptr)       # Raw FFI pointer; caller asserts nul-term
+cs = CStringSlice(some_string_slice) raises         # Raises if no terminator / interior nul
+cs = CStringSlice(some_byte_span) raises
+
+len(cs)                                             # strlen() semantics, excludes nul
+cs.unsafe_ptr() -> UnsafePointer[c_char, origin]
+cs.as_bytes()                                       # Excludes nul terminator
+cs.as_bytes_with_nul()                              # Includes nul terminator
+
+# Convert to StringSlice via the nul-terminated pointer (CStringSlice has no
+# `.as_string_slice()`, and the StringSlice constructor takes a byte pointer):
+slc = StringSlice(unsafe_from_utf8_ptr=cs.unsafe_ptr())
+
+# Optional[CStringSlice] has the same size/layout as `const char*` - use it for
+# nullable FFI returns:
+var maybe: Optional[CStringSlice[StaticConstantOrigin]] = external_call[
+    "getenv", Optional[CStringSlice[StaticConstantOrigin]]
+](name)
+```
+
+#### Byte length vs codepoint count vs grapheme count
+
+All three are different in general, and confusing them is the single most common source of UTF-8 bugs.
+
+```mojo
+def show(label: StaticString, s: StringSlice):
+    print(label,
+          "bytes=",      s.byte_length(),
+          "codepoints=", s.count_codepoints(),
+          "graphemes=",  s.count_graphemes())
+
+show("family ", "👨‍👩‍👧‍👦")   # bytes=25  codepoints=7  graphemes=1
+show("flag   ", "🇺🇸")            # bytes=8   codepoints=2  graphemes=1
+show("namaste", "नमस्ते")          # bytes=18  codepoints=6  graphemes=3
+show("ascii  ", "hello")        # bytes=5   codepoints=5  graphemes=5
+```
+
+Use `byte_length()` for buffer math (it's O(1)). Use `count_graphemes()` only when the answer needs to match what a human would call a "character." Slicing follows the same rule — `byte=` is O(1), `codepoint=` and `grapheme=` are O(n) forward scans.
 
 ### Collections
 ```mojo
@@ -986,11 +1301,11 @@ counter1 - counter2
 counter1 & counter2
 counter1 | counter2
 
-# LinkedList (conforms to Writable)
+# LinkedList (conforms to Writable). No __getitem__ — indexing is O(n); iterate instead.
 list = LinkedList[Int](1, 2, 3)
 list.append(val) | prepend(val) | pop() | pop(idx)
-list[idx]
 list.reverse() | insert(idx, val)
+for ref item in list: pass
 
 # InlineArray (not ImplicitlyCopyable - must explicitly copy or take references)
 var arr: InlineArray[Int, 3] = [1, 2, 3]  # Literal construction required
@@ -1007,6 +1322,9 @@ bs.union(other) | intersection(other) | difference(other)
 # Optional (element type does not need to be Copyable)
 opt = Optional(value) | Optional[Int](None)
 opt.value() | unsafe_value() | take() | unsafe_take() | or_else(default)
+opt.map[To=String](closure)                # Optional[T] -> Optional[To]
+opt.and_then[To=Int](closure)              # Flat-map over closures that return Optional
+opt.destroy_with(destroy_func)             # In-place destruction with caller-provided destructor
 if opt: pass
 for item in opt: print(item)
 
@@ -1044,8 +1362,6 @@ for i in range(3):
     print(i)
 else:
     print("finished")  # runs if loop wasn't broken
-
-# Note: match/switch is not supported yet
 ```
 
 ### Bool Operations
@@ -1067,12 +1383,14 @@ Dangling (placeholder) → Allocated → Initialized → Dangling
 ```
 
 ```mojo
-from std.memory import UnsafePointer, alloc
+from std.memory import UnsafePointer, alloc, free, Layout, forget_deinit
 
-# Allocation
-ptr = alloc[Int](count)                    # Allocate space for count values (debug_assert: count >= 0)
-ptr = alloc[Float32](256, alignment=64)    # With alignment
-ptr = UnsafePointer[Int, MutOrigin.external].unsafe_dangling()  # Placeholder for split init
+# Allocation — three equivalent forms; the Layout form bundles count + alignment
+ptr = alloc[Int](count)                    # Aborts if allocation fails (debug_assert: count >= 0)
+ptr = alloc[Float32](256, alignment=64)    # With explicit alignment
+var ly = Layout[Int](count=count)
+ptr = alloc(ly)                            # Layout-aware allocator; free(ptr, ly) pairs cleanly
+ptr = UnsafePointer[Int, MutExternalOrigin].unsafe_dangling()  # Non-null placeholder for split init
 
 # Initialization (allocated memory is uninitialized)
 ptr.init_pointee_copy(value)               # Copy value into memory
@@ -1144,7 +1462,7 @@ If you find yourself reaching for `unsafe_dangling()` and *also* writing a "is t
 
 **Origin Tracking:**
 ```mojo
-# alloc() returns MutOrigin.external (untracked by lifetime checker)
+# alloc() returns MutExternalOrigin (untracked by lifetime checker)
 # UnsafePointer(to=value) infers origin from value
 
 def unsafe_ptr(ref self) -> UnsafePointer[T, origin_of(self)]:
@@ -1153,8 +1471,7 @@ def unsafe_ptr(ref self) -> UnsafePointer[T, origin_of(self)]:
 
 **Foreign Interop:**
 ```mojo
-# FFI module is top-level: `from ffi import ...`
-from ffi import external_call
+from std.ffi import external_call
 
 # Python (ConvertibleFromPython requires keyword: Int(py=pyObj))
 ptr = arr.ctypes.data.unsafe_get_as_pointer[DType.int64]()
@@ -1166,7 +1483,7 @@ def add(a: Int32, b: Int32) abi("C") -> Int32:
 comptime CUnaryF64 = def(Float64) abi("C") -> Float64
 
 # Raw symbol / function calls
-ptr = external_call["c_func", UnsafePointer[Int, MutOrigin.external]]()
+ptr = external_call["c_func", UnsafePointer[Int, MutExternalOrigin]]()
 
 # Opaque pointer (void* equivalent)
 comptime OpaquePointer = UnsafePointer[NoneType]
@@ -1218,7 +1535,7 @@ var typed = stack_allocation[count, MyType]()
 **Origin** - Compiler token for memory lifetime tracking:
 - Prevents use-after-free, ensures safe aliasing
 - Generic parameter in function signatures: `ref [origin] data`
-- Common origins: `MutAnyOrigin`, `ImmutAnyOrigin`, `external`
+- Common origins: `MutAnyOrigin`, `ImmutAnyOrigin`, `MutExternalOrigin`, `ImmutExternalOrigin`
 - Use `origin_of(value)` in generic code when needed
 
 **Layout** - Compile-time memory organization:
@@ -1268,7 +1585,7 @@ tensor.store(1, 0, vals * 2.0)
 ## Stdlib Integration (Function-Based APIs)
 
 ```mojo
-from algorithm import sum, vectorize
+from std.algorithm import sum, vectorize
 
 # sum() via parametric closure
 comptime lt = Layout.row_major(1, 16)
@@ -1414,13 +1731,13 @@ tile[workgroup_fn, sizes_x, sizes_y](off_x, off_y, bound_x, bound_y)
 
 ### Imports
 ```mojo
-from gpu import block_idx, thread_idx, cluster_sync
-from gpu.primitives.warp import shuffle_idx, shuffle_up, shuffle_down, shuffle_xor
-from gpu.primitives.block import sum, max, min, broadcast, prefix_sum
-from gpu.compute.mma import mma, load_matrix_a, load_matrix_b, store_matrix_d
-from gpu.memory import async_copy, async_copy_commit_group, async_copy_wait_group
-from gpu.sync import barrier, syncwarp, named_barrier
-from gpu.sync.semaphore import Semaphore
+from std.gpu import block_idx, thread_idx, cluster_sync
+from std.gpu.primitives.warp import shuffle_idx, shuffle_up, shuffle_down, shuffle_xor
+from std.gpu.primitives.block import sum, max, min, broadcast, prefix_sum
+from std.gpu.compute.mma import mma, load_matrix_a, load_matrix_b, store_matrix_d
+from std.gpu.memory import async_copy, async_copy_commit_group, async_copy_wait_group
+from std.gpu.sync import barrier, syncwarp, named_barrier
+from std.gpu.sync.semaphore import Semaphore
 ```
 
 ### Thread Hierarchy
@@ -1444,13 +1761,16 @@ val = load[
     alignment
 ](ptr)
 
-val = load_relaxed[dtype](ptr, scope=THREAD|WARP|BLOCK|CLUSTER|GPU|SYSTEM)
-val = load_acquire[dtype](ptr, scope)
+# Volatile load/store (e.g. MMIO)
 val = load_volatile[dtype](ptr)
-
-store_relaxed[dtype](ptr, value, scope)
-store_release[dtype](ptr, value, scope)
 store_volatile[dtype](ptr, value)
+
+# Scoped atomic load/store goes through std.atomic.Atomic. The previous
+# *_release / *_relaxed / *_acquire helpers in std.gpu.intrinsics are gone.
+from std.atomic import Atomic, Ordering
+Atomic[dtype, scope="device"].store[ordering=Ordering.RELEASE](ptr, value)
+val = Atomic[dtype, scope="device"].load[ordering=Ordering.ACQUIRE](ptr)
+val = Atomic[dtype, scope="device"].load[ordering=Ordering.RELAXED](ptr)
 ```
 
 ### Async Copy
@@ -1802,7 +2122,7 @@ mean[dtype, input_fn, output_fn](input_shape, reduce_dim, output_shape, context)
 
 ### Path Operations
 ```mojo
-from os.path import (
+from std.os.path import (
     join, basename, dirname, split, splitroot, split_extension,
     exists, isdir, isfile, islink, lexists, is_absolute,
     expanduser, expandvars, realpath, getsize
@@ -1826,7 +2146,7 @@ lexists(path), is_absolute(path)
 
 ### File Operations
 ```mojo
-from os import (
+from std.os import (
     listdir, mkdir, makedirs, rmdir, removedirs, remove, unlink,
     stat, lstat, getuid, isatty, link, symlink
 )
@@ -1855,8 +2175,8 @@ uid = getuid()  # Linux/macOS
 is_tty = isatty(fd: Int)
 
 # File type checks
-from stat import S_ISREG, S_ISDIR, S_ISCHR, S_ISBLK, S_ISFIFO, S_ISLNK, S_ISSOCK
-from stat import S_IFMT, S_IFREG, S_IFDIR, S_IFCHR, S_IFBLK, S_IFIFO, S_IFLNK, S_IFSOCK
+from std.stat import S_ISREG, S_ISDIR, S_ISCHR, S_ISBLK, S_ISFIFO, S_ISLNK, S_ISSOCK
+from std.stat import S_IFMT, S_IFREG, S_IFDIR, S_IFCHR, S_IFBLK, S_IFIFO, S_IFLNK, S_IFSOCK
 
 S_ISREG(info.st_mode)  # Regular file
 S_ISDIR(info.st_mode)  # Directory
@@ -1889,7 +2209,7 @@ pwd = cwd()
 
 ### Environment Variables
 ```mojo
-from os import getenv, setenv, unsetenv
+from std.os import getenv, setenv, unsetenv
 
 val = getenv("VAR", default="")
 ok = setenv("VAR", "value", overwrite=True)
@@ -1898,7 +2218,7 @@ ok = unsetenv("VAR")
 
 ### User Info (Linux/macOS)
 ```mojo
-from pwd import getpwnam, getpwuid, Passwd
+from std.pwd import getpwnam, getpwuid, Passwd
 
 struct Passwd:
     pw_name: String, pw_passwd: String
@@ -1911,7 +2231,7 @@ user = getpwuid(uid)
 
 ### Process Management
 ```mojo
-from os.process import spawn, wait  # Uses posix_spawn(), no system shell
+from std.os.process import spawn, wait  # Uses posix_spawn(), no system shell
 ```
 
 ### OS Constants
@@ -1940,9 +2260,25 @@ fh = open[PathLike](path, mode)
 s = input(prompt="")
 print[*Ts](*values, sep=" ", end="\n", flush=False, file=FileDescriptor(1))
 
-# Writer and Writable are in the `format` module (not `io`)
-from format import Writer, Writable
-# Writer supports only UTF-8 data; write_string() is the primary method
+# Writer and Writable live in the `format` module (not `io`).
+from std.format import Writer, Writable
+
+# `Writer` is the sink side: a generic byte-accepting trait restricted to UTF-8
+# text. `Writable` is the source side: any type with `write_to(self, mut writer)`.
+# `print`, `FileHandle.write`, `FileDescriptor.write`, and `Logger.*` all accept
+# variadic `*Ts: Writable`, so passing a `t"..."` template or any Writable
+# struct directly is the no-allocation path.
+
+# Stream a value without building an intermediate String:
+print(t"x={x}, y={y}")                     # No alloc
+fh.write(t"line {n}: {payload}\n")         # No alloc
+
+# Build an owned String through the same trait surface:
+var buf = String(t"x={x}, y={y}")          # Single alloc, sized in advance
+buf.write(", more=", more)                 # In-place append - any Writables
+
+# String itself is BOTH `Writable` and `Writer`, which is what makes
+# `String(t"...")` and t-string composition allocation-free at the boundary.
 ```
 
 ## 11. Iterators
@@ -1956,8 +2292,8 @@ zip(ref iterable_a, ref iterable_b)
 map[IterableType, ResultType, function](ref iterable)
 
 # Extras
-from iter import peekable
-from itertools import count, repeat, product, cycle, take_while, drop_while
+from std.iter import peekable
+from std.itertools import count, repeat, product, cycle, take_while, drop_while
 
 cycle(iterable)                            # Cycles through elements indefinitely
 take_while[predicate](iterable)            # Yields while predicate returns True
@@ -1966,7 +2302,7 @@ peekable(iterator)                         # Peek at next element without advanc
 ```
 
 ```mojo
-from iter import Iterator, StopIteration
+from std.iter import Iterator, StopIteration
 
 # Iterator protocol:
 # - implement __next__ that raises StopIteration
@@ -2023,8 +2359,10 @@ pi=3.14159265, tau=6.28318531, e=2.71828182, log2e=1.44269504
 ## 14. Random
 
 ```mojo
-from random import Random, NormalRandom  # Philox-based RNG
+from std.random import Random, NormalRandom  # Philox-based RNG
 
+# Default seed for Random / NormalRandom is 0x3D30F19CD101 (matches PyTorch's
+# at::Philox4_32_10). Pass `seed=0` explicitly if you need the prior behavior.
 rng = Random[rounds=10](seed=0, subsequence=0, offset=0)
 val = rng.step() | step_uniform()
 
@@ -2131,11 +2469,12 @@ comptime assert TypeList[Trait=AnyType, Int, String]().contains[Int]
 ## 21. Compilation
 
 ```mojo
-from compile import compile_info, get_linkage_name, get_type_name
+from std.compile import compile_info
+from std.reflection import reflect, reflect_fn
 
 info = compile_info[func, emission_kind="asm"|"llvm"|"llvm-opt"|"object"]()
-get_linkage_name[func]()
-get_type_name[type]()
+reflect_fn[func].linkage_name()            # Mangled symbol name
+reflect[T].name()                          # Fully-qualified type name
 
 # comptime assert (compile-time assertion)
 comptime assert condition, "message"
@@ -2143,58 +2482,47 @@ comptime assert condition, "message"
 
 ### Reflection
 
+`reflect[T]` is a comptime alias for the reflection handle `Reflected[T]`. Call its `@staticmethod`s with no trailing parens after `[T]` — `reflect[T].method()`. Auto-imported via the prelude.
+
 ```mojo
-from compile import get_type_name
-from reflection import (
-    # Struct field introspection
-    struct_field_count,
-    struct_field_names,
-    struct_field_types,
-    struct_field_index_by_name,
-    struct_field_type_by_name,
-    # Field byte offsets
-    offset_of,
-    # Type introspection
-    is_struct_type,
-    get_base_type_name,
-    # Source location
-    source_location, call_location, SourceLocation,
-)
+from std.reflection import reflect, reflect_fn, source_location, call_location, SourceLocation
 
 @fieldwise_init
-struct Point(Copyable):
+struct Point(Copyable, ImplicitlyCopyable):
     var x: Float32
     var y: Float32
 
 def print_fields[T: AnyType]():
-    comptime names = struct_field_names[T]()
-    comptime types = struct_field_types[T]()
-    comptime
-    for i in range(struct_field_count[T]()):
-        print(names[i], get_type_name[types[i]]())
+    comptime names = reflect[T].field_names()
+    comptime for i in range(reflect[T].field_count()):
+        print(names[i], reflect[T].field_types()[i].name())
 
 def main():
     print_fields[Point]()
-    comptime idx = struct_field_index_by_name[Point, "x"]()
-    comptime field_type = struct_field_type_by_name[Point, "y"]()
+    comptime idx = reflect[Point].field_index["x"]()         # 0
+    comptime y_handle = reflect[Point].field_type["y"]       # Reflected[Float32]
     print(idx)
-    print(get_type_name[field_type.T]())
+    print(y_handle.name())                                   # "SIMD[DType.float32, 1]"
 
-# Field access by index (returns reference, works with non-copyable types)
+# Field access by index — returns a reference; works with non-copyable types
 def print_all_fields[T: AnyType](ref s: T):
-    comptime names = struct_field_names[T]()
-    comptime
-    for i in range(struct_field_count[T]()):
-        print(names[i], "=", __struct_field_ref(i, s))
+    comptime names = reflect[T].field_names()
+    comptime for i in range(reflect[T].field_count()):
+        print(names[i], "=", reflect[T].field_ref[i](s))
 
 # Field byte offsets
-comptime x_off = offset_of[Point, name="x"]()    # 0
-comptime y_off = offset_of[Point, name="y"]()    # Aligned offset
-comptime off_by_idx = offset_of[Point, index=0]() # By field index
+comptime x_off = reflect[Point].field_offset[name="x"]()     # 0
+comptime y_off = reflect[Point].field_offset[name="y"]()     # Aligned offset
+comptime off_by_idx = reflect[Point].field_offset[index=0]() # By field index
 
 # Type introspection
-is_struct_type[Int]()                      # True for Mojo struct types
-get_base_type_name[List[Int]]()            # Returns "List"
+reflect[Int].is_struct()                                     # True for Mojo struct types
+reflect[List[Int]].base_name()                               # "List"
+
+# Function-side reflection
+def some_fn(x: Int) -> Int: return x + 1
+print(reflect_fn[some_fn].display_name())                    # "some_fn"
+print(reflect_fn[some_fn].linkage_name())                    # mangled symbol
 
 # Source location
 var loc = source_location()
@@ -2206,12 +2534,12 @@ def log_here():
     var caller_loc = call_location()       # Location where caller was invoked
     print("Called from:", caller_loc)
 
-# Trait conformance checking on dynamically obtained types
-comptime
-for i in range(struct_field_count[MyStruct]()):
-    comptime field_type = struct_field_types[MyStruct]()[i]
-    comptime
-    if conforms_to(field_type, Copyable):
+# Trait refinement on reflected field types — inside the conforms_to-guarded
+# `comptime if` branch the compiler narrows the field type to the trait, so
+# trait members are reachable directly.
+comptime for i in range(reflect[MyStruct].field_count()):
+    comptime FT = reflect[MyStruct].field_types()[i]
+    comptime if conforms_to(FT, Copyable):
         print("Field", i, "is Copyable")
 ```
 
@@ -2232,7 +2560,7 @@ async def caller():
 
 ### Runtime AsyncRT
 ```mojo
-from runtime.asyncrt import Task, TaskGroup, create_task, parallelism_level
+from std.runtime.asyncrt import Task, TaskGroup, create_task, parallelism_level
 
 # Task - Scheduled async execution
 var task: Task[Int, {}]

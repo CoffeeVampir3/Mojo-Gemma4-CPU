@@ -17,7 +17,6 @@ end
 
 set BINARY (string replace -r '\.mojo$' '' (basename $TARGET))
 
-# ---- perf events --------------------------------------------------------
 # Note: SPR has 8 GP PMCs + fixed counters. This list exceeds that, so
 # perf will multiplex — check the [%] column in the output. Ratios among
 # events with similar [%] coverage are still meaningful; ratios across
@@ -50,7 +49,6 @@ set -a PERF_EVENTS mem_load_l3_miss_retired.remote_fwd mem_load_l3_miss_retired.
 # NUMA: broader off-core view — catches stores (RFOs) and HW prefetches
 set -a PERF_EVENTS ocr.reads_to_core.local_dram ocr.reads_to_core.remote_dram
 set PERF_EVENTS_CSV (string join , $PERF_EVENTS)
-# -------------------------------------------------------------------------
 
 rsync -av \
     --exclude='.*' \

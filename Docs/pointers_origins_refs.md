@@ -138,8 +138,8 @@ When the function declares an argument as `var`, it has unique mutable access. B
 
 You shouldn't conflate "ownership transfer" with a "move operation"—these aren't strictly the same. There are multiple ways Mojo transfers ownership:
 
-- If a type implements the move constructor, `__init__(take=)`, Mojo may invoke this method when a value is transferred into a function as a `var` argument and the original variable's lifetime ends at the same point.
-- In some cases, Mojo optimizes away the move operation entirely, leaving the value in the same memory location but updating its ownership. In these cases, a value transfers without invoking either the copy or move constructors.
+- If a type implements a take constructor `__init__(out self, *, deinit take: Self)`, Mojo may invoke it when a value is transferred into a function as a `var` argument and the original variable's lifetime ends at the same point.
+- In some cases, Mojo optimizes the take entirely away, leaving the value in the same memory location but updating its ownership. In these cases, a value transfers without invoking either the copy or take constructors.
 
 For the `var` convention to work without the transfer sigil, the value type must be copyable (via `__init__(out self, *, copy: Self)`).
 
@@ -244,6 +244,20 @@ The union of two or more origins creates a new origin that references all of the
 
 An origin union is mutable if and only if all of its constituent origins are mutable.
 
+A reference whose origin is a subset of a wider union implicitly widens to that union, so branches that produce references with different but compatible origins can be combined into a single return type:
+
+```mojo
+def widen_origins(
+    a: String, b: String, c: Bool
+) -> Pointer[String, origin_of(a, b)]:
+    if c:
+        return Pointer(to=a)   # Pointer[String, origin_of(a)]
+    else:
+        return Pointer(to=b)   # Pointer[String, origin_of(b)]
+```
+
+Each branch produces a `Pointer` over a single argument's origin; both widen to the declared `origin_of(a, b)` return type without an explicit conversion.
+
 #### Inferred origins
 
 Since origins are parameters, the compiler can infer an origin value from the argument passed to a function or method. This allows a function to return a value that has the same origin as the argument passed to it.
@@ -254,7 +268,7 @@ Since origins are parameters, the compiler can infer an origin value from the ar
 
 #### Wildcard origins
 
-`ImmutAnyOrigin` and `MutAnyOrigin` are special cases indicating a reference that might access any live value. These were previously widely used for unsafe pointers. Using a pointer with a wildcard origin into a scope effectively disables Mojo's ASAP destruction for any values in that scope, as long as the pointer is live. The use of wildcard origins is discouraged, and should be used as a last resort.
+`ImmutAnyOrigin` and `MutAnyOrigin` are special cases indicating a reference that might access any live value. Using a pointer with a wildcard origin into a scope effectively disables Mojo's ASAP destruction for any values in that scope, as long as the pointer is live. Wildcard origins are a last resort — prefer a concrete origin parameter wherever you can express one.
 
 ### `ref` arguments
 
@@ -374,6 +388,23 @@ def pick_one(cond: Bool, ref a: String, ref b: String) -> ref[a, b] String:
 
 Because the compiler can't statically determine which branch will be picked, this function must use the union origin `[a, b]`. This ensures the compiler extends the lifetime of both values as long as the returned reference is live. The returned reference is mutable if both `a` and `b` are mutable.
 
+### Parameterized `out`
+
+A type can parameterize the address space of its `out` self, letting a constructor be bound at the call site for any (or a specific) address space:
+
+```mojo
+struct MemType(Movable):
+    # Constructable into any address space.
+    def __init__[addr_space: AddressSpace](out[addr_space] self):
+        ...
+
+    # Only constructable into AddressSpace.GLOBAL.
+    def __init__(arg: Int, out[AddressSpace.GLOBAL] self):
+        ...
+```
+
+This is how a type expresses that some constructors are address-space-polymorphic while others are pinned to a single space (for example, global memory only).
+
 ## Pointers
 
 A pointer is an indirect reference to one or more values stored in memory. The pointer is a value that holds an address to memory, and provides APIs to store and retrieve values to that memory. The value pointed to by a pointer is also known as a pointee.
@@ -455,7 +486,7 @@ o_ptr = OwnedPointer(some_big_struct)
 
 An owned pointer can hold almost any type of item, but when constructing an `OwnedPointer`, the stored item must be either `Movable` or `Copyable`. Since `OwnedPointer` is designed to enforce single ownership, the pointer itself can be moved, but not copied.
 
-> **Note:** Currently, you can't create an `Optional[OwnedPointer[T]]` because the `Optional` type only works with types that are both movable and copyable. This restricts some use cases that would otherwise be a natural fit for `OwnedPointer`, including self-referential data structures like linked lists and trees. (Until this use case is supported for `OwnedPointer`, it's possible to use `ArcPointer` where you need a smart pointer that can be `Optional`.)
+Self-referential structures like linked lists and trees that need an "absent" state can spell it as `Optional[OwnedPointer[T]]`. The `Optional` is `None` when the slot is empty and holds a moved-in `OwnedPointer` when populated.
 
 ### `ArcPointer`
 
@@ -498,7 +529,7 @@ def main():
     print(thing2["Flip"])
 ```
 
-> **Note:** The reference count is stored using an `Atomic` value to ensure that updates to the reference count are thread-safe. However, Mojo doesn't currently enforce exclusive access across thread boundaries, so it's possible to form race conditions.
+The reference count is stored using an `Atomic` value, so updates to the count itself are thread-safe. Mojo does not enforce argument exclusivity across thread boundaries, so user code is responsible for synchronizing access to the *referenced value*.
 
 ### `UnsafePointer`
 

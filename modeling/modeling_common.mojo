@@ -38,7 +38,6 @@ struct ArenaLayout(Copyable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Repeated[T: ImplicitlyCopyable](Copyable, ImplicitlyCopyable):
-    """Repeated topology: proto identity + off/stride/count placement."""
     var proto: Self.T
     var off: Int
     var stride: Int

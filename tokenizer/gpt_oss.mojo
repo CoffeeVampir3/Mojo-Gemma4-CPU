@@ -30,11 +30,6 @@ from .unicode_case_props import (
 )
 
 
-# =============================================================================
-# Case classification
-# =============================================================================
-
-
 struct CaseContext(TrivialRegisterPassable):
     def __init__(out self):
         pass
@@ -93,11 +88,6 @@ def is_letter_or_mark_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
     return is_unicode_letter_cp(cp, ctx) or is_unicode_mark_cp(cp, ctx)
 
 
-# =============================================================================
-# Prefix and contraction matching
-# =============================================================================
-
-
 @always_inline
 def is_prefix_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
     """Matches [^\\r\\n\\p{L}\\p{N}] — not newline, not letter, not number."""
@@ -122,11 +112,6 @@ def is_newline_or_slash_byte(b: Byte) -> Bool:
 
 def try_contraction_ci(data: Span[Byte, _], pos: Int, n: Int) -> Int:
     return try_contraction_at[case_insensitive=True, accept_unicode_quote=True](data, pos, n)
-
-
-# =============================================================================
-# Core matching: try each alternative at a position
-# =============================================================================
 
 
 def try_match_letter_alts(
@@ -344,11 +329,6 @@ def try_match_at(
         return m
 
     return -1
-
-
-# =============================================================================
-# Pre-tokenizer
-# =============================================================================
 
 
 def pre_tokenize_gpt_oss(text: String) -> List[String]:

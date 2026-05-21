@@ -61,15 +61,13 @@ def reference_gemm[rows: Int, cols: Int](
 
 
 def assert_close(
-    got: Float32, exp: Float32, label: String, abs_floor: Float32 = 0.5,
+    got: Float32, exp: Float32, label: StringSlice, abs_floor: Float32 = 0.5,
 ):
     var diff = abs(got - exp)
     var tol = abs(exp) * Float32(0.02)
     if abs_floor > tol:
         tol = abs_floor
-    check(diff <= tol,
-        label + " got=" + String(got) + " exp=" + String(exp)
-        + " diff=" + String(diff) + " tol=" + String(tol))
+    check(diff <= tol, String(t"{label} got={got} exp={exp} diff={diff} tol={tol}"))
 
 
 def run_gemm_case[rows: Int, cols: Int, MR: Int](m: Int, label: String):
@@ -101,7 +99,7 @@ def run_gemm_case[rows: Int, cols: Int, MR: Int](m: Int, label: String):
     if m == 0:
         for i in range(alloc_m * rows):
             check(Float32(got[i]) == Float32(0.0),
-                label + " m=0 must not write outputs")
+                String(t"{label} m=0 must not write outputs"))
     else:
         reference_gemm[rows, cols](x, w, expected, m)
         for tok in range(m):
@@ -109,7 +107,7 @@ def run_gemm_case[rows: Int, cols: Int, MR: Int](m: Int, label: String):
                 assert_close(
                     Float32(got[tok * rows + n]),
                     Float32(expected[tok * rows + n]),
-                    label + " tok=" + String(tok) + " n=" + String(n))
+                    String(t"{label} tok={tok} n={n}"))
 
     x.free(); w.free(); got.free(); expected.free()
 

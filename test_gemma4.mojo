@@ -52,7 +52,7 @@ def load_and_run[
         return
     var model = model_opt.take()
     var load_ms = (perf_counter_ns() - t0) / 1_000_000
-    print("model loaded in", load_ms, "ms")
+    print(t"model loaded in {load_ms} ms")
     print()
 
     var prompt_len = len(token_ids)
@@ -83,7 +83,8 @@ def load_and_run[
     for i in range(5):
         var id_list = List[Int]()
         id_list.append(top_ids[i])
-        print(" ", i, "id=", top_ids[i], "val=", top_vals[i], "tok=", repr(tok.decode(id_list)))
+        var decoded_repr = repr(tok.decode(id_list))
+        print(t"  {i} id={top_ids[i]} val={top_vals[i]} tok={decoded_repr}")
 
     var result = greedy_argmax[degree](logits)
     var next_id = result[0]
@@ -92,12 +93,8 @@ def load_and_run[
     var generated = List[Int]()
     generated.append(next_id)
 
-    var prefill_tps = Float64(prompt_len) / (Float64(prefill_ms) / 1000.0)
-    print(
-        "prompt  |", prompt_len, "tokens |",
-        prefill_ms, "ms |",
-        Int(prefill_tps), "t/s",
-    )
+    var prefill_tps = Int(Float64(prompt_len) / (Float64(prefill_ms) / 1000.0))
+    print(t"prompt  | {prompt_len} tokens | {prefill_ms} ms | {prefill_tps} t/s")
 
     var pos = prompt_len
     var decode_start = perf_counter_ns()
@@ -119,12 +116,8 @@ def load_and_run[
 
     var decode_elapsed_ms = (perf_counter_ns() - decode_start) / 1_000_000
     var decode_tokens = len(generated) - 1
-    var decode_tps = Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0)
-    print(
-        "decode  |", decode_tokens, "tokens |",
-        decode_elapsed_ms, "ms |",
-        Int(decode_tps), "t/s",
-    )
+    var decode_tps = Int(Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0))
+    print(t"decode  | {decode_tokens} tokens | {decode_elapsed_ms} ms | {decode_tps} t/s")
 
     var all_ids = List[Int]()
     for i in range(len(token_ids)):
@@ -134,14 +127,15 @@ def load_and_run[
 
     var full_text = tok.decode(all_ids)
     print()
-    print("=== generated", len(generated), "tokens ===")
+    var n_generated = len(generated)
+    print(t"=== generated {n_generated} tokens ===")
     print(full_text)
 
 
 def main():
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:
-        print("failed to load tokenizer from", TOKENIZER_PATH)
+        print(t"failed to load tokenizer from {TOKENIZER_PATH}")
         return
     var tok = tok_opt.take()
 
@@ -255,16 +249,18 @@ Peter Kovesi, "Phase Preserving Tone Mapping of Non-Photographic High Dynamic Ra
     var encoded = tok.encode(prompt)
     for i in range(len(encoded)):
         token_ids.append(encoded[i])
-    print("prompt:", repr(prompt))
-    print("tokens:", len(token_ids), "ids:", end="")
+    var prompt_repr = repr(prompt)
+    print(t"prompt: {prompt_repr}")
+    var n_tokens = len(token_ids)
+    print(t"tokens: {n_tokens} ids:", end="")
     for i in range(len(token_ids)):
         print("", token_ids[i], end="")
     print()
 
     var topo = NumaTopology()
-
-    print(String(topo.num_nodes()) + " NUMA nodes, "
-        + String(len(topo.isolated_cpus)) + " isolated cpus")
+    var nodes = topo.num_nodes()
+    var iso = len(topo.isolated_cpus)
+    print(t"{nodes} NUMA nodes, {iso} isolated cpus")
 
     @parameter
     def dispatch_gemma4_tp[

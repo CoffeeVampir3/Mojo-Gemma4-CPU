@@ -39,7 +39,7 @@ struct ScratchPhaseOrder[*names: StaticString](ScratchPhaseOrderLike):
     @staticmethod
     def index[name: StaticString]() -> Int:
         comptime for i in range(len(Self.names)):
-            comptime if String(Self.names[i]) == String(name):
+            comptime if Self.names[i] == name:
                 return i
         return -1
 
