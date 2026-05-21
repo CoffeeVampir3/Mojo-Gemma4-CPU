@@ -24,12 +24,12 @@ def parse_cpulist(cpulist: String) raises -> List[Int]:
     for part in parts:
         var dash_pos = part.find("-")
         if dash_pos >= 0:
-            var start = atol(String(part[byte=:dash_pos]))
-            var end = atol(String(part[byte=dash_pos + 1:]))
+            var start = atol(part[byte=:dash_pos])
+            var end = atol(part[byte=dash_pos + 1:])
             for cpu in range(start, end + 1):
                 cpus.append(cpu)
         else:
-            cpus.append(atol(String(part)))
+            cpus.append(atol(part))
     return cpus^
 
 
@@ -66,7 +66,7 @@ def parse_distances(s: String) raises -> List[Int]:
     var parts = s.split(" ")
     for part in parts:
         if part.byte_length() > 0:
-            distances.append(atol(String(part)))
+            distances.append(atol(part))
     return distances^
 
 def parse_meminfo(path: String, field: String) raises -> Int:
@@ -280,16 +280,17 @@ struct NumaTopology(Movable, Sized):
         return self.nodes[i].distances[j]
 
     def print_debug(self):
-        print("NUMA Topology:", self.num_nodes(), "nodes, tp =", len(self))
+        print(t"NUMA Topology: {self.num_nodes()} nodes, tp = {len(self)}")
         print()
         for i in range(self.num_nodes()):
-            print("Node", self.nodes[i].id, ":", len(self.nodes[i].cpu_ids), "cpus,",
-                  self.nodes[i].mem_total_kb // 1024, "MB total,",
-                  self.nodes[i].mem_free_kb // 1024, "MB free")
+            ref n = self.nodes[i]
+            print(t"Node {n.id}: {len(n.cpu_ids)} cpus, "
+                  t"{n.mem_total_kb // 1024} MB total, "
+                  t"{n.mem_free_kb // 1024} MB free")
         print()
         print("Ring order (rank -> node):")
         for r in range(len(self)):
-            print("  rank", r, "-> node", self.rank_to_node[r])
+            print(t"  rank {r} -> node {self.rank_to_node[r]}")
         print()
         print("Distance matrix:")
         for i in range(self.num_nodes()):

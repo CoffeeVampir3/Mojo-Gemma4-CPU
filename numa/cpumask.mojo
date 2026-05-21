@@ -41,13 +41,7 @@ struct CpuMask[size: Int = 128](Copyable, TrivialRegisterPassable):
         self.bytes = SIMD[DType.uint8, Self.size](UInt8(0xFF))
 
     def count(ref self) -> Int:
-        var total = 0
-        for i in range(Self.size):
-            var b = self.bytes[i]
-            while b != UInt8(0):
-                total += Int(b & UInt8(1))
-                b >>= 1
-        return total
+        return self.bytes.reduce_bit_count()
 
     @always_inline
     def unsafe_address(ref self) -> Int:
