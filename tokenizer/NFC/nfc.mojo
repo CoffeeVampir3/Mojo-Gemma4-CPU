@@ -154,22 +154,10 @@ def compose(var cps: List[UInt32]) -> List[UInt32]:
 
 
 def encode_utf8(cp: UInt32, mut out: List[Byte]):
-    if cp < UInt32(0x80):
-        out.append(Byte(cp))
-        return
-    if cp < UInt32(0x800):
-        out.append(Byte(UInt32(0xC0) | (cp >> UInt32(6))))
-        out.append(Byte(UInt32(0x80) | (cp & UInt32(0x3F))))
-        return
-    if cp < UInt32(0x10000):
-        out.append(Byte(UInt32(0xE0) | (cp >> UInt32(12))))
-        out.append(Byte(UInt32(0x80) | ((cp >> UInt32(6)) & UInt32(0x3F))))
-        out.append(Byte(UInt32(0x80) | (cp & UInt32(0x3F))))
-        return
-    out.append(Byte(UInt32(0xF0) | (cp >> UInt32(18))))
-    out.append(Byte(UInt32(0x80) | ((cp >> UInt32(12)) & UInt32(0x3F))))
-    out.append(Byte(UInt32(0x80) | ((cp >> UInt32(6)) & UInt32(0x3F))))
-    out.append(Byte(UInt32(0x80) | (cp & UInt32(0x3F))))
+    var codepoint = Codepoint(unsafe_unchecked_codepoint=cp)
+    var base = len(out)
+    out.resize(unsafe_uninit_length=base + codepoint.utf8_byte_length())
+    _ = codepoint.unsafe_write_utf8[True](out.unsafe_ptr() + base)
 
 
 @always_inline

@@ -1,5 +1,6 @@
 from std.collections import Dict, Set
 from std.memory import Span
+from std.math import iota
 
 from .unicode_props import (
     LETTER_RANGES,
@@ -35,11 +36,10 @@ def bytes_to_gpt2(data: Span[Byte, _]) -> String:
     var cp_table = materialize[BYTE_TO_CODEPOINT]()
     var out = List[Byte]()
     out.reserve(len(data) * 2)
-    for i in range(len(data)):
-        var cp = Codepoint(unsafe_unchecked_codepoint=UInt32(cp_table[Int(data[i])]))
-        var needed = cp.utf8_byte_length()
+    for b in data:
+        var cp = Codepoint(unsafe_unchecked_codepoint=UInt32(cp_table[Int(b)]))
         var base = len(out)
-        out.resize(unsafe_uninit_length=base + needed)
+        out.resize(unsafe_uninit_length=base + cp.utf8_byte_length())
         _ = cp.unsafe_write_utf8[True](out.unsafe_ptr() + base)
     return String(unsafe_from_utf8=Span(out))
 
@@ -249,7 +249,7 @@ def is_whitespace_start_at(data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeCo
 
 @always_inline
 def span_to_string(data: Span[Byte, _], start: Int, end: Int) -> String:
-    return String(unsafe_from_utf8=Span[Byte, _](ptr=data.unsafe_ptr() + start, length=end - start))
+    return String(unsafe_from_utf8=data.unsafe_subspan(offset=start, length=end - start))
 
 
 comptime PRETOKENIZE_SIMD_WIDTH = 16
@@ -285,9 +285,11 @@ def skip_while_matching[
         if all(mask):
             i += width
             continue
-        comptime for lane in range(width):
-            if not mask[lane]:
-                return i + lane
+        var positions = (~mask).select(
+            iota[DType.int32, width](),
+            SIMD[DType.int32, width](width),
+        )
+        return i + Int(positions.reduce_min())
     while i < n and scalar_pred(data[i]):
         i += 1
     return i

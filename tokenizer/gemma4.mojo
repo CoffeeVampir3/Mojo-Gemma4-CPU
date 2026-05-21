@@ -58,15 +58,14 @@ def pre_tokenize_gemma4(text: String) -> List[String]:
         return result^
 
     var data = text.as_bytes()
-    var n = len(data)
-    var buf = List[Byte]()
-    for i in range(n):
-        if data[i] == ASCII_SPACE:
+    var buf = List[Byte](capacity=len(data))
+    for b in data:
+        if b == ASCII_SPACE:
             buf.append(Byte(0xE2))
             buf.append(Byte(0x96))
             buf.append(Byte(0x81))
         else:
-            buf.append(data[i])
+            buf.append(b)
     result.append(String(unsafe_from_utf8=Span(buf)))
     return result^
 
