@@ -1,6 +1,6 @@
 from std.collections import Dict
 from std.memory import Span, UnsafePointer
-from std.bit import count_trailing_zeros
+from std.math import iota
 
 comptime QUOTE = Byte(34)
 comptime BACKSLASH = Byte(92)
@@ -71,6 +71,9 @@ struct ParseError(Copyable, Writable):
     var message: String
     var pos: Int
 
+    def write_to(self, mut writer: Some[Writer]):
+        t"ParseError: {self.message} at position {self.pos}".write_to(writer)
+
 @always_inline
 def is_whitespace(b: Byte) -> Bool:
     return (materialize[CHAR_CLASS]()[Int(b)] & CHAR_WHITESPACE) != 0
@@ -97,13 +100,14 @@ def simd_string_stop[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]
 
 @always_inline
 def first_true_index[w: Int](mask: SIMD[DType.bool, w]) -> Int:
-    comptime assert w > 0 and w <= 64, "first_true_index requires 1 <= width <= 64"
-    var packed: UInt64 = 0
-    comptime for i in range(w):
-        packed |= UInt64(mask[i]) << UInt64(i)
-    if packed == 0:
+    comptime assert w > 0, "first_true_index requires positive width"
+    if not any(mask):
         return w
-    return Int(count_trailing_zeros(packed))
+    var positions = mask.select(
+        iota[DType.int32, w](),
+        SIMD[DType.int32, w](w),
+    )
+    return Int(positions.reduce_min())
 
 @always_inline
 def append_block_prefix[w: Int](
@@ -111,9 +115,10 @@ def append_block_prefix[w: Int](
     block: SIMD[DType.uint8, w],
     count: Int,
 ):
-    comptime for i in range(w):
-        if i < count:
-            out.append(block[i])
+    var base = len(out)
+    out.reserve(base + w)
+    (out.unsafe_ptr() + base).store(block)
+    out.resize(unsafe_uninit_length=base + count)
 
 @always_inline
 def hex_value(b: Byte) -> Int:
@@ -289,11 +294,8 @@ struct Parser[origin: Origin, simd_width: Int = 16, max_depth: Int = 256]:
                 self.pos += idx
             var b = self.advance()
             if b == QUOTE:
-                if len(out_bytes) == 0:
-                    return String("")
-                var out_ptr = out_bytes.unsafe_ptr()
                 try:
-                    return String(from_utf8=Span[Byte, _](ptr=out_ptr, length=len(out_bytes)))
+                    return String(from_utf8=Span(out_bytes))
                 except:
                     raise ParseError("invalid UTF-8 in string", self.pos)
             if b == BACKSLASH:
