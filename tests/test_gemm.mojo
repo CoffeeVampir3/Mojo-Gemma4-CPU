@@ -3,7 +3,6 @@ from std.os import abort
 
 from kernels.gemm import dispatch_gemm
 from kernels.helpers import Binding, ArenaBases
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
@@ -83,8 +82,8 @@ def run_gemm_case[rows: Int, cols: Int, MR: Int](m: Int, label: String):
         got[i] = BFloat16(0.0)
         expected[i] = BFloat16(0.0)
 
-    var pools = HeapMoveArray[TestPool](1)
-    pools.push(TestPool(4, 0))
+    var pools = List[TestPool](capacity=1)
+    pools.append(TestPool(4, 0))
     var bases = ArenaBases[1].uninitialized()
     bases[0] = 0
 

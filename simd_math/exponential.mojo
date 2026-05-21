@@ -88,7 +88,7 @@ comptime EXP_MINIMAX_BIASED = sollya_never_overshoot_exp_coeffs_biased()
 
 # Error profile — max relative error, sweep x ∈ [-10, 10], default flags.
 # Expect similar relative ULP profile with undershoot but with bias.
-# Reproduce / regression-asserted in simd_math/tests/test_exp.mojo.
+# Reproduce / regression-asserted in tests/test_exp.mojo.
 #   polynomial_degree=2: rel ≈ 2.3e-3   (~0.30 bf16 ULP / ~2.4 f16 ULPs)
 #                        loss-free for bf16; visible at f16.
 #   polynomial_degree=3: rel ≈ 4.3e-4   (~0.44 f16 ULP)

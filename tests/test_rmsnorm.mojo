@@ -8,7 +8,6 @@ from kernels.rmsnorm import (
 )
 from kernels.helpers import Binding, ArenaBases
 from simd_math.ops import sqrt
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
@@ -95,8 +94,8 @@ def check_rms_norm_seq(count: Int):
         rms_norm_row[HIDDEN, SQRT_N, N_EPS](
             src_any + off, expected_any + off, weight_any)
 
-    var pools = HeapMoveArray[TestPool](1)
-    pools.push(TestPool(4, 0))
+    var pools = List[TestPool](capacity=1)
+    pools.append(TestPool(4, 0))
     var bases = ArenaBases[1].uninitialized()
     bases[0] = 0
     dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=1](
@@ -137,8 +136,8 @@ def check_fused_norm_residual_add_seq(count: Int):
             src_any + off, residual_any + off, expected_any + off,
             weight_any)
 
-    var pools = HeapMoveArray[TestPool](1)
-    pools.push(TestPool(4, 0))
+    var pools = List[TestPool](capacity=1)
+    pools.append(TestPool(4, 0))
     var bases = ArenaBases[1].uninitialized()
     bases[0] = 0
     fused_norm_residual_add[

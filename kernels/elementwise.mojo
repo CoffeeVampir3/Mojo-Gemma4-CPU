@@ -1,6 +1,5 @@
 from std.algorithm import vectorize
 
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
@@ -54,7 +53,7 @@ def dispatch_gelu_gate_up[
     up: Binding[BFloat16, tp],
     dst: Binding[BFloat16, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = GeluGateUpTokenKernel[intermediate]
 
@@ -107,7 +106,7 @@ def dispatch_scalar_mul[
     dst: Binding[BFloat16, tp],
     scalar: Float32,
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = ScalarMulTokenKernel[hidden]
 

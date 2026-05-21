@@ -5,7 +5,6 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from notstdcollections import HeapMoveArray
 from kernels.helpers import Binding, ArenaBases
 from kernels.rope import (
     rope_head, dispatch_rope_cache_write,
@@ -47,7 +46,7 @@ def arena_alloc[dtype: DType](
 
 
 def arena_bases[tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ) -> ArenaBases[tp]:
     var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
@@ -56,7 +55,7 @@ def arena_bases[tp: Int](
 
 
 def arena_alloc_all[dtype: DType, tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
     for r in range(tp):
@@ -173,7 +172,7 @@ def section_token_scaling(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr):
 def section_sliding_cache_write[
     P: BurstThreadPool, //, tp: Int,
 ](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     q: BF16Ptr, k_src: BF16Ptr, v_src: BF16Ptr,
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_sl: F32Ptr, sin_sl: F32Ptr,
@@ -224,7 +223,7 @@ def section_sliding_cache_write[
 def section_full_cache_write[
     P: BurstThreadPool, //, tp: Int,
 ](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     q: BF16Ptr, k_src: BF16Ptr, v_src: BF16Ptr,
     k_cache: BF16Ptr, v_cache: BF16Ptr,
     cos_fl: F32Ptr, sin_fl: F32Ptr,
@@ -279,7 +278,7 @@ def section_full_cache_write[
 
 
 def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     sliding_q: BF16Ptr, sliding_k: BF16Ptr, sliding_v: BF16Ptr,
     sliding_k_cache: BF16Ptr, sliding_v_cache: BF16Ptr,
     full_q: BF16Ptr, full_k: BF16Ptr, full_v: BF16Ptr,
@@ -298,8 +297,8 @@ def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
     comptime MAX_SEQ = 128
     comptime MAX_HEADS = 16
@@ -376,9 +375,9 @@ def main():
     print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
-    var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
+    var arenas = List[NumaArena[alignment=ALIGNMENT]](capacity=tp)
     for i in range(tp):
-        arenas.push(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
+        arenas.append(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
         if not arenas[i]:
             print("arena alloc failed on node", topo[i])
             return
@@ -386,7 +385,7 @@ def main():
     @parameter
     def dispatch_rope_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[

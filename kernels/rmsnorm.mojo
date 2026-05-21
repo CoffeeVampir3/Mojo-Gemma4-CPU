@@ -2,7 +2,6 @@ from std.algorithm import vectorize
 
 from simd_math.ops import sqrt
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     Chain, RangePartitionedKernel,
     fanout_dispatch, saturate_workers,
@@ -123,7 +122,7 @@ def dispatch_rms_norm[
     dst: Binding[BFloat16, tp],
     weight: Binding[BFloat16, tp],
     count: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled]
 
@@ -176,7 +175,7 @@ def dispatch_rms_norm_qkv_heads[
     q_weight: Binding[BFloat16, tp],
     k_weight: Binding[BFloat16, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     if seq_len <= 0:
         return
@@ -216,7 +215,7 @@ def fused_norm_residual_add[
     dst: Binding[BFloat16, tp],
     weight: Binding[BFloat16, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = NormResidualAddTokenKernel[hidden, sqrt_n, n_eps]
 

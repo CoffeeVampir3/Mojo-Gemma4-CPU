@@ -5,7 +5,6 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from notstdcollections import HeapMoveArray
 from kernels.attention_dispatch_kernels import (
     dispatch_sliding_attention, dispatch_full_attention,
 )
@@ -50,7 +49,7 @@ comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 def arena_bases[tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ) -> ArenaBases[tp]:
     var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
@@ -69,7 +68,7 @@ def arena_alloc[dtype: DType](
 
 
 def arena_alloc_all[dtype: DType, tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
     for r in range(tp):
@@ -92,7 +91,7 @@ def fill_pattern_all[tp: Int](
 
 
 def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     q: Binding[BFloat16, tp],
     k_cache: Binding[BFloat16, tp],
     v_cache: Binding[BFloat16, tp],
@@ -161,7 +160,7 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
 
 
 def section_full_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     q: Binding[BFloat16, tp],
     k_cache: Binding[BFloat16, tp],
     v_cache: Binding[BFloat16, tp],
@@ -232,7 +231,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
 
 
 def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     q: Binding[BFloat16, tp],
     k_cache: Binding[BFloat16, tp],
     v_cache: Binding[BFloat16, tp],
@@ -266,7 +265,7 @@ def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
 
 
 def section_validation_full[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     q: Binding[BFloat16, tp],
     k_cache: Binding[BFloat16, tp],
     v_cache: Binding[BFloat16, tp],
@@ -331,8 +330,8 @@ def section_validation_full[P: BurstThreadPool, //, tp: Int](
 
 
 def run_sliding[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
     var bases = arena_bases[tp](arenas)
 
@@ -373,8 +372,8 @@ def run_sliding[P: BurstThreadPool, //, tp: Int](
 
 
 def run_full[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
     comptime LOCAL_NUM_Q = FULL_NUM_Q // tp
     var bases = arena_bases[tp](arenas)
@@ -417,9 +416,9 @@ def run_full[P: BurstThreadPool, //, tp: Int](
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
-    var pools: HeapMoveArray[P],
-    mut arenas_sliding: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
-    mut arenas_full: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    var pools: List[P],
+    mut arenas_sliding: List[NumaArena[alignment=ALIGNMENT]],
+    mut arenas_full: List[NumaArena[alignment=ALIGNMENT]],
 ):
     var cap = pools[0].get_capacity()
     print(t"pool capacity: {cap} workers")
@@ -436,17 +435,17 @@ def main():
     print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 512 * 1024 * 1024
-    var arenas_sliding = HeapMoveArray[
+    var arenas_sliding = List[
         NumaArena[alignment=ALIGNMENT]](tp)
-    var arenas_full = HeapMoveArray[
+    var arenas_full = List[
         NumaArena[alignment=ALIGNMENT]](tp)
     for i in range(tp):
-        arenas_sliding.push(
+        arenas_sliding.append(
             NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
         if not arenas_sliding[i]:
             print("arena alloc failed on node", topo[i])
             return
-        arenas_full.push(
+        arenas_full.append(
             NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
         if not arenas_full[i]:
             print("arena alloc failed on node", topo[i])
@@ -455,7 +454,7 @@ def main():
     @parameter
     def dispatch_flash_prefill_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         run_all[tp=degree](
             selected_pools^, arenas_sliding, arenas_full)
 

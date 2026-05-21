@@ -145,7 +145,7 @@ struct SinCosResult[width: Int = 1]:
 
 # Error profile — max absolute error (sin/cos bounded by 1, abs ≈ rel near peak).
 # Sweep θ ∈ [-π, π], 2^18 samples, default flags. Reproduce / asserted in
-# simd_math/tests/test_sincos.mojo.
+# tests/test_sincos.mojo.
 #
 # Sincos is f64-native; the parametric range buys you precision tiers from
 # the existing N=4 (~1e-6) all the way to f64 ULP at N=8.

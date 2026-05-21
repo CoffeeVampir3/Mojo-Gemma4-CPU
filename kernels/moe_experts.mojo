@@ -1,6 +1,5 @@
 from std.collections import InlineArray
 
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math.ops import gelu_tanh_f32
 from .helpers import (
@@ -164,7 +163,7 @@ def dispatch_phase1_gate_up[
     experts_gate_up: Binding[BFloat16, tp],
     gate_scratch: Binding[Float32, tp],
     hidden_bucket: Binding[BFloat16, tp],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = Phase1GateUpKernel[
         hidden, gate_up_fused, intermediate, experts_per_rank, tile_j, MR,
@@ -318,7 +317,7 @@ def dispatch_phase2_down[
     moe_accum: Binding[Float32, tp],
     moe_partial: Binding[BFloat16, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = Phase2DownKernel[hidden, intermediate, experts_per_rank]
     comptime hidden_strides = hidden // W

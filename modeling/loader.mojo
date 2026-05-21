@@ -4,7 +4,6 @@ from std.memory import UnsafePointer
 from modeling.model_spec import WeightDesc
 from safetensors.parser import parse_safetensors_header, SafetensorsHeader, TensorMeta
 from linux.io_uring import ReadOp, run_reads_multi
-from notstdcollections import HeapMoveArray
 from threading.burst_threading import BurstPool
 from numa import NumaTopology
 
@@ -148,7 +147,7 @@ struct LocatedTensor(Copyable):
 
 def find_tensor(
     name: String,
-    ref headers: HeapMoveArray[SafetensorsHeader],
+    ref headers: List[SafetensorsHeader],
 ) -> Optional[LocatedTensor]:
     for i in range(len(headers)):
         var meta_opt = headers[i].tensors.get(name)
@@ -159,7 +158,7 @@ def find_tensor(
 
 def resolve_and_emit(
     w: WeightDesc,
-    ref headers: HeapMoveArray[SafetensorsHeader],
+    ref headers: List[SafetensorsHeader],
     arena_bases: List[Int],
     ranks: List[Int],
     mut ops_per_rank: List[List[ReadOp[]]],
@@ -194,14 +193,14 @@ def load_weights_from_descs[
     topo: NumaTopology,
 ) -> Optional[LoadResult]:
     """Runtime variant — takes a prebuilt List[WeightDesc]."""
-    var headers = HeapMoveArray[SafetensorsHeader](len(paths))
+    var headers = List[SafetensorsHeader](capacity=len(paths))
     for i in range(len(paths)):
         var header_opt = parse_safetensors_header(paths[i])
         if not header_opt:
             var p = paths[i]
             print(t"failed to parse: {p}")
             return None
-        headers.push(header_opt.take())
+        headers.append(header_opt.take())
 
     var targeted_weights = List[WeightDesc]()
     var distributed_weights = List[WeightDesc]()
@@ -253,17 +252,17 @@ def run_load[
             total_ops += 1
 
     var tp = len(ops_per_rank)
-    var load_pools = HeapMoveArray[BurstPool[mask_size]](tp)
+    var load_pools = List[BurstPool[mask_size]](capacity=tp)
     for r in range(tp):
         var mask = topo.mask[mask_size](r)
-        load_pools.push(BurstPool[mask_size](
+        load_pools.append(BurstPool[mask_size](
             capacity=1, cpu_mask=mask, numa_node=topo.node(r)))
         if not load_pools[r]:
             print(t"load pool setup failed for rank {r}")
             return None
 
     var pools_span = Span[BurstPool[mask_size], MutAnyOrigin](
-        ptr=load_pools.ptr, length=len(load_pools))
+        ptr=load_pools.unsafe_ptr(), length=len(load_pools))
     run_reads_multi[io_depth, mask_size](pools_span, paths, ops_per_rank)
 
     return LoadResult(total_bytes, total_ops)

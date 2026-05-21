@@ -5,7 +5,6 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from notstdcollections import HeapMoveArray
 from kernels.attention_ops import flash_partial_stride
 from kernels.attention_dispatch_kernels import dispatch_full_attention
 from kernels.helpers import Binding, ArenaBases
@@ -33,7 +32,7 @@ comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
 def arena_bases[tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ) -> ArenaBases[tp]:
     var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
@@ -52,7 +51,7 @@ def arena_alloc[dtype: DType](
 
 
 def arena_alloc_all[dtype: DType, tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
     for r in range(tp):
@@ -75,7 +74,7 @@ def fill_pattern_all[tp: Int](
 
 
 def section_validation[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
+    mut pools: List[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
     output: BF16Ptr, partials: F32Ptr, bases: ArenaBases[tp],
 ):
     print("\n=== Validation (valid_len=64) ===")
@@ -109,7 +108,7 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
 
 
 def section_context_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
+    mut pools: List[P], q: BF16Ptr, k_cache: BF16Ptr, v_cache: BF16Ptr,
     output: BF16Ptr, partials: F32Ptr, bases: ArenaBases[tp],
 ):
     print("\n=== Context sweep (replicated Q + context-local attention + merge) ===")
@@ -166,8 +165,8 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
     var bases = arena_bases[tp](arenas)
     comptime LOCAL_NUM_Q = GLOBAL_NUM_Q // tp
@@ -207,9 +206,9 @@ def main():
     print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
-    var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
+    var arenas = List[NumaArena[alignment=ALIGNMENT]](capacity=tp)
     for i in range(tp):
-        arenas.push(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
+        arenas.append(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
         if not arenas[i]:
             print("arena alloc failed on node", topo[i])
             return
@@ -217,7 +216,7 @@ def main():
     @parameter
     def dispatch_full_attention_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[

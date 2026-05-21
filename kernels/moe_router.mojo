@@ -1,7 +1,6 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
 
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from simd_math import fast_exp_softmax_biased
 from simd_math.ops import sqrt
@@ -112,7 +111,7 @@ def dispatch_router_sharded[
     scaled_scratch: Binding[Float32, tp],
     cands_out: Binding[RouterCandidate, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = RouterShardedKernel[
         hidden, sqrt_n, n_eps, experts_per_rank, top_k,

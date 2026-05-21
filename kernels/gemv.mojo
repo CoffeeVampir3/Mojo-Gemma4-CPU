@@ -1,6 +1,5 @@
 from simd_math.ops import tanh_f32
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     RangePartitionedKernel,
     fanout_dispatch,
@@ -62,7 +61,7 @@ def dispatch_gemv_softcap[
     x: Binding[BFloat16, tp],
     weight: Binding[BFloat16, tp],
     output: Binding[BFloat16, tp],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = GemvSoftcapKernel[rows, cols, cap]
 

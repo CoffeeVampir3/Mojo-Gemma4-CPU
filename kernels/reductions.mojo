@@ -4,7 +4,6 @@ from std.memory import UnsafePointer, memcpy
 from std.sys.info import simd_width_of
 
 from modeling.model_spec import Encoding
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from .helpers import (
     RangePartitionedKernel, RankBuffers, DispatchBuffer, Binding,
@@ -127,7 +126,7 @@ def dispatch_allreduce[
 ](
     src: RankBuffers[E.DTYPE, tp, src_origin],
     output: RankBuffers[E.DTYPE, tp, dst_origin],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
 ):
     if src.count <= 0:
@@ -186,7 +185,7 @@ def dispatch_allreduce_inplace[
     max_worker_count: Int = 128,
 ](
     buf: Binding[Scalar[E.DTYPE], tp], count: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
 ):
     """In-place allreduce: each rank's `buf` is both source and destination."""

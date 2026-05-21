@@ -1,7 +1,6 @@
 from std.collections import InlineArray
 
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     Binding, fanout_dispatch, fanout_dispatch_per_rank,
 )
@@ -36,7 +35,7 @@ def dispatch_sliding_attention[
     partials: Binding[Float32, tp],
     base_pos: Int,
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     if seq_len <= 0:
         return
@@ -104,7 +103,7 @@ def dispatch_full_attention[
     partials: Binding[Float32, tp],
     base_pos: Int,
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     """`q_local_output` is the per-rank merged attention output, feeding the
     column-sharded o_proj."""

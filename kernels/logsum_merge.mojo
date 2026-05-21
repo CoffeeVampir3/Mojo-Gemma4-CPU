@@ -3,7 +3,6 @@ from std.memory import UnsafePointer, memset_zero
 
 from simd_math import pick_port_unroll, fast_exp_softmax_biased
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
     RangePartitionedKernel, DispatchBuffer, tile_dispatch,
@@ -214,7 +213,7 @@ def dispatch_merge_flash_partials[
     output: Binding[BFloat16, tp],
     partials_buf: Binding[Float32, tp],
     num_sources: InlineArray[Int, tp],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     inline_max_bytes: Int = MERGE_INLINE_MAX_BYTES,
 ):
     comptime K = FinalizeKernel[head_dim, num_q, partial_stride]
@@ -246,7 +245,7 @@ def dispatch_merge_context_flash_partials[
     output: Binding[BFloat16, tp],
     partials_buf: Binding[Float32, tp],
     num_sources: InlineArray[Int, tp],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     var total_sources = 0
     for r in range(tp):

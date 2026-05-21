@@ -7,7 +7,6 @@ from simd_math.ops import sqrt
 from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from kernels.helpers import Binding, ArenaBases
 from kernels.reductions import dispatch_allreduce_inplace
 from kernels.embedding import dispatch_embed_lookup
@@ -536,7 +535,7 @@ def dispatch_sliding_attention_qkv[
     seq_len: Int,
     layer_idx: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     """Sliding-window attention for `seq_len` Q-tokens starting at
     `base_pos`. `seq_len == 1` uses kv-range-parallel decode flash plus
@@ -635,7 +634,7 @@ def dispatch_full_attention_qkv[
     seq_len: Int,
     layer_idx: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     """Full attention for `seq_len` Q-tokens starting at `base_pos`. The
     unified attention dispatcher routes decode vs prefill internally
@@ -731,7 +730,7 @@ def dispatch_moe[
     moe_out: BF16Bind[degree],
     seq_len: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime experts_per_rank = C.NUM_EXPERTS // degree
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
@@ -805,7 +804,7 @@ def dispatch_ffn[
     x_residual: BF16Bind[degree],
     seq_len: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
@@ -880,15 +879,15 @@ struct Gemma4[
     max_worker_count: Int = 128,
     Pool: BurstThreadPool = BurstPool[],
 ](Movable):
-    var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
-    var pools: HeapMoveArray[Self.Pool]
+    var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
+    var pools: List[Self.Pool]
     var layout: Gemma4Layout[Self.degree, Self.max_seq_len]
     var scratch: Gemma4ScratchPool[Self.degree, Self.max_worker_count]
     var arena_bases: ArenaBases[Self.degree]
 
     def __init__(out self,
-        var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
-        var pools: HeapMoveArray[Self.Pool],
+        var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
+        var pools: List[Self.Pool],
         layout: Gemma4Layout[Self.degree, Self.max_seq_len],
     ):
         self.arena_bases = ArenaBases[Self.degree].uninitialized()
@@ -1070,7 +1069,7 @@ struct Gemma4[
     def load(
         dir_path: Path,
         topo: NumaTopology,
-        var pools: HeapMoveArray[Self.Pool],
+        var pools: List[Self.Pool],
     ) -> Optional[Self]:
         var shards = discover_shards(dir_path)
         if len(shards) == 0:
@@ -1093,10 +1092,10 @@ struct Gemma4[
             t"({weights_mb} MB weights + {state_mb} MB state each)"
         )
 
-        var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.degree)
+        var arenas = List[NumaArena[alignment=DEFAULT_ALIGNMENT]](capacity=Self.degree)
         var arena_bases = List[Int]()
         for rank in range(Self.degree):
-            arenas.push(NumaArena[alignment=DEFAULT_ALIGNMENT](topo.node(rank), size))
+            arenas.append(NumaArena[alignment=DEFAULT_ALIGNMENT](topo.node(rank), size))
             if not arenas[rank]:
                 var node = topo.node(rank)
                 print(t"arena allocation failed on node {node}")

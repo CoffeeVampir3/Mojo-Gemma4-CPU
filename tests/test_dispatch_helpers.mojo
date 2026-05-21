@@ -6,7 +6,6 @@ from kernels.helpers import (
     DispatchBuffer, OutputPartitionedKernel,
     fanout_dispatch_per_rank, saturate_workers, tile_dispatch,
 )
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
@@ -87,9 +86,9 @@ def test_fanout_per_rank_returns_actual_counts():
     for i in range(16):
         out[i] = 0
 
-    var pools = HeapMoveArray[TestPool](tp)
-    pools.push(TestPool(8, 0))
-    pools.push(TestPool(8, 0))
+    var pools = List[TestPool](capacity=tp)
+    pools.append(TestPool(8, 0))
+    pools.append(TestPool(8, 0))
 
     @parameter
     def make(r: Int) -> CountKernel:

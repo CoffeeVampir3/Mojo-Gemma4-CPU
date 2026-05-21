@@ -5,7 +5,6 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from notstdcollections import HeapMoveArray
 from kernels.helpers import (
     DispatchBuffer, recommended_workers, Binding, ArenaBases,
 )
@@ -44,7 +43,7 @@ def arena_alloc[dtype: DType](
 
 
 def arena_bases[tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ) -> ArenaBases[tp]:
     var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
@@ -53,7 +52,7 @@ def arena_bases[tp: Int](
 
 
 def arena_alloc_all[dtype: DType, tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
     for r in range(tp):
@@ -209,7 +208,7 @@ def section_dispatch_overhead[P: BurstThreadPool](
 
 
 def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P], src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
+    mut pools: List[P], src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
     bases: ArenaBases[tp],
 ):
     print("\n=== Standalone norm: seq_len sweep ===")
@@ -272,7 +271,7 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
 
 
 def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P], partial: BF16Ptr, residual: BF16Ptr,
+    mut pools: List[P], partial: BF16Ptr, residual: BF16Ptr,
     res_dst: BF16Ptr, weight: BF16Ptr,
     bases: ArenaBases[tp],
 ):
@@ -344,8 +343,8 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
     comptime MAX_TOKENS = 256
     var bases = arena_bases[tp](arenas)
@@ -388,9 +387,9 @@ def main():
     print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 256 * 1024 * 1024
-    var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
+    var arenas = List[NumaArena[alignment=ALIGNMENT]](capacity=tp)
     for i in range(tp):
-        arenas.push(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
+        arenas.append(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
         if not arenas[i]:
             print("arena alloc failed on node", topo[i])
             return
@@ -398,7 +397,7 @@ def main():
     @parameter
     def dispatch_rmsnorm_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[

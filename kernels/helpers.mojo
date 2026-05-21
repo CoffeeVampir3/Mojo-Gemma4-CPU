@@ -1,7 +1,6 @@
 from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
-from notstdcollections import HeapMoveArray
 from simd_math import pick_port_unroll
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
@@ -138,7 +137,7 @@ struct DispatchBuffer[K: BurstKernel, max_worker_count: Int = 128]:
         self.count = 0
 
 
-def join_all[P: BurstThreadPool, //, tp: Int](mut pools: HeapMoveArray[P]):
+def join_all[P: BurstThreadPool, //, tp: Int](mut pools: List[P]):
     for r in range(tp):
         pools[r].join()
 
@@ -241,7 +240,7 @@ def fanout_dispatch[
         data_bytes: Int, capacity: Int,
     ) thin -> Int = recommended_workers,
 ](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     total: Int,
     data_bytes: Int,
     inline_threshold_bytes: Int = -1,
@@ -273,7 +272,7 @@ def fanout_dispatch_per_rank[
         data_bytes: Int, capacity: Int,
     ) thin -> Int = recommended_workers,
 ](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ) -> InlineArray[Int, tp]:
     var nws = InlineArray[Int, tp](fill=0)
     var buf = DispatchBuffer[K, max_worker_count]()

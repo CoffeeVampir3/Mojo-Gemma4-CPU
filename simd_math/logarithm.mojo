@@ -43,7 +43,7 @@ comptime LOG_MINIMAX_UNBIASED = sollya_remez_log_coeffs_unbiased()
 
 
 # Error profile — max relative error, sweep x ∈ [0.1, 10] log-uniform, default flags.
-# Reproduce / regression-asserted in simd_math/tests/test_log.mojo.
+# Reproduce / regression-asserted in tests/test_log.mojo.
 #
 # log_simd's polynomial converges very fast on the centered domain
 # z² ∈ [0, 0.0294], so the error floor is set by f32 evaluation noise,

@@ -2,7 +2,6 @@ from std.math import sqrt
 from std.memory import UnsafePointer, alloc
 from std.time import perf_counter_ns
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 
 
 comptime DEFAULT_SAMPLES = 600
@@ -132,7 +131,7 @@ def print_row(
 
 
 def max_last_ts[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ) -> Int:
     var hi = 0
     for r in range(tp):

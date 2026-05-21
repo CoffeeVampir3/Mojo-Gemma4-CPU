@@ -5,7 +5,6 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from notstdcollections import HeapMoveArray
 from kernels.helpers import Binding, ArenaBases
 from kernels.moe_router import SparseRoute
 from kernels.moe_experts import dispatch_phase1_gate_up, dispatch_phase2_down
@@ -47,7 +46,7 @@ def arena_alloc[T: AnyType](
 
 
 def arena_alloc_all[T: AnyType, tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[T, MutAnyOrigin]:
     var first = UnsafePointer[T, MutAnyOrigin].unsafe_dangling()
     for r in range(tp):
@@ -58,7 +57,7 @@ def arena_alloc_all[T: AnyType, tp: Int](
 
 
 def arena_bases[tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ) -> ArenaBases[tp]:
     var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
@@ -134,7 +133,7 @@ def section_phase1[
     P: BurstThreadPool, //,
     tp: Int, experts_per_rank: Int,
 ](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     mut samples: SampleBuffer,
     seq_len: Int,
     x_normed: Binding[BFloat16, tp],
@@ -175,7 +174,7 @@ def section_phase2[
     P: BurstThreadPool, //,
     tp: Int, experts_per_rank: Int,
 ](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     mut samples: SampleBuffer,
     seq_len: Int,
     expert_offset: Binding[Int32, tp],
@@ -214,7 +213,7 @@ def section_combined[
     P: BurstThreadPool, //,
     tp: Int, experts_per_rank: Int,
 ](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     mut samples: SampleBuffer,
     seq_len: Int,
     x_normed: Binding[BFloat16, tp],
@@ -265,8 +264,8 @@ def section_combined[
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
     comptime experts_per_rank = NUM_EXPERTS // tp
     comptime MAX_SEQ = 1024
@@ -366,10 +365,10 @@ def main():
     var iso = len(topo.isolated_cpus)
     print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
-    var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
+    var arenas = List[NumaArena[alignment=ALIGNMENT]](capacity=tp)
     var bytes = arena_bytes_for(tp)
     for i in range(tp):
-        arenas.push(NumaArena[alignment=ALIGNMENT](topo[i], bytes))
+        arenas.append(NumaArena[alignment=ALIGNMENT](topo[i], bytes))
         if not arenas[i]:
             print("arena alloc failed on node", topo[i])
             return
@@ -377,7 +376,7 @@ def main():
     @parameter
     def dispatch_moe_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[

@@ -5,7 +5,6 @@ from std.memory import Span, UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
 from numa import NumaTopology
-from notstdcollections import HeapMoveArray
 import linux.sys as linux
 
 
@@ -27,19 +26,19 @@ comptime WARMUP = 5
 comptime TRIALS = 50
 
 
-def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
-    var node_kernels = HeapMoveArray[HeapMoveArray[DelayKernel]](num_nodes)
-    var node_outputs = HeapMoveArray[HeapMoveArray[Int]](num_nodes)
+def run_bench[P: BurstThreadPool](mut pools: List[P], num_nodes: Int):
+    var node_kernels = List[List[DelayKernel]](capacity=num_nodes)
+    var node_outputs = List[List[Int]](capacity=num_nodes)
     for i in range(num_nodes):
         var nc = pools[i].get_capacity()
-        var no = HeapMoveArray[Int](nc)
+        var no = List[Int](capacity=nc)
         for _ in range(nc):
-            no.push(0)
-        var nk = HeapMoveArray[DelayKernel](nc)
+            no.append(0)
+        var nk = List[DelayKernel](capacity=nc)
         for j in range(nc):
-            nk.push(DelayKernel(no.ptr + j, j, 0))
-        node_kernels.push(nk^)
-        node_outputs.push(no^)
+            nk.append(DelayKernel(no.unsafe_ptr().unsafe_origin_cast[MutExternalOrigin]() + j, j, 0))
+        node_kernels.append(nk^)
+        node_outputs.append(no^)
 
     print("\nwork       dispatch    join      join_overhead")
 
@@ -62,7 +61,7 @@ def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
                 for i in range(num_nodes):
                     ref nk = node_kernels[i]
                     pools[i].dispatch(
-                        Span(ptr=nk.ptr, length=nk.len),
+                        Span(ptr=nk.unsafe_ptr(), length=len(nk)),
                         pools[i].get_capacity())
                 for i in range(num_nodes):
                     pools[i].join()
@@ -79,7 +78,7 @@ def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
                 for i in range(num_nodes):
                     ref nk = node_kernels[i]
                     pools[i].dispatch(
-                        Span(ptr=nk.ptr, length=nk.len),
+                        Span(ptr=nk.unsafe_ptr(), length=len(nk)),
                         pools[i].get_capacity())
                 var t1 = Int(perf_counter_ns())
                 for i in range(num_nodes):
@@ -93,7 +92,7 @@ def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
                 da += t1 - t0
                 ja += t2 - t1
                 oa += t2 - max_ts
-            keep(node_outputs[0].ptr[])
+            keep(node_outputs[0].unsafe_ptr()[])
             var d = da // LAYERS
             var j = ja // LAYERS
             var o = oa // LAYERS
@@ -116,18 +115,18 @@ def main():
 
     if topo.has_isolation():
         print("mode: isolated (spin-only)")
-        var pools = HeapMoveArray[IsolatedBurstPool[]](num_nodes)
+        var pools = List[IsolatedBurstPool[]](capacity=num_nodes)
         for i in range(num_nodes):
-            pools.push(IsolatedBurstPool[].for_rank(topo, i))
+            pools.append(IsolatedBurstPool[].for_rank(topo, i))
             var node = topo.node(i)
             var workers = pools[i].get_capacity()
             print(t"  node {node}: {workers} workers")
         run_bench(pools, num_nodes)
     else:
         print("mode: cold (spin-backoff)")
-        var pools = HeapMoveArray[BurstPool[]](num_nodes)
+        var pools = List[BurstPool[]](capacity=num_nodes)
         for i in range(num_nodes):
-            pools.push(BurstPool[].for_rank(topo, i))
+            pools.append(BurstPool[].for_rank(topo, i))
             var node = topo.node(i)
             var workers = pools[i].get_capacity()
             print(t"  node {node}: {workers} workers")

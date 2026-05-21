@@ -5,7 +5,6 @@ from std.time import perf_counter_ns
 import linux.sys as linux
 from std.atomic import Ordering
 from numa import NumaTopology, CpuMask
-from notstdcollections import HeapMoveArray
 from .threading_traits import BurstKernel, BurstThreadPool
 from .threading_shared import (
     AtomicInt32, KernelFn, JoinFlag, SlotLayout,
@@ -74,7 +73,7 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool):
     Zero cross-NUMA reads on the hot path.
     """
     # Worker-side (on worker's NUMA node)
-    var slots: HeapMoveArray[WorkerSlot]
+    var slots: List[WorkerSlot]
     var mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin]
     var shared: UnsafePointer[SharedState, MutAnyOrigin]
     var worker_arena: Int
@@ -105,7 +104,7 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool):
         self.numa_node = numa_node
         self.workers_alive = False
         self.futex_flags = linux.Futex2.SIZE_U32 | linux.Futex2.PRIVATE
-        self.slots = HeapMoveArray[WorkerSlot](capacity)
+        self.slots = List[WorkerSlot](capacity=capacity)
         self.worker_arena = 0
         self.worker_arena_size = 0
         self.join_arena = 0
@@ -159,7 +158,7 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool):
                 _ = sys.sys_munmap(self.worker_arena, self.worker_arena_size)
                 self.worker_arena = 0
                 return
-            self.slots.push(WorkerSlot(slot_base))
+            self.slots.append(WorkerSlot(slot_base))
 
         self.join_arena_size = capacity * size_of[JoinFlag]()
         self.join_arena = sys.sys_mmap[

@@ -5,7 +5,6 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from notstdcollections import HeapMoveArray
 from kernels.logsum_merge import dispatch_merge_flash_partials
 from kernels.attention_ops import flash_partial_stride
 from kernels.helpers import (
@@ -60,7 +59,7 @@ def arena_alloc[dtype: DType](
 
 
 def arena_bases[tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ) -> ArenaBases[tp]:
     var bases = ArenaBases[tp].uninitialized()
     for r in range(tp):
@@ -69,7 +68,7 @@ def arena_bases[tp: Int](
 
 
 def arena_alloc_all[dtype: DType, tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]], count: Int,
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
     for r in range(tp):
@@ -108,8 +107,8 @@ def source_counts[tp: Int](num_sources: Int) -> InlineArray[Int, tp]:
 def run_config[
     P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
 ](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
-    mut pools: HeapMoveArray[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
 ):
     comptime stride = flash_partial_stride[num_q, head_dim]()
     var bases = arena_bases[tp](arenas)
@@ -190,8 +189,8 @@ def run_config[
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
-    mut pools: HeapMoveArray[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
 ):
     run_config[head_dim=256, num_q=8, tp=tp](arenas, pools)
     run_config[head_dim=512, num_q=16, tp=tp](arenas, pools)
@@ -206,9 +205,9 @@ def main():
     print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 128 * 1024 * 1024
-    var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
+    var arenas = List[NumaArena[alignment=ALIGNMENT]](capacity=tp)
     for i in range(tp):
-        arenas.push(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
+        arenas.append(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
         if not arenas[i]:
             print("arena alloc failed on node", topo[i])
             return
@@ -216,7 +215,7 @@ def main():
     @parameter
     def dispatch_logsum_merge_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         run_all[tp=degree](arenas, selected_pools)
 
     with_topological_rank_dispatch[

@@ -2,7 +2,6 @@ from std.collections import InlineArray
 
 from simd_math import pick_port_unroll
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     Chain, RangePartitionedKernel,
     fanout_dispatch, saturate_workers,
@@ -90,7 +89,7 @@ def dispatch_gemm[
     weight: Binding[BFloat16, tp],
     output: Binding[BFloat16, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     if seq_len <= 0:
         return
@@ -143,7 +142,7 @@ def dispatch_gemm_chained_qkv[
     k_out: Binding[BFloat16, tp],
     v_out: Binding[BFloat16, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     if seq_len <= 0:
         return

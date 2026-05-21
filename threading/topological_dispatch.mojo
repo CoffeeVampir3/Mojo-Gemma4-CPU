@@ -1,4 +1,3 @@
-from notstdcollections import HeapMoveArray
 from numa import NumaTopology
 from .burst_threading import BurstPool
 from .isolated_burst_pool import IsolatedBurstPool
@@ -11,9 +10,9 @@ def select_tensor_parallel_degree[
     *,
     power_of_two_unrolling: Int,
     dispatch: def[Q: BurstThreadPool, //, degree: Int](
-        var HeapMoveArray[Q]
+        var List[Q]
     ) capturing [_] -> None,
-](tp: Int, var pools: HeapMoveArray[P]):
+](tp: Int, var pools: List[P]):
     comptime assert power_of_two_unrolling > 0, (
         "power_of_two_unrolling must be positive"
     )
@@ -29,7 +28,7 @@ def with_topological_rank_dispatch[
     *,
     power_of_two_unrolling: Int,
     dispatch: def[P: BurstThreadPool, //, degree: Int](
-        var HeapMoveArray[P]
+        var List[P]
     ) capturing [_] -> None,
 ](
     read topo: NumaTopology,
@@ -39,9 +38,9 @@ def with_topological_rank_dispatch[
     var tp = len(topo)
     if topo.has_isolation():
         print(isolated_mode)
-        var pools = HeapMoveArray[IsolatedBurstPool[]](tp)
+        var pools = List[IsolatedBurstPool[]](capacity=tp)
         for i in range(tp):
-            pools.push(IsolatedBurstPool[].for_rank(topo, i))
+            pools.append(IsolatedBurstPool[].for_rank(topo, i))
             print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
         print("")
 
@@ -51,9 +50,9 @@ def with_topological_rank_dispatch[
         ](tp, pools^)
     else:
         print(cold_mode)
-        var pools = HeapMoveArray[BurstPool[]](tp)
+        var pools = List[BurstPool[]](capacity=tp)
         for i in range(tp):
-            pools.push(BurstPool[].for_rank(topo, i))
+            pools.append(BurstPool[].for_rank(topo, i))
             print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
         print("")
 

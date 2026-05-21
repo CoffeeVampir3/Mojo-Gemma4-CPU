@@ -7,7 +7,6 @@ from kernels.reductions import (
     dispatch_allreduce,
 )
 from modeling.model_spec import BF16
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
@@ -81,9 +80,9 @@ def check_bf16(ptr: BF16Ptr, idx: Int, expected: Float32, msg: StringSlice):
 # ---- Exact correctness tests (logic bugs) ----
 
 def test_allreduce_exact[tp: Int](n: Int, label: String, inline_max_bytes: Int):
-    var pools = HeapMoveArray[TestPool](tp)
+    var pools = List[TestPool](capacity=tp)
     for _ in range(tp):
-        pools.push(TestPool(4, 0))
+        pools.append(TestPool(4, 0))
     var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out = InlineArray[BF16Ptr, tp](uninitialized=True)
     for r in range(tp):
@@ -119,9 +118,9 @@ def accuracy_allreduce[tp: Int](
     n: Int, label: String, hypothesis_ulp: Float64,
     inline_max_bytes: Int,
 ):
-    var pools = HeapMoveArray[TestPool](tp)
+    var pools = List[TestPool](capacity=tp)
     for _ in range(tp):
-        pools.push(TestPool(4, 0))
+        pools.append(TestPool(4, 0))
     var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out = InlineArray[BF16Ptr, tp](uninitialized=True)
     for r in range(tp):
@@ -171,11 +170,11 @@ def accuracy_allreduce[tp: Int](
 
 
 def accuracy_crosspath[tp: Int](n: Int, label: String):
-    var pools_a = HeapMoveArray[TestPool](tp)
-    var pools_b = HeapMoveArray[TestPool](tp)
+    var pools_a = List[TestPool](capacity=tp)
+    var pools_b = List[TestPool](capacity=tp)
     for _ in range(tp):
-        pools_a.push(TestPool(4, 0))
-        pools_b.push(TestPool(4, 0))
+        pools_a.append(TestPool(4, 0))
+        pools_b.append(TestPool(4, 0))
     var raw = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out_inline = InlineArray[BF16Ptr, tp](uninitialized=True)
     var out_parallel = InlineArray[BF16Ptr, tp](uninitialized=True)

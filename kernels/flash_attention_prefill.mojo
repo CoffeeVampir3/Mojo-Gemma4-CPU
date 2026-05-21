@@ -2,7 +2,6 @@ from std.collections import InlineArray
 from std.memory import UnsafePointer
 
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     BF16Ptr, F32Ptr, W,
     RangePartitionedKernel, WorkerRangePartitionedKernel,
@@ -203,7 +202,7 @@ def dispatch_merge_flash_prefill_partials[
     output: Binding[BFloat16, tp],
     partials: Binding[Float32, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     if seq_len <= 0:
         return

@@ -6,7 +6,6 @@ from std.sys.info import simd_width_of
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstKernel, BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from notstdcollections import HeapMoveArray
 from kernels.helpers import (
     OutputPartitionedKernel, DispatchBuffer, RankBuffers,
     tile_dispatch, join_all, worker_range,
@@ -164,7 +163,7 @@ def timed_copy[P: BurstThreadPool](
 
 
 def section_local_bw[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     src: InlineArray[BF16Ptr, tp],
     dst: InlineArray[BF16Ptr, tp],
     count: Int,
@@ -190,7 +189,7 @@ def section_local_bw[P: BurstThreadPool, //, tp: Int](
 
 
 def section_remote_cached[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     src: InlineArray[BF16Ptr, tp],
     count: Int,
 ):
@@ -212,7 +211,7 @@ def section_remote_cached[P: BurstThreadPool, //, tp: Int](
 
 
 def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     bufs: InlineArray[BF16Ptr, tp],
     count: Int,
 ):
@@ -254,7 +253,7 @@ def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
 
 
 def section_contended[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     bufs: InlineArray[BF16Ptr, tp],
     count: Int,
 ):
@@ -290,7 +289,7 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
 
 
 def section_dispatch[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     print("\n=== Dispatch + join overhead ===")
     var samples = SampleBuffer(SAMPLES)
@@ -344,7 +343,7 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
 
 
 def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     src: InlineArray[BF16Ptr, tp],
     count: Int,
 ):
@@ -406,7 +405,7 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
 
 
 def section_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
     src: InlineArray[BF16Ptr, tp],
     dst: InlineArray[BF16Ptr, tp],
 ):
@@ -470,8 +469,8 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
 
 
 def run_all[P: BurstThreadPool, //, tp: Int](
-    mut pools: HeapMoveArray[P],
-    mut arenas: HeapMoveArray[NumaArena[alignment=ALIGNMENT]],
+    mut pools: List[P],
+    mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
     var src = InlineArray[BF16Ptr, tp](uninitialized=True)
     var dst = InlineArray[BF16Ptr, tp](uninitialized=True)
@@ -498,9 +497,9 @@ def main():
     print(t"{tp} NUMA node(s), {iso} isolated cpus\n")
 
     comptime ARENA_BYTES = 512 * 1024 * 1024
-    var arenas = HeapMoveArray[NumaArena[alignment=ALIGNMENT]](tp)
+    var arenas = List[NumaArena[alignment=ALIGNMENT]](capacity=tp)
     for i in range(tp):
-        arenas.push(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
+        arenas.append(NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
         if not arenas[i]:
             print("arena alloc failed on node", topo[i])
             return
@@ -508,7 +507,7 @@ def main():
     @parameter
     def dispatch_primitives_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[

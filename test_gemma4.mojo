@@ -7,7 +7,6 @@ from numa import NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
-from notstdcollections import HeapMoveArray
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
 from modeling.gemma4_common import Gemma4BaseConfig
 from modeling.gemma_4_moe import Gemma4
@@ -41,7 +40,7 @@ def load_and_run[
     P: BurstThreadPool, //, degree: Int,
 ](
     topo: NumaTopology,
-    var pools: HeapMoveArray[P],
+    var pools: List[P],
     read tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read token_ids: List[Int],
 ):
@@ -163,7 +162,7 @@ def main():
     @parameter
     def dispatch_gemma4_tp[
         P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: HeapMoveArray[P]):
+    ](var selected_pools: List[P]):
         load_and_run[degree=degree](topo, selected_pools^, tok, token_ids)
 
     with_topological_rank_dispatch[

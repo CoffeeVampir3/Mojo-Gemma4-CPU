@@ -1,7 +1,6 @@
 from std.algorithm import vectorize
 from std.memory import Span, UnsafePointer
 
-from notstdcollections import HeapMoveArray
 from threading.threading_traits import BurstThreadPool
 from .helpers import (
     RangePartitionedKernel, Binding,
@@ -71,7 +70,7 @@ def dispatch_embed_lookup[
     embed: Binding[BFloat16, tp],
     dst: Binding[BFloat16, tp],
     seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     """Unowned tokens write zero; caller follows with allreduce to replicate."""
     comptime K = EmbedLookupKernel[tok_origin, hidden, scale, shard_rows]

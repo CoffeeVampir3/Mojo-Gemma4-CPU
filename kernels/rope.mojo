@@ -3,7 +3,6 @@ from std.sys.info import simd_width_of
 
 from simd_math import sincos_simd
 from threading.threading_traits import BurstThreadPool
-from notstdcollections import HeapMoveArray
 from .helpers import (
     RangePartitionedKernel, Binding,
     fanout_dispatch,
@@ -118,7 +117,7 @@ def dispatch_rope_cache_write[
     cos_table: Binding[Float32, tp],
     sin_table: Binding[Float32, tp],
     base_pos: Int, seq_len: Int,
-    mut pools: HeapMoveArray[P],
+    mut pools: List[P],
 ):
     comptime K = RopeCacheWriteKernel[
         half, pair_stride, num_q, num_kv, head_dim,
