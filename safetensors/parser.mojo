@@ -1,7 +1,8 @@
+from std.bit import byte_swap
 from std.collections import Dict
 from std.memory import Span, UnsafePointer
 from std.pathlib import Path
-from std.sys.info import size_of
+from std.sys.info import size_of, is_big_endian
 
 from jsontools.parser import (
     Parser,
@@ -124,7 +125,7 @@ struct TensorMeta(Copyable, Writable):
         return n
 
 @fieldwise_init
-struct SafetensorsHeader(Copyable, Movable):
+struct SafetensorsHeader(Copyable):
     var path: Path
     var tensors: Dict[String, TensorMeta]
     var data_offset: Int
@@ -211,7 +212,7 @@ def parse_safetensors_dict(mut parser: Parser, payload_size: Int = -1) raises Pa
         if key_value == "__metadata__":
             parser.skip_value()
         else:
-            if tensors.get(key_value):
+            if key_value in tensors:
                 raise ParseError("duplicate tensor name", parser.pos)
             var meta = parse_tensor(parser)
             if meta.end < meta.start:
@@ -242,9 +243,9 @@ def parse_safetensors_dict(mut parser: Parser, payload_size: Int = -1) raises Pa
     return tensors^
 
 def read_u64_le(ptr: UnsafePointer[Byte, _]) -> UInt64:
-    var v = UInt64(0)
-    for i in range(HEADER_LEN_BYTES):
-        v |= UInt64(ptr[i]) << UInt64(i * 8)
+    var v = ptr.bitcast[UInt64]()[]
+    comptime if is_big_endian():
+        return byte_swap(v)
     return v
 
 def parse_safetensors_header[simd_width: Int = 16](path: Path) -> Optional[SafetensorsHeader]:
@@ -276,12 +277,12 @@ def parse_safetensors_header[simd_width: Int = 16](path: Path) -> Optional[Safet
                 print("load: header length exceeds file")
                 return None
     except e:
-        print("load: failed to read file:", e)
+        print(t"load: failed to read file: {e}")
         return None
     var parser = Parser[simd_width=simd_width](Span(header_bytes))
     try:
         var tensors = parse_safetensors_dict(parser, Int(file_len) - HEADER_LEN_BYTES - header_size)
         return SafetensorsHeader(path, tensors^, HEADER_LEN_BYTES + header_size, Int(file_len))
     except e:
-        print("load: parse error at pos", e.pos, "-", e.message)
+        print(t"load: parse error at pos {e.pos}: {e.message}")
         return None
