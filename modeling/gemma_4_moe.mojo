@@ -51,6 +51,10 @@ from modeling.modeling_common import (
 from modeling.slot import (
     Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
 )
+from quant.recipe import (
+    QuantRecipe, PerRowQuant, PerBlockQuant, RouterCenter,
+    SplitGamma, NoGamma, SingleSided, NoColsum, PerRowCs, PerBlockCs,
+)
 from modeling.loader import discover_shards, load_weights_from_descs
 
 
@@ -141,21 +145,38 @@ struct Gemma4TailShapes[degree: Int]:
     comptime Embed = VocabularyRowSharded[C.VOCAB_SIZE, C.HIDDEN, Self.D]
 
 
+comptime SplitGainPerRowCs[fwht: Int, gamma: StaticString]: QuantRecipe = PerRowQuant(
+    fwht, SplitGamma(gamma), SingleSided(), PerRowCs(),
+)
+
+
+comptime PlainPerRowBlockCs[fwht: Int]: QuantRecipe = PerRowQuant(
+    fwht, NoGamma(), SingleSided(), PerBlockCs(),
+)
+
+
 struct SlidingAttnRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
-    var q_proj: Slot[BF16, Self.S.SlidingQ,  "self_attn.q_proj.weight"]
-    var k_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.k_proj.weight"]
-    var v_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.v_proj.weight"]
-    var o_proj: Slot[BF16, Self.S.SlidingO,  "self_attn.o_proj.weight"]
+    var q_proj: Slot[BF16, Self.S.SlidingQ,  "self_attn.q_proj.weight",
+        SplitGainPerRowCs[128, "input_layernorm.weight"]]
+    var k_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.k_proj.weight",
+        SplitGainPerRowCs[128, "input_layernorm.weight"]]
+    var v_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.v_proj.weight",
+        SplitGainPerRowCs[128, "input_layernorm.weight"]]
+    var o_proj: Slot[BF16, Self.S.SlidingO,  "self_attn.o_proj.weight",
+        PlainPerRowBlockCs[C.HEAD_DIM_SLIDING]]
     var q_norm: Slot[BF16, Shape[C.HEAD_DIM_SLIDING, 1], "self_attn.q_norm.weight"]
     var k_norm: Slot[BF16, Shape[C.HEAD_DIM_SLIDING, 1], "self_attn.k_norm.weight"]
 
 
 struct FullAttnRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
-    var q_proj: Slot[BF16, Self.S.FullQ, "self_attn.q_proj.weight"]
-    var k_proj: Slot[BF16, Self.S.FullK, "self_attn.k_proj.weight"]
-    var o_proj: Slot[BF16, Self.S.FullO, "self_attn.o_proj.weight"]
+    var q_proj: Slot[BF16, Self.S.FullQ, "self_attn.q_proj.weight",
+        SplitGainPerRowCs[128, "input_layernorm.weight"]]
+    var k_proj: Slot[BF16, Self.S.FullK, "self_attn.k_proj.weight",
+        SplitGainPerRowCs[128, "input_layernorm.weight"]]
+    var o_proj: Slot[BF16, Self.S.FullO, "self_attn.o_proj.weight",
+        PlainPerRowBlockCs[C.HEAD_DIM_FULL]]
     var q_norm: Slot[BF16, Shape[C.HEAD_DIM_FULL, 1], "self_attn.q_norm.weight"]
     var k_norm: Slot[BF16, Shape[C.HEAD_DIM_FULL, 1], "self_attn.k_norm.weight"]
 
@@ -169,14 +190,20 @@ struct BodyRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     var post_ffn_norm_1: Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm_1.weight"]
     var post_ffn_norm_2: Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm_2.weight"]
     var post_ffn_norm:   Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm.weight"]
-    var gate_proj:       Slot[BF16, Self.S.GateUp,              "mlp.gate_proj.weight"]
-    var up_proj:         Slot[BF16, Self.S.GateUp,              "mlp.up_proj.weight"]
-    var down_proj:       Slot[BF16, Self.S.Down,                "mlp.down_proj.weight"]
-    var router_proj:     Slot[BF16, Self.S.RouterProj,          "router.proj.weight"]
+    var gate_proj:       Slot[BF16, Self.S.GateUp,              "mlp.gate_proj.weight",
+        SplitGainPerRowCs[128, "pre_feedforward_layernorm.weight"]]
+    var up_proj:         Slot[BF16, Self.S.GateUp,              "mlp.up_proj.weight",
+        SplitGainPerRowCs[128, "pre_feedforward_layernorm.weight"]]
+    var down_proj:       Slot[BF16, Self.S.Down,                "mlp.down_proj.weight",
+        PlainPerRowBlockCs[64]]
+    var router_proj:     Slot[BF16, Self.S.RouterProj,          "router.proj.weight",
+        RouterCenter("")]
     var router_scale:    Slot[BF16, Shape[C.HIDDEN, 1],         "router.scale"]
     var router_pes:      Slot[BF16, Shape[C.NUM_EXPERTS, 1],    "router.per_expert_scale"]
-    var experts_gate_up: Slot[BF16, Self.S.ExpertsGateUp,       "experts.gate_up_proj"]
-    var experts_down:    Slot[BF16, Self.S.ExpertsDown,         "experts.down_proj"]
+    var experts_gate_up: Slot[BF16, Self.S.ExpertsGateUp,       "experts.gate_up_proj",
+        SplitGainPerRowCs[128, "pre_feedforward_layernorm_2.weight"]]
+    var experts_down:    Slot[BF16, Self.S.ExpertsDown,         "experts.down_proj",
+        PlainPerRowBlockCs[64]]
     var layer_scalar:    Slot[BF16, Shape[1, 1],                "layer_scalar"]
 
 

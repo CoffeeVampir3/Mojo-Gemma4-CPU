@@ -49,6 +49,25 @@ def parse_dtype(s: String) -> DType:
         return DType.uint64
     return DType.invalid
 
+
+def dtype_tag(dt: DType) -> StaticString:
+    if dt == DType.bool: return "BOOL"
+    if dt == DType.uint8: return "U8"
+    if dt == DType.int8: return "I8"
+    if dt == DType.int16: return "I16"
+    if dt == DType.uint16: return "U16"
+    if dt == DType.float16: return "F16"
+    if dt == DType.bfloat16: return "BF16"
+    if dt == DType.int32: return "I32"
+    if dt == DType.uint32: return "U32"
+    if dt == DType.float32: return "F32"
+    if dt == DType.float64: return "F64"
+    if dt == DType.float8_e4m3fn: return "F8_E4M3"
+    if dt == DType.float8_e5m2: return "F8_E5M2"
+    if dt == DType.int64: return "I64"
+    if dt == DType.uint64: return "U64"
+    return "UNKNOWN"
+
 def dtype_byte_size(dtype: DType) -> Int:
     if dtype == DType.bool:
         return size_of[Scalar[DType.bool]]()

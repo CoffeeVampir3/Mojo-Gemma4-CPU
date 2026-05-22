@@ -7,6 +7,7 @@ from modeling.model_spec import (
     DISTRIBUTED, align_up,
 )
 from modeling.utilities import FieldwiseDefault
+from quant.recipe import QuantRecipe, Passthrough
 
 
 trait SlotLike:
@@ -14,6 +15,7 @@ trait SlotLike:
     comptime SHAPE: ShapeLike
     comptime NAME: StaticString
     comptime TARGET_RANK: Int
+    comptime QUANT: QuantRecipe
 
     @always_inline
     def set_offset(mut self, off: Int): ...
@@ -49,12 +51,14 @@ struct BindContext[degree: Int](Copyable, ImplicitlyCopyable):
 
 struct Slot[
     encoding: Encoding, shape: ShapeLike, name: StaticString = "",
+    quant: QuantRecipe = Passthrough(),
     target_rank: Int = DISTRIBUTED,
 ](SlotLike, Defaultable, Copyable, ImplicitlyCopyable):
     comptime ENCODING = Self.encoding
     comptime SHAPE = Self.shape
     comptime NAME = Self.name
     comptime TARGET_RANK = Self.target_rank
+    comptime QUANT = Self.quant
 
     var offset: Int
 
