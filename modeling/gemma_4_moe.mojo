@@ -55,6 +55,12 @@ from quant.recipe import (
     QuantRecipe, PerRowQuant, PerBlockQuant, RouterCenter,
     SplitGamma, NoGamma, SingleSided, NoColsum, PerRowCs, PerBlockCs,
 )
+from quant.quantizer import Quantizer
+from linux.io_uring import (
+    IoRing, ReadMode, WriteMode, open_files_for_ring, close_fds,
+)
+from std.memory import alloc
+from std.collections import Dict
 from modeling.loader import discover_shards, load_weights_from_descs
 
 
@@ -1143,3 +1149,23 @@ struct Gemma4[
         var model = Self(arenas^, pools^, layout)
         model.model_init()
         return model^
+
+    @staticmethod
+    def quantize(source_dir: Path, output_path: Path) -> Bool:
+        var q = Quantizer(source_dir, output_path)
+        if not q:
+            return False
+        for i in range(C.NUM_LAYERS):
+            var entry = LAYER_SCHEDULE[i]
+            var prefix = String(t"model.language_model.layers.{entry.idx}.")
+            if entry.kind == LayerKind.FULL:
+                if not q.plan_walk[FullLayerRefs[1]](prefix):
+                    return False
+            else:
+                if not q.plan_walk[SlidingLayerRefs[1]](prefix):
+                    return False
+        if not q.plan_walk[TailRefs[1]](String("")):
+            return False
+        if not q.write_header():
+            return False
+        return q.execute()
