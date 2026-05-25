@@ -24,6 +24,31 @@ def select_tensor_parallel_degree[
     print(t"unsupported tp={tp}")
 
 
+def dispatch_topological_rank_pools[
+    P: BurstThreadPool,
+    //,
+    *,
+    power_of_two_unrolling: Int,
+    dispatch: def[Q: BurstThreadPool, //, degree: Int](
+        var List[Q]
+    ) capturing [_] -> None,
+](
+    read topo: NumaTopology,
+    read mode: String,
+    var pools: List[P],
+):
+    var tp = len(topo)
+    print(mode)
+    for i in range(tp):
+        print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
+    print("")
+
+    select_tensor_parallel_degree[
+        power_of_two_unrolling=power_of_two_unrolling,
+        dispatch=dispatch,
+    ](tp, pools^)
+
+
 def with_topological_rank_dispatch[
     *,
     power_of_two_unrolling: Int,
@@ -37,26 +62,18 @@ def with_topological_rank_dispatch[
 ):
     var tp = len(topo)
     if topo.has_isolation():
-        print(isolated_mode)
         var pools = List[IsolatedBurstPool[]](capacity=tp)
         for i in range(tp):
             pools.append(IsolatedBurstPool[].for_rank(topo, i))
-            print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
-        print("")
-
-        select_tensor_parallel_degree[
+        dispatch_topological_rank_pools[
             power_of_two_unrolling=power_of_two_unrolling,
             dispatch=dispatch,
-        ](tp, pools^)
+        ](topo, isolated_mode, pools^)
     else:
-        print(cold_mode)
         var pools = List[BurstPool[]](capacity=tp)
         for i in range(tp):
             pools.append(BurstPool[].for_rank(topo, i))
-            print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
-        print("")
-
-        select_tensor_parallel_degree[
+        dispatch_topological_rank_pools[
             power_of_two_unrolling=power_of_two_unrolling,
             dispatch=dispatch,
-        ](tp, pools^)
+        ](topo, cold_mode, pools^)

@@ -4,7 +4,9 @@ from std.os import abort
 
 from simd_math.ops import quantize_i8, sqrt
 from butterquant.fwht import fwht_block, fwht_row
-from butterquant.constants import SIMD_F32_WIDTH
+from butterquant.constants import (
+    SIMD_F32_WIDTH, FWHT_POWER_OF_TWO_UNROLLING,
+)
 
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
@@ -13,15 +15,6 @@ comptime PtrBF16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime SrcPtr[dtype: DType] = UnsafePointer[Scalar[dtype], MutAnyOrigin]
 comptime WIDTH = SIMD_F32_WIDTH
-
-
-@always_inline
-def bf16_to_f32(src: PtrBF16, dst: PtrF32, count: Int):
-    var k = 0
-    while k + WIDTH <= count:
-        (dst + k).store((src + k).load[width=WIDTH]().cast[DType.float32]())
-        k += WIDTH
-
 
 @always_inline
 def apply_gamma_in_place(work_row: PtrF32, gamma: PtrF32, cols: Int):
@@ -128,32 +121,47 @@ def rotate_and_quant_per_block[block: Int](
     quant_rows_per_block[block](work, qi, scales, rows, cols)
 
 
+def dispatch_fwht_block[
+    *,
+    power_of_two_unrolling: Int,
+    dispatch: def[block: Int]() capturing [_] -> None,
+](block: Int) -> Bool:
+    comptime assert power_of_two_unrolling > 0, (
+        "power_of_two_unrolling must be positive")
+    comptime for i in range(power_of_two_unrolling):
+        comptime candidate = WIDTH << i
+        if block == candidate:
+            dispatch[candidate]()
+            return True
+    return False
+
+
 def rotate_and_quant[per_block: Bool](
     block: Int, work: PtrF32, qi: PtrI8, scales: PtrF32,
     rows: Int, cols: Int, two_sided_head_dim: Int = 0,
 ):
     @parameter
-    def go[b: Int]():
-        fwht_rotate_rows[b](work, rows, cols)
-        if two_sided_head_dim == 512: fwht_rotate_columns[512](work, rows, cols)
-        elif two_sided_head_dim == 256: fwht_rotate_columns[256](work, rows, cols)
-        elif two_sided_head_dim == 128: fwht_rotate_columns[128](work, rows, cols)
-        elif two_sided_head_dim == 64: fwht_rotate_columns[64](work, rows, cols)
-        elif two_sided_head_dim == 32: fwht_rotate_columns[32](work, rows, cols)
-        elif two_sided_head_dim == 16: fwht_rotate_columns[16](work, rows, cols)
-        elif two_sided_head_dim != 0:
-            abort(t"butterquant: unsupported M-axis FWHT block={two_sided_head_dim}")
+    def rotate_columns[m_block: Int]():
+        fwht_rotate_columns[m_block](work, rows, cols)
+
+    @parameter
+    def rotate_rows_and_quant[k_block: Int]():
+        fwht_rotate_rows[k_block](work, rows, cols)
+        if two_sided_head_dim != 0:
+            if not dispatch_fwht_block[
+                power_of_two_unrolling=FWHT_POWER_OF_TWO_UNROLLING,
+                dispatch=rotate_columns,
+            ](two_sided_head_dim):
+                abort(t"butterquant: unsupported M-axis FWHT block={two_sided_head_dim}")
         comptime if per_block:
-            quant_rows_per_block[b](work, qi, scales, rows, cols)
+            quant_rows_per_block[k_block](work, qi, scales, rows, cols)
         else:
             quant_rows_per_row(work, qi, scales, rows, cols)
-    if block == 512: go[512]()
-    elif block == 256: go[256]()
-    elif block == 128: go[128]()
-    elif block == 64: go[64]()
-    elif block == 32: go[32]()
-    elif block == 16: go[16]()
-    else:
+
+    if not dispatch_fwht_block[
+        power_of_two_unrolling=FWHT_POWER_OF_TWO_UNROLLING,
+        dispatch=rotate_rows_and_quant,
+    ](block):
         abort(t"butterquant: unsupported K-axis FWHT block={block}")
 
 

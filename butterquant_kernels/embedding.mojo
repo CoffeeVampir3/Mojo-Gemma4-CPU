@@ -1,0 +1,81 @@
+from std.collections import InlineArray
+from std.memory import Span, UnsafePointer
+
+from threading.threading_traits import BurstThreadPool
+from kernels.helpers import (
+    RangePartitionedKernel, Binding, fanout_dispatch, BF16Ptr,
+)
+from kernels.dispatch_heuristics import EMBED_INLINE_TOKENS
+
+from butterquant.fwht import fwht_row
+from butterquant.runtime import (
+    dequant_weight_row_per_block, scale_cast_row, zero_row, F32Ptr, I8Ptr,
+)
+from butterquant.weight import ButterquantEncoding, ButterquantWeight
+
+
+@fieldwise_init
+struct BqEmbedLookupKernel[
+    tok_origin: ImmutOrigin,
+    hidden: Int, block: Int, scale: Float64, shard_rows: Int,
+](RangePartitionedKernel):
+    var token_ids: Span[Int32, Self.tok_origin]
+    var weight: I8Ptr
+    var scales: F32Ptr
+    var dst: BF16Ptr
+    var rank: Int
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        comptime nb = Self.hidden // Self.block
+        var work = InlineArray[Float32, Self.hidden](uninitialized=True)
+        var wp = UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=work[0])))
+        for tok in range(self.start, self.end):
+            var tid = Int(self.token_ids[tok])
+            var owner = tid // Self.shard_rows
+            var dst_row = self.dst + tok * Self.hidden
+            if owner == self.rank:
+                var local_row = tid - owner * Self.shard_rows
+                dequant_weight_row_per_block[Self.block](
+                    self.weight + local_row * Self.hidden,
+                    self.scales + local_row * nb,
+                    wp, Self.hidden)
+                fwht_row[Self.block](wp, Self.hidden)
+                scale_cast_row[Self.hidden, Self.scale](wp, dst_row)
+            else:
+                zero_row[Self.hidden](dst_row)
+        _ = work
+
+    @always_inline
+    def install_range(mut self, start: Int, end: Int):
+        self.start = start
+        self.end = end
+
+
+def dispatch_bq_embed_lookup[
+    P: BurstThreadPool, tok_origin: ImmutOrigin,
+    E: ButterquantEncoding, tp: Int, //,
+    scale: Float64, shard_rows: Int,
+    max_worker_count: Int = 128,
+](
+    token_ids: Span[Int32, tok_origin],
+    weight: ButterquantWeight[E, tp],
+    dst: Binding[BFloat16, tp],
+    seq_len: Int,
+    mut pools: List[P],
+):
+    """Unowned tokens write zero; caller follows with allreduce to replicate."""
+    comptime assert E.per_block_scale, "embed lookup expects a per-block weight scale"
+    comptime K = BqEmbedLookupKernel[
+        tok_origin, E.m, E.k_block, scale, shard_rows,
+    ]
+
+    @parameter
+    def make(r: Int) -> K:
+        return K(token_ids, weight.data[r], weight.scale[r], dst[r], r, 0, 0)
+
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
+        pools, seq_len, seq_len * E.m * 6,
+        inline_threshold_bytes=EMBED_INLINE_TOKENS * E.m * 6)

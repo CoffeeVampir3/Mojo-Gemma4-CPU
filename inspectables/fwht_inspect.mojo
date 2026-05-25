@@ -1,12 +1,40 @@
 from std.collections import InlineArray
 from std.memory import UnsafePointer
+from std.sys import llvm_intrinsic
 from std.sys.info import simd_width_of
+from std.utils import IndexList
+from std.benchmark import keep
 
-from simd_math.matrixops import butterfly_shuffle, log2
-from simd_math.ops import sqrt
+
+@always_inline
+def sqrt[dtype: DType, width: Int](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    return llvm_intrinsic[
+        "llvm.sqrt",
+        SIMD[dtype, width],
+        SIMD[dtype, width],
+    ](x)
 
 
-comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
+def is_power_of_two[N: Int]() -> Bool:
+    return N > 0 and (N & (N - 1)) == 0
+
+
+def log2[N: Int]() -> Int:
+    comptime if N == 1:
+        return 0
+    else:
+        return 1 + log2[N // 2]()
+
+
+def butterfly_partner[i: Int, stride: Int]() -> Int:
+    return i ^ stride
+
+
+def butterfly_shuffle[width: Int, stride: Int]() -> IndexList[width]:
+    var result = IndexList[width]()
+    comptime for i in range(width):
+        result[i] = butterfly_partner[i, stride]()
+    return result
 
 
 def fwht_width[T: DType, block: Int]() -> Int:
@@ -23,7 +51,7 @@ def fwht_apply[T: DType, block: Int](
         SIMD[T, fwht_width[T, block]()],
         block // fwht_width[T, block](),
     ],
-    ):
+):
     comptime width = fwht_width[T, block]()
     comptime regs = block // width
     comptime stages = log2[block]()
@@ -36,7 +64,8 @@ def fwht_apply[T: DType, block: Int](
             comptime for k in range(width):
                 comptime if (k >> stage) & 1 != 0:
                     sign_buf[k] = Scalar[T](-1.0)
-            var sign = UnsafePointer(to=sign_buf).bitcast[Scalar[T]]().load[width=width]()
+            var sign = UnsafePointer(to=sign_buf).bitcast[
+                Scalar[T]]().load[width=width]()
             comptime for i in range(regs):
                 var partner = r[i].shuffle[mask=mask](r[i])
                 r[i] = r[i].fma(sign, partner)
@@ -58,7 +87,7 @@ def fwht_apply[T: DType, block: Int](
 
 
 @always_inline
-def fwht_block[block: Int](buf: PtrF32):
+def fwht_block[block: Int](buf: UnsafePointer[Float32, MutAnyOrigin]):
     comptime width = fwht_width[DType.float32, block]()
     comptime regs = block // width
     var r = InlineArray[SIMD[DType.float32, width], regs](
@@ -70,7 +99,16 @@ def fwht_block[block: Int](buf: PtrF32):
         (buf + i * width).store(r[i])
 
 
-@always_inline
-def fwht_row[block: Int](buf: PtrF32, cols: Int):
-    for b in range(cols // block):
-        fwht_block[block](buf + b * block)
+def fwht_64(buf: UnsafePointer[Float32, MutAnyOrigin]):
+    fwht_block[64](buf)
+
+
+def fwht_128(buf: UnsafePointer[Float32, MutAnyOrigin]):
+    fwht_block[128](buf)
+
+
+def main():
+    var buf = UnsafePointer[Float32, MutAnyOrigin].unsafe_dangling()
+    fwht_64(buf)
+    fwht_128(buf)
+    keep(buf)

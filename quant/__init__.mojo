@@ -4,7 +4,14 @@ from .recipe import (
     RotationMode, SingleSided, TwoSided,
     ColsumMode, PerBlockColsumMode, NoColsum, PerRowCs, PerBlockCs,
 )
+from .plan import (
+    SlotIdentity, GammaRef, PassthroughPlan, QuantPlan, RouterPlan, SlotPlan,
+    ColsumKind, ScratchCapacity,
+    SCALE_SUFFIX, COLSUM_SUFFIX, GAUGE_SUFFIX, BIAS_SUFFIX,
+)
 from .quantizer import (
-    Quantizer, OutputEntry, SlotMeta, LocatedTensor,
+    Quantizer, QuantWorker, QuantShardKernel,
+    OutputEntry, LocatedTensor,
     build_header, find_tensor,
+    estimate_slot_bytes, partition_slots,
 )

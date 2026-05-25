@@ -6,9 +6,6 @@ from simd_math.matrixops import butterfly_shuffle, log2
 from simd_math.ops import sqrt
 
 
-comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
-
-
 def fwht_width[T: DType, block: Int]() -> Int:
     comptime hw = simd_width_of[T]()
     comptime if block <= hw:
@@ -23,7 +20,8 @@ def fwht_apply[T: DType, block: Int](
         SIMD[T, fwht_width[T, block]()],
         block // fwht_width[T, block](),
     ],
-    ):
+):
+    """In-register FWHT butterfly plus 1/sqrt(block) normalization."""
     comptime width = fwht_width[T, block]()
     comptime regs = block // width
     comptime stages = log2[block]()
@@ -36,7 +34,8 @@ def fwht_apply[T: DType, block: Int](
             comptime for k in range(width):
                 comptime if (k >> stage) & 1 != 0:
                     sign_buf[k] = Scalar[T](-1.0)
-            var sign = UnsafePointer(to=sign_buf).bitcast[Scalar[T]]().load[width=width]()
+            var sign = UnsafePointer(to=sign_buf).bitcast[
+                Scalar[T]]().load[width=width]()
             comptime for i in range(regs):
                 var partner = r[i].shuffle[mask=mask](r[i])
                 r[i] = r[i].fma(sign, partner)
@@ -58,9 +57,10 @@ def fwht_apply[T: DType, block: Int](
 
 
 @always_inline
-def fwht_block[block: Int](buf: PtrF32):
+def fwht_block[block: Int](buf: UnsafePointer[Float32, MutAnyOrigin]):
     comptime width = fwht_width[DType.float32, block]()
     comptime regs = block // width
+
     var r = InlineArray[SIMD[DType.float32, width], regs](
         fill=SIMD[DType.float32, width](0))
     comptime for i in range(regs):
@@ -71,6 +71,6 @@ def fwht_block[block: Int](buf: PtrF32):
 
 
 @always_inline
-def fwht_row[block: Int](buf: PtrF32, cols: Int):
+def fwht_row[block: Int](buf: UnsafePointer[Float32, MutAnyOrigin], cols: Int):
     for b in range(cols // block):
         fwht_block[block](buf + b * block)

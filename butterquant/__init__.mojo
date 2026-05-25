@@ -5,8 +5,9 @@ from .constants import (
     is_supported_fwht_block,
 )
 from .fwht import fwht_block, fwht_row
+from .weight import ButterquantEncoding, ButterquantWeight, ButterquantActivation
 from .kernels import (
-    bf16_to_f32, apply_gamma_in_place, gamma_sqrt_abs_in_place,
+    apply_gamma_in_place, gamma_sqrt_abs_in_place,
     row_absmax, quantize_inv,
     fwht_rotate_rows, fwht_rotate_columns,
     quant_rows_per_row, quant_rows_per_block,

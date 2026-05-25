@@ -1,35 +1,15 @@
-from std.collections import InlineArray
 from std.pathlib import Path
-from std.memory import Span, UnsafePointer
-from std.sys.info import simd_width_of
-from simd_math.ops import sqrt
+from std.memory import UnsafePointer
 
 from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
-from kernels.helpers import Binding, ArenaBases
-from kernels.reductions import dispatch_allreduce_inplace
-from kernels.embedding import dispatch_embed_lookup
-from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
-from kernels.rmsnorm import fused_norm_residual_add
-from kernels.gemv import dispatch_gemv_softcap
-from kernels.gemm import dispatch_gemm, dispatch_gemm_chained_qkv
-from kernels.rope import dispatch_rope_cache_write
+from kernels.helpers import ArenaBases
+from kernels.moe_router import RouterCandidate, SparseRoute
 from kernels.attention_ops import flash_partial_stride
-from kernels.attention_dispatch_kernels import (
-    dispatch_sliding_attention, dispatch_full_attention,
-)
-from kernels.moe_router import (
-    RouterCandidate, SparseRoute,
-    dispatch_router_sharded, merge_router_candidates, build_expert_schedules,
-)
-from kernels.moe_experts import (
-    dispatch_phase1_gate_up, dispatch_phase2_down,
-)
-from kernels.elementwise import dispatch_gelu_gate_up, dispatch_scalar_mul
 from modeling.temporal_scratch import (
     ScratchBuffer, ScratchIsland, ScratchPhase, ScratchPhaseOrder,
-    TemporalLogitsView, TemporalScratchPool, aggregate_scratch_peak,
+    TemporalScratchPool, aggregate_scratch_peak,
 )
 
 from modeling.model_spec import (
@@ -46,21 +26,16 @@ from modeling.gemma4_common import (
     Gemma4BaseConfig, LAYER_SCHEDULE, LayerKind,
 )
 from modeling.modeling_common import (
-    Repeated, ArenaLayout, BF16Bind,
+    Repeated, ArenaLayout,
 )
 from modeling.slot import (
-    Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
+    Slot, SlotGroup, stamp_offsets, emit_descs,
 )
 from quant.recipe import (
     QuantRecipe, PerRowQuant, PerBlockQuant, RouterCenter,
-    SplitGamma, NoGamma, SingleSided, NoColsum, PerRowCs, PerBlockCs,
+    SplitGamma, NoGamma, SingleSided, PerRowCs, PerBlockCs,
 )
 from quant.quantizer import Quantizer
-from linux.io_uring import (
-    IoRing, ReadMode, WriteMode, open_files_for_ring, close_fds,
-)
-from std.memory import alloc
-from std.collections import Dict
 from modeling.loader import discover_shards, load_weights_from_descs
 
 
@@ -161,6 +136,11 @@ comptime PlainPerRowBlockCs[fwht: Int]: QuantRecipe = PerRowQuant(
 )
 
 
+comptime TiedHeadEmbed[fwht: Int]: QuantRecipe = PerBlockQuant(
+    fwht, NoGamma(), SingleSided(), PerBlockCs(),
+)
+
+
 struct SlidingAttnRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
     var q_proj: Slot[BF16, Self.S.SlidingQ,  "self_attn.q_proj.weight",
@@ -249,7 +229,8 @@ struct ActivationSlots(Copyable, ImplicitlyCopyable, SlotGroup):
 struct TailRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4TailShapes[Self.degree]
     var final_norm: Slot[BF16, Self.S.FinalNorm, "model.language_model.norm.weight"]
-    var embed:      Slot[BF16, Self.S.Embed, "model.language_model.embed_tokens.weight"]
+    var embed:      Slot[BF16, Self.S.Embed, "model.language_model.embed_tokens.weight",
+        TiedHeadEmbed[128]]
 
 
 @fieldwise_init
@@ -559,369 +540,27 @@ def build_gemma4_plan[
         tail=tail)
 
 
-def dispatch_sliding_attention_qkv[
-    P: BurstThreadPool, //, degree: Int, max_seq_len: Int, max_worker_count: Int = 128,
-](
-    layout: Gemma4Layout[degree, max_seq_len],
-    ctx: BindContext[degree],
-    base_pos: Int,
-    seq_len: Int,
-    layer_idx: Int,
-    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: List[P],
-):
-    """Sliding-window attention for `seq_len` Q-tokens starting at
-    `base_pos`. `seq_len == 1` uses kv-range-parallel decode flash plus
-    cross-worker merge; `seq_len > 1` uses Q-range-parallel prefill
-    flash that writes finalized output directly (no merge). Caller must
-    keep `seq_len <= SLIDING_WINDOW` so the chunk's KV writes land in
-    one half of the 2W ring and the prior chunk stays addressable."""
-    comptime S = Gemma4Shapes[degree]
-    comptime q_rows = S.SlidingQ.DATA_N
-    comptime kv_rows = S.SlidingKV.DATA_N
-    comptime head_dim = C.HEAD_DIM_SLIDING
-    comptime num_q_heads = q_rows // head_dim
-    comptime num_kv_heads = kv_rows // head_dim
-    comptime sqrt_hd = sqrt[DType.float32, 1](head_dim)
-    comptime hd_eps = head_dim * C.RMS_NORM_EPS
-    comptime rope_half = C.ROPE_HALF_SLIDING
-    comptime kv_cols = kv_rows
-    comptime cache_size = Gemma4StateShapes[degree, max_seq_len].SLIDING_CACHE
-    comptime Island = Gemma4SlidingScratch[degree, max_worker_count]
-
-    debug_assert(
-        seq_len <= C.SLIDING_WINDOW,
-        "sliding attention chunk exceeds SLIDING_WINDOW; the 2W ring "
-        "only protects W tokens of prior context.",
-    )
-
-    var attn_ctx = ctx.with_layer(layout.sliding.base(ctx.arena_bases[0], layer_idx))
-    var attn = layout.sliding.proto.attn
-
-    var q_outs = scratch.binding[Island, "q"](ctx)
-    var k_outs = scratch.binding[Island, "kv"](ctx)
-    var v_outs = k_outs.shifted(seq_len * kv_rows)
-    var xs = layout.activations.x_residual.state_binding(ctx)
-
-    dispatch_gemm_chained_qkv[
-        q_rows=q_rows, kv_rows=kv_rows, cols=C.HIDDEN, tp=degree,
-        max_worker_count=max_worker_count,
-    ](xs,
-      attn.q_proj.binding(attn_ctx),
-      attn.k_proj.binding(attn_ctx),
-      attn.v_proj.binding(attn_ctx),
-      q_outs, k_outs, v_outs, seq_len, pools)
-
-    dispatch_rms_norm_qkv_heads[
-        head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
-        num_q=num_q_heads, num_kv=num_kv_heads, tp=degree,
-        max_worker_count=max_worker_count,
-    ](q_outs, q_outs, k_outs, k_outs, v_outs, v_outs,
-      attn.q_norm.binding(attn_ctx),
-      attn.k_norm.binding(attn_ctx),
-      seq_len, pools)
-
-    var kv_lb = layout.sliding_kv.base(ctx.arena_bases[0], layer_idx)
-    var k_kv = layout.sliding_kv.proto.k.binding(kv_lb, ctx.arena_bases)
-    var v_kv = layout.sliding_kv.proto.v.binding(kv_lb, ctx.arena_bases)
-
-    dispatch_rope_cache_write[
-        half=rope_half, pair_stride=head_dim // 2,
-        num_q=num_q_heads, num_kv=num_kv_heads,
-        head_dim=head_dim, kv_cache_stride=kv_cols,
-        slot_mask=cache_size - 1, cache_degree=1, tp=degree,
-        max_worker_count=max_worker_count,
-    ](q_outs, k_outs, v_outs,
-      k_kv, v_kv,
-      layout.sliding_rope.cos.state_binding(ctx),
-      layout.sliding_rope.sin.state_binding(ctx),
-      base_pos, seq_len, pools)
-
-    var partials = scratch.binding[Island, "partials"](ctx)
-
-    dispatch_sliding_attention[
-        head_dim=head_dim, num_q=num_q_heads,
-        gqa_ratio=num_q_heads // num_kv_heads,
-        kv_stride=kv_cols, window=C.SLIDING_WINDOW,
-        cache_size=cache_size,
-        partial_stride=Island.PARTIAL_STRIDE, tp=degree,
-        max_worker_count=max_worker_count,
-    ](q_outs, k_kv, v_kv, q_outs, partials,
-      base_pos, seq_len, pools)
-
-    dispatch_gemm[
-        rows=C.HIDDEN, cols=q_rows, tp=degree,
-        max_worker_count=max_worker_count,
-    ](
-        q_outs,
-        attn.o_proj.binding(attn_ctx),
-        xs, seq_len, pools)
-
-
-def dispatch_full_attention_qkv[
-    P: BurstThreadPool, //, degree: Int, max_seq_len: Int, max_worker_count: Int = 128,
-](
-    layout: Gemma4Layout[degree, max_seq_len],
-    ctx: BindContext[degree],
-    base_pos: Int,
-    seq_len: Int,
-    layer_idx: Int,
-    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: List[P],
-):
-    """Full attention for `seq_len` Q-tokens starting at `base_pos`. The
-    unified attention dispatcher routes decode vs prefill internally
-    based on seq_len; this orchestrator does not branch."""
-    comptime S = Gemma4Shapes[degree]
-    comptime q_rows = S.FullQ.DATA_N
-    comptime local_q_rows = S.FullO.DATA_M
-    comptime k_rows = S.FullK.DATA_N
-    comptime head_dim = C.HEAD_DIM_FULL
-    comptime num_q_heads = q_rows // head_dim
-    comptime local_num_q_heads = local_q_rows // head_dim
-    comptime num_kv_heads = k_rows // head_dim
-    comptime sqrt_hd = sqrt[DType.float32, 1](head_dim)
-    comptime hd_eps = head_dim * C.RMS_NORM_EPS
-    comptime rope_half = C.ROPE_HALF_FULL
-    comptime pair_stride = head_dim // 2
-    comptime kv_cols = k_rows
-    comptime Island = Gemma4FullScratch[degree, max_worker_count]
-
-    var attn_ctx = ctx.with_layer(layout.full.base(ctx.arena_bases[0], layer_idx))
-    var attn = layout.full.proto.attn
-
-    var q_outs = scratch.binding[Island, "q"](ctx)
-    var k_outs = scratch.binding[Island, "kv"](ctx)
-    var v_outs = k_outs.shifted(seq_len * k_rows)
-    var xs = layout.activations.x_residual.state_binding(ctx)
-
-    dispatch_gemm[
-        rows=q_rows, cols=C.HIDDEN, tp=degree,
-        max_worker_count=max_worker_count,
-    ](
-        xs, attn.q_proj.binding(attn_ctx), q_outs, seq_len, pools)
-    dispatch_gemm[
-        rows=k_rows, cols=C.HIDDEN, tp=degree,
-        max_worker_count=max_worker_count,
-    ](
-        xs, attn.k_proj.binding(attn_ctx), k_outs, seq_len, pools)
-
-    # Full attention has no v_proj; v reads from k's pre-norm buffer (chain runs V→Q→K).
-    dispatch_rms_norm_qkv_heads[
-        head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
-        num_q=num_q_heads, num_kv=num_kv_heads, tp=degree,
-        max_worker_count=max_worker_count,
-    ](q_outs, q_outs, k_outs, k_outs, k_outs, v_outs,
-      attn.q_norm.binding(attn_ctx),
-      attn.k_norm.binding(attn_ctx),
-      seq_len, pools)
-
-    var kv_lb = layout.full_kv.base(ctx.arena_bases[0], layer_idx)
-    var k_kv = layout.full_kv.proto.k.binding(kv_lb, ctx.arena_bases)
-    var v_kv = layout.full_kv.proto.v.binding(kv_lb, ctx.arena_bases)
-
-    dispatch_rope_cache_write[
-        half=rope_half, pair_stride=pair_stride,
-        num_q=num_q_heads, num_kv=num_kv_heads,
-        head_dim=head_dim, kv_cache_stride=kv_cols,
-        slot_mask=-1, cache_degree=degree, tp=degree,
-        max_worker_count=max_worker_count,
-    ](q_outs, k_outs, v_outs,
-      k_kv, v_kv,
-      layout.full_rope.cos.state_binding(ctx),
-      layout.full_rope.sin.state_binding(ctx),
-      base_pos, seq_len, pools)
-
-    var q_local_outs = scratch.binding[Island, "q_local"](ctx)
-    var partials = scratch.binding[Island, "partials"](ctx)
-
-    dispatch_full_attention[
-        head_dim=head_dim, num_q=num_q_heads,
-        local_num_q=local_num_q_heads,
-        gqa_ratio=C.NUM_HEADS // C.NUM_KV_HEADS_FULL,
-        kv_stride=kv_cols,
-        partial_stride=Island.PARTIAL_STRIDE, tp=degree,
-        max_worker_count=max_worker_count,
-    ](q_outs, k_kv, v_kv, q_local_outs, partials,
-      base_pos, seq_len, pools)
-
-    dispatch_gemm[
-        rows=C.HIDDEN, cols=local_q_rows, tp=degree,
-        max_worker_count=max_worker_count,
-    ](
-        q_local_outs,
-        attn.o_proj.binding(attn_ctx),
-        xs, seq_len, pools)
-
-
-def dispatch_moe[
-    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
-](
-    body: BodyRefs[degree],
-    ctx: BindContext[degree],
-    x_input: BF16Bind[degree],
-    moe_out: BF16Bind[degree],
-    seq_len: Int,
-    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: List[P],
-):
-    comptime experts_per_rank = C.NUM_EXPERTS // degree
-    comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
-    comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
-    comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
-
-    var per_expert_scale_ptr = body.router_pes.at(ctx.layer_base)
-
-    var x_normed = scratch.binding[Ffn, "moe_x_normed"](ctx)
-    var cands = scratch.binding[Ffn, "moe_cands"](ctx)
-    var router_scaled = scratch.binding[Ffn, "moe_router_scaled"](ctx)
-    var route_idx = scratch.binding[Ffn, "moe_route_idx"](ctx)
-    var route_w = scratch.binding[Ffn, "moe_route_w"](ctx)
-    var expert_offset = scratch.binding[Ffn, "moe_expert_offset"](ctx)
-    var routes = scratch.binding[Ffn, "moe_routes"](ctx)
-    var hidden_bucket = scratch.binding[Ffn, "moe_hidden_bucket"](ctx)
-    var moe_accum = scratch.binding[Ffn, "moe_accum"](ctx)
-    var gate_scratch = scratch.binding[Ffn, "moe_gate_scratch"](ctx)
-
-    dispatch_router_sharded[
-        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-        experts_per_rank=experts_per_rank,
-        top_k=C.TOP_K, tp=degree,
-        max_worker_count=max_worker_count,
-    ](x_input,
-      body.router_proj.binding(ctx),
-      body.router_scale.binding(ctx),
-      router_scaled, cands, seq_len, pools)
-
-    merge_router_candidates[degree, C.TOP_K](
-        cands, per_expert_scale_ptr, route_idx, route_w, seq_len)
-
-    dispatch_rms_norm[
-        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
-        max_worker_count=max_worker_count,
-    ](x_input, x_normed,
-      body.pre_ffn_norm_2.binding(ctx), seq_len, pools)
-
-    build_expert_schedules[degree, experts_per_rank, C.TOP_K](
-        route_idx, route_w, expert_offset, routes, seq_len)
-
-    dispatch_phase1_gate_up[
-        hidden=C.HIDDEN, gate_up_fused=C.MOE_GATE_UP_FUSED,
-        intermediate=C.MOE_INTERMEDIATE,
-        experts_per_rank=experts_per_rank, tp=degree,
-        tile_j=Ffn.PHASE1_TILE_J, MR=Ffn.PHASE1_MR,
-        max_worker_count=max_worker_count,
-    ](x_normed, expert_offset, routes,
-      body.experts_gate_up.binding(ctx),
-      gate_scratch, hidden_bucket, pools)
-
-    dispatch_phase2_down[
-        hidden=C.HIDDEN, intermediate=C.MOE_INTERMEDIATE,
-        experts_per_rank=experts_per_rank, tp=degree,
-        max_worker_count=max_worker_count,
-    ](expert_offset, routes, hidden_bucket,
-      body.experts_down.binding(ctx),
-      moe_accum, moe_out, seq_len, pools)
-
-    dispatch_allreduce_inplace[
-        BF16, degree, max_worker_count=max_worker_count,
-    ](moe_out, seq_len * C.HIDDEN, pools)
-
-
-def dispatch_ffn[
-    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
-](
-    body: BodyRefs[degree],
-    ctx: BindContext[degree],
-    x_main: BF16Bind[degree],
-    x_residual: BF16Bind[degree],
-    seq_len: Int,
-    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
-    mut pools: List[P],
-):
-    comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
-    comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
-    comptime intermediate_per_rank = Gemma4Shapes[degree].GateUp.DATA_N
-    comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
-
-    var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_base)
-
-    var gate = scratch.binding[Ffn, "ffn_gate"](ctx)
-    var up = scratch.binding[Ffn, "ffn_up"](ctx)
-    var dense_out = scratch.binding[Ffn, "ffn_dense_out"](ctx)
-
-    dispatch_rms_norm[
-        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
-        max_worker_count=max_worker_count,
-    ](x_main, x_residual,
-      body.pre_ffn_norm.binding(ctx), seq_len, pools)
-
-    dispatch_gemm[
-        rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
-        max_worker_count=max_worker_count,
-    ](x_residual, body.gate_proj.binding(ctx), gate, seq_len, pools)
-
-    dispatch_gemm[
-        rows=intermediate_per_rank, cols=C.HIDDEN, tp=degree,
-        max_worker_count=max_worker_count,
-    ](x_residual, body.up_proj.binding(ctx), up, seq_len, pools)
-
-    dispatch_gelu_gate_up[
-        intermediate=intermediate_per_rank, tp=degree,
-        max_worker_count=max_worker_count,
-    ](gate, up, gate, seq_len, pools)
-
-    dispatch_moe[degree=degree, max_worker_count=max_worker_count](
-        body, ctx, x_main, x_residual, seq_len, scratch, pools)
-
-    dispatch_gemm[
-        rows=C.HIDDEN, cols=intermediate_per_rank, tp=degree,
-        max_worker_count=max_worker_count,
-    ](gate, body.down_proj.binding(ctx), dense_out, seq_len, pools)
-
-    dispatch_allreduce_inplace[
-        BF16, degree, max_worker_count=max_worker_count,
-    ](dense_out, seq_len * C.HIDDEN, pools)
-
-    dispatch_rms_norm[
-        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
-        max_worker_count=max_worker_count,
-    ](dense_out, dense_out,
-      body.post_ffn_norm_1.binding(ctx), seq_len, pools)
-
-    fused_norm_residual_add[
-        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
-        max_worker_count=max_worker_count,
-    ](x_residual, dense_out, dense_out,
-      body.post_ffn_norm_2.binding(ctx), seq_len, pools)
-
-    fused_norm_residual_add[
-        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
-        max_worker_count=max_worker_count,
-    ](dense_out, x_main, x_main,
-      body.post_ffn_norm.binding(ctx), seq_len, pools)
-
-    var ls_value = layer_scalar_ptr[0].cast[DType.float32]()
-    dispatch_scalar_mul[
-        hidden=C.HIDDEN, tp=degree, max_worker_count=max_worker_count,
-    ](x_main, x_main, ls_value, seq_len, pools)
-
-
 struct Gemma4[
     degree: Int, max_seq_len: Int = 8192,
     max_worker_count: Int = 128,
     Pool: BurstThreadPool = BurstPool[],
 ](Movable):
+    """BQ variant of the Gemma 4 model. The runtime forward path lives
+    in `gemma_4_moe.mojo`; this file only exists to drive the quantizer
+    (recipes on every weight slot) and to load and inspect the resulting
+    int8 checkpoint until ButterQuant kernels arrive."""
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
     var layout: Gemma4Layout[Self.degree, Self.max_seq_len]
     var scratch: Gemma4ScratchPool[Self.degree, Self.max_worker_count]
     var arena_bases: ArenaBases[Self.degree]
+    var descs: List[WeightDesc]
 
     def __init__(out self,
         var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
         var pools: List[Self.Pool],
         layout: Gemma4Layout[Self.degree, Self.max_seq_len],
+        var descs: List[WeightDesc],
     ):
         self.arena_bases = ArenaBases[Self.degree].uninitialized()
         for r in range(Self.degree):
@@ -929,174 +568,55 @@ struct Gemma4[
         self.layout = layout.bind(self.arena_bases[0])
         self.arenas = arenas^
         self.pools = pools^
+        self.descs = descs^
         self.scratch = Gemma4ScratchPool[
             Self.degree, Self.max_worker_count,
         ](
             self.layout.arena.scratch_base())
 
-    def model_init(mut self):
-        ref layout = self.layout
-        comptime width = simd_width_of[DType.float32]()
-
-        comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
-        for rank in range(Self.degree):
-            var arena_base = self.arena_bases[rank]
-            for i in range(C.NUM_LAYERS):
-                var entry = LAYER_SCHEDULE[i]
-                var p: UnsafePointer[BFloat16, MutAnyOrigin]
-                if entry.kind == LayerKind.FULL:
-                    var lb = layout.full.base(arena_base, entry.local_idx)
-                    p = layout.full.proto.body.router_scale.at(lb)
-                else:
-                    var lb = layout.sliding.base(arena_base, entry.local_idx)
-                    p = layout.sliding.proto.body.router_scale.at(lb)
-                for j in range(0, C.HIDDEN, width):
-                    var lane = p + j
-                    var v = lane.load[width=width]().cast[DType.float32]()
-                    lane.store((v * inv_sqrt_hidden).cast[DType.bfloat16]())
-        print("  router constants baked")
-
-        from kernels.rope import init_rope_table, init_rope_table_partial_strided
-        for rank in range(Self.degree):
-            var base = self.arena_bases[rank]
-            var sl_cos = layout.sliding_rope.cos.at(base)
-            var sl_sin = layout.sliding_rope.sin.at(base)
-            init_rope_table[C.ROPE_HALF_SLIDING, Self.max_seq_len](
-                sl_cos, sl_sin, 10000.0)
-            var fl_cos = layout.full_rope.cos.at(base)
-            var fl_sin = layout.full_rope.sin.at(base)
-            init_rope_table_partial_strided[
-                C.ROPE_HALF_FULL, Self.max_seq_len,
-            ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, 0, 1)
-        print("  rope tables initialized")
-
-    def forward[
-        tok_origin: ImmutOrigin, //,
-    ](
-        mut self,
-        token_ids: Span[Int32, tok_origin],
-        base_pos: Int,
-    ) -> TemporalLogitsView[C.VOCAB_SIZE, Self.degree]:
-        ref layout = self.layout
-        comptime shard_rows = Gemma4TailShapes[Self.degree].Embed.DATA_N
-        comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
-        comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
-        comptime embed_scale = Float64(sqrt[DType.float32, 1](C.HIDDEN)
-            .cast[DType.bfloat16]().cast[DType.float32]())
-        comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
-
-        var total_len = len(token_ids)
-        debug_assert(total_len > 0, "forward called with empty token_ids")
-        debug_assert(
-            base_pos + total_len <= Self.max_seq_len,
-            "forward exceeds max_seq_len",
-        )
-
-        var ctx = BindContext[Self.degree](
-            arena_bases=self.arena_bases, layer_base=0)
-        var tail_ctx = ctx.with_layer(
-            layout.tail.base(self.arena_bases[0], 0))
-
-        var x_main_ranks = layout.activations.x_main.state_binding(ctx)
-        var x_res_ranks = layout.activations.x_residual.state_binding(ctx)
-        var logits = self.scratch.binding[
-            Gemma4HeadScratch[Self.degree], "logits",
-        ](ctx)
-
-        var consumed = 0
-        var pos = base_pos
-        while consumed < total_len:
-            var remaining = total_len - consumed
-            var chunk_len = remaining if remaining < C.SLIDING_WINDOW else C.SLIDING_WINDOW
-            var is_last = (consumed + chunk_len == total_len)
-
-            var chunk = Span[Int32, tok_origin](
-                ptr=token_ids.unsafe_ptr() + consumed,
-                length=chunk_len)
-
-            dispatch_embed_lookup[
-                hidden=C.HIDDEN, scale=embed_scale, shard_rows=shard_rows,
-                tp=Self.degree, max_worker_count=Self.max_worker_count,
-            ](chunk,
-              layout.tail.proto.embed.binding(tail_ctx),
-              x_main_ranks, chunk_len, self.pools)
-            dispatch_allreduce_inplace[
-                BF16, Self.degree, max_worker_count=Self.max_worker_count,
-            ](x_main_ranks, chunk_len * C.HIDDEN, self.pools)
-
-            for i in range(C.NUM_LAYERS):
-                var entry = LAYER_SCHEDULE[i]
-                var body: BodyRefs[Self.degree]
-                var layer_ctx: BindContext[Self.degree]
-                if entry.kind == LayerKind.FULL:
-                    layer_ctx = ctx.with_layer(layout.full.base(self.arena_bases[0], entry.local_idx))
-                    body = layout.full.proto.body
-                else:
-                    layer_ctx = ctx.with_layer(layout.sliding.base(self.arena_bases[0], entry.local_idx))
-                    body = layout.sliding.proto.body
-
-                dispatch_rms_norm[
-                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                    tp=Self.degree, max_worker_count=Self.max_worker_count,
-                ](x_main_ranks, x_res_ranks,
-                  body.input_norm.binding(layer_ctx),
-                  chunk_len, self.pools)
-
-                if entry.kind == LayerKind.FULL:
-                    dispatch_full_attention_qkv[
-                        degree=Self.degree,
-                        max_seq_len=Self.max_seq_len,
-                        max_worker_count=Self.max_worker_count,
-                    ](
-                        layout, ctx, pos, chunk_len, entry.local_idx,
-                        self.scratch, self.pools)
-                else:
-                    dispatch_sliding_attention_qkv[
-                        degree=Self.degree,
-                        max_seq_len=Self.max_seq_len,
-                        max_worker_count=Self.max_worker_count,
-                    ](
-                        layout, ctx, pos, chunk_len, entry.local_idx,
-                        self.scratch, self.pools)
-
-                dispatch_allreduce_inplace[
-                    BF16, Self.degree, max_worker_count=Self.max_worker_count,
-                ](x_res_ranks, chunk_len * C.HIDDEN, self.pools)
-
-                fused_norm_residual_add[
-                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                    tp=Self.degree, max_worker_count=Self.max_worker_count,
-                ](x_res_ranks, x_main_ranks, x_main_ranks,
-                  body.post_attn_norm.binding(layer_ctx),
-                  chunk_len, self.pools)
-
-                dispatch_ffn[
-                    degree=Self.degree, max_worker_count=Self.max_worker_count,
-                ](
-                    body, layer_ctx, x_main_ranks, x_res_ranks, chunk_len,
-                    self.scratch, self.pools)
-
-            if is_last:
-                var x_last = x_main_ranks.shifted((chunk_len - 1) * C.HIDDEN)
-
-                dispatch_rms_norm[
-                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                    tp=Self.degree, max_worker_count=Self.max_worker_count,
-                ](x_last, x_last,
-                  layout.tail.proto.final_norm.binding(tail_ctx),
-                  1, self.pools)
-
-                dispatch_gemv_softcap[
-                    rows=vocab_per_rank, cols=C.HIDDEN, tp=Self.degree,
-                    cap=C.LOGIT_SOFTCAP,
-                    max_worker_count=Self.max_worker_count,
-                ](x_last, layout.tail.proto.embed.binding(tail_ctx), logits, self.pools)
-
-            consumed += chunk_len
-            pos += chunk_len
-
-        return TemporalLogitsView[C.VOCAB_SIZE, Self.degree](
-            logits.ptr, self.arena_bases)
+    def dump_tensors(self):
+        """One line per loaded tensor: full name, dtype, global/data shape,
+        per-rank arena offset, plus the first four values from rank 0. The
+        line count is high (one per WeightDesc, including every sidecar)
+        but is the cheapest way to verify the int8 / scale / colsum /
+        gauge layout end-to-end without a runtime kernel."""
+        var n = len(self.descs)
+        print(t"--- {n} loaded tensors ---")
+        for i in range(n):
+            ref d = self.descs[i]
+            var addr = self.arena_bases[0] + d.arena_offset
+            var name = d.name
+            var dt = d.dtype
+            var gr = d.global_rows
+            var gc = d.global_cols
+            var dr = d.data_rows
+            var dc = d.data_cols
+            var off = d.arena_offset
+            var tr = d.target_rank
+            print(
+                t"{name} :: {dt} global=[{gr},{gc}] data=[{dr},{dc}] "
+                t"target={tr} arena_off={off}"
+            )
+            var count = dr * dc
+            if count > 4: count = 4
+            if dt == DType.int8:
+                var p = UnsafePointer[Int8, MutAnyOrigin](
+                    unsafe_from_address=addr)
+                for k in range(count):
+                    var v = Int(p[k])
+                    print(t"    [{k}] = {v}")
+            elif dt == DType.float32:
+                var p = UnsafePointer[Float32, MutAnyOrigin](
+                    unsafe_from_address=addr)
+                for k in range(count):
+                    var v = p[k]
+                    print(t"    [{k}] = {v}")
+            elif dt == DType.bfloat16:
+                var p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                    unsafe_from_address=addr)
+                for k in range(count):
+                    var v = p[k].cast[DType.float32]()
+                    print(t"    [{k}] = {v}")
 
     @staticmethod
     def load(
@@ -1146,8 +666,7 @@ struct Gemma4[
         for rank in range(Self.degree):
             _ = arenas[rank].prefault(layout.arena.distributed_bytes, layout.arena.state_bytes)
 
-        var model = Self(arenas^, pools^, layout)
-        model.model_init()
+        var model = Self(arenas^, pools^, layout, descs^)
         return model^
 
     @staticmethod
