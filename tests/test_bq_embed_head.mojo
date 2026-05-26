@@ -10,11 +10,12 @@ from kernels.rmsnorm import rms_reduce_row
 from kernels.gemv import softcap_value
 from butterquant import (
     rotate_and_quant_per_block, colsum_per_block,
-    ButterquantEncoding, ButterquantWeight, ButterquantActivation,
+    ButterquantWeight, ButterquantActivation,
 )
 from butterquant_kernels import (
     dispatch_bq_embed_lookup, dispatch_bq_head_prep, dispatch_bq_head_gemv,
 )
+from quant.recipe import PerBlockQuant, NoGamma, SingleSided, PerBlockCs
 
 
 comptime HIDDEN = 2816
@@ -26,8 +27,7 @@ comptime SQRT_N = sqrt[DType.float32, 1](HIDDEN)
 comptime N_EPS = HIDDEN * 1e-6
 comptime EMBED_SCALE = Float64(
     sqrt[DType.float32, 1](HIDDEN).cast[DType.bfloat16]().cast[DType.float32]())
-comptime ENC = ButterquantEncoding(
-    n=VOCAB, m=HIDDEN, k_block=BLOCK, per_block_scale=True, has_colsum=True)
+comptime QUANT = PerBlockQuant(BLOCK, NoGamma(), SingleSided(), PerBlockCs())
 
 comptime F32ExtPtr = UnsafePointer[Float32, MutAnyOrigin]
 comptime I8ExtPtr = UnsafePointer[Int8, MutAnyOrigin]
@@ -134,7 +134,7 @@ def main():
     var pools = List[TestPool](capacity=1)
     pools.append(TestPool(4, 0))
 
-    var bqw = ButterquantWeight[ENC, 1](
+    var bqw = ButterquantWeight[QUANT, VOCAB, HIDDEN, 1](
         Binding[Int8, 1](wi8, bases),
         Binding[Float32, 1](sw, bases),
         Binding[Float32, 1](cs, bases))

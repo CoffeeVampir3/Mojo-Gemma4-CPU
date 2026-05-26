@@ -9,8 +9,9 @@ from butterquant.runtime import (
     prepare_head_activation, head_logit_row, F32Ptr, I8Ptr,
 )
 from butterquant.weight import (
-    ButterquantEncoding, ButterquantWeight, ButterquantActivation,
+    ButterquantWeight, ButterquantActivation, quant_k_block, quant_per_block,
 )
+from quant.recipe import QuantRecipe
 
 
 def dispatch_bq_head_prep[
@@ -56,17 +57,17 @@ struct BqHeadGemvKernel[
 
 
 def dispatch_bq_head_gemv[
-    P: BurstThreadPool, E: ButterquantEncoding, tp: Int, //,
+    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int, //,
     cap: Float64,
     max_worker_count: Int = 128,
 ](
     act: ButterquantActivation[tp],
-    weight: ButterquantWeight[E, tp],
+    weight: ButterquantWeight[quant, n, m, tp],
     output: Binding[BFloat16, tp],
     mut pools: List[P],
 ):
-    comptime assert E.per_block_scale, "head GEMV consumes a per-block weight scale"
-    comptime K = BqHeadGemvKernel[E.n, E.m, E.k_block, cap]
+    comptime assert quant_per_block[quant](), "head GEMV consumes a per-block weight scale"
+    comptime K = BqHeadGemvKernel[n, m, quant_k_block[quant](), cap]
 
     @parameter
     def make(r: Int) -> K:
@@ -74,5 +75,5 @@ def dispatch_bq_head_gemv[
                  output[r], 0, 0)
 
     fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, E.n, E.n * E.m,
-        inline_threshold_bytes=GEMV_INLINE_ROWS * E.m)
+        pools, n, n * m,
+        inline_threshold_bytes=GEMV_INLINE_ROWS * m)

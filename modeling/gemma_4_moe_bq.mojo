@@ -1,12 +1,15 @@
 from std.pathlib import Path
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 
 from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
+from simd_math.ops import sqrt
 from kernels.helpers import ArenaBases
 from kernels.moe_router import RouterCandidate, SparseRoute
 from kernels.attention_ops import flash_partial_stride
+from kernels.reductions import dispatch_allreduce_inplace
+from butterquant_kernels import dispatch_bq_embed_lookup
 from modeling.temporal_scratch import (
     ScratchBuffer, ScratchIsland, ScratchPhase, ScratchPhaseOrder,
     TemporalScratchPool, aggregate_scratch_peak,
@@ -29,7 +32,7 @@ from modeling.modeling_common import (
     Repeated, ArenaLayout,
 )
 from modeling.slot import (
-    Slot, SlotGroup, stamp_offsets, emit_descs,
+    Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
 )
 from quant.recipe import (
     QuantRecipe, PerRowQuant, PerBlockQuant, RouterCenter,
@@ -617,6 +620,58 @@ struct Gemma4[
                 for k in range(count):
                     var v = p[k].cast[DType.float32]()
                     print(t"    [{k}] = {v}")
+
+    def forward[
+        tok_origin: ImmutOrigin, //,
+    ](
+        mut self,
+        token_ids: Span[Int32, tok_origin],
+        base_pos: Int,
+    ):
+        """Runs the bq model up to and including token embedding: resolves the
+        int8 embedding through the bq_weight bridge, dispatches the butterquant
+        embed-lookup into the per-token activation state, replicates across
+        ranks, and logs the embedded hidden values. The remaining layers are
+        not yet implemented."""
+        ref layout = self.layout
+        comptime shard_rows = Gemma4TailShapes[Self.degree].Embed.DATA_N
+        comptime embed_scale = Float64(sqrt[DType.float32, 1](C.HIDDEN)
+            .cast[DType.bfloat16]().cast[DType.float32]())
+
+        var total_len = len(token_ids)
+        debug_assert(total_len > 0, "forward called with empty token_ids")
+        var chunk_len = total_len if total_len < C.SLIDING_WINDOW else C.SLIDING_WINDOW
+
+        var ctx = BindContext[Self.degree](
+            arena_bases=self.arena_bases, layer_base=0)
+        var tail_ctx = ctx.with_layer(
+            layout.tail.base(self.arena_bases[0], 0))
+
+        var x_main_ranks = layout.activations.x_main.state_binding(ctx)
+
+        var chunk = Span[Int32, tok_origin](
+            ptr=token_ids.unsafe_ptr(), length=chunk_len)
+
+        dispatch_bq_embed_lookup[
+            scale=embed_scale, shard_rows=shard_rows,
+            max_worker_count=Self.max_worker_count,
+        ](chunk,
+          layout.tail.proto.embed.bq_weight(tail_ctx),
+          x_main_ranks, chunk_len, self.pools)
+        dispatch_allreduce_inplace[
+            BF16, Self.degree, max_worker_count=Self.max_worker_count,
+        ](x_main_ranks, chunk_len * C.HIDDEN, self.pools)
+
+        var x0 = x_main_ranks[0]
+        var h0 = x0[0].cast[DType.float32]()
+        var h1 = x0[1].cast[DType.float32]()
+        var h2 = x0[2].cast[DType.float32]()
+        var h3 = x0[3].cast[DType.float32]()
+        var tid0 = Int(token_ids[0])
+        print(
+            t"bq forward: embedded {chunk_len} tokens; "
+            t"token0(id={tid0}) hidden[0..3] = {h0}, {h1}, {h2}, {h3}"
+        )
 
     @staticmethod
     def load(

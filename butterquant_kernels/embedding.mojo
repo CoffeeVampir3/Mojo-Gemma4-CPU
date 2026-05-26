@@ -11,7 +11,10 @@ from butterquant.fwht import fwht_row
 from butterquant.runtime import (
     dequant_weight_row_per_block, scale_cast_row, zero_row, F32Ptr, I8Ptr,
 )
-from butterquant.weight import ButterquantEncoding, ButterquantWeight
+from butterquant.weight import (
+    ButterquantWeight, quant_k_block, quant_per_block,
+)
+from quant.recipe import QuantRecipe
 
 
 @fieldwise_init
@@ -56,20 +59,20 @@ struct BqEmbedLookupKernel[
 
 def dispatch_bq_embed_lookup[
     P: BurstThreadPool, tok_origin: ImmutOrigin,
-    E: ButterquantEncoding, tp: Int, //,
+    quant: QuantRecipe, n: Int, m: Int, tp: Int, //,
     scale: Float64, shard_rows: Int,
     max_worker_count: Int = 128,
 ](
     token_ids: Span[Int32, tok_origin],
-    weight: ButterquantWeight[E, tp],
+    weight: ButterquantWeight[quant, n, m, tp],
     dst: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
 ):
     """Unowned tokens write zero; caller follows with allreduce to replicate."""
-    comptime assert E.per_block_scale, "embed lookup expects a per-block weight scale"
+    comptime assert quant_per_block[quant](), "embed lookup expects a per-block weight scale"
     comptime K = BqEmbedLookupKernel[
-        tok_origin, E.m, E.k_block, scale, shard_rows,
+        tok_origin, m, quant_k_block[quant](), scale, shard_rows,
     ]
 
     @parameter
@@ -77,5 +80,5 @@ def dispatch_bq_embed_lookup[
         return K(token_ids, weight.data[r], weight.scale[r], dst[r], r, 0, 0)
 
     fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * E.m * 6,
-        inline_threshold_bytes=EMBED_INLINE_TOKENS * E.m * 6)
+        pools, seq_len, seq_len * m * 6,
+        inline_threshold_bytes=EMBED_INLINE_TOKENS * m * 6)

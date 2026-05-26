@@ -1,12 +1,6 @@
 from std.utils.variant import Variant
 
 
-comptime SCALE_SUFFIX: StaticString = ".scale"
-comptime COLSUM_SUFFIX: StaticString = ".colsum"
-comptime GAUGE_SUFFIX: StaticString = ".gauge"
-comptime BIAS_SUFFIX: StaticString = ".bias"
-
-
 struct ColsumKind:
     comptime NONE = 0
     comptime PER_ROW = 1

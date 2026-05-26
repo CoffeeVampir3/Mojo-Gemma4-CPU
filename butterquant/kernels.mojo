@@ -4,9 +4,7 @@ from std.os import abort
 
 from simd_math.ops import quantize_i8, sqrt
 from butterquant.fwht import fwht_block, fwht_row
-from butterquant.constants import (
-    SIMD_F32_WIDTH, FWHT_POWER_OF_TWO_UNROLLING,
-)
+from butterquant.constants import SIMD_F32_WIDTH
 
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
@@ -123,16 +121,26 @@ def rotate_and_quant_per_block[block: Int](
 
 def dispatch_fwht_block[
     *,
-    power_of_two_unrolling: Int,
     dispatch: def[block: Int]() capturing [_] -> None,
 ](block: Int) -> Bool:
-    comptime assert power_of_two_unrolling > 0, (
-        "power_of_two_unrolling must be positive")
-    comptime for i in range(power_of_two_unrolling):
-        comptime candidate = WIDTH << i
-        if block == candidate:
-            dispatch[candidate]()
-            return True
+    if block == 16:
+        dispatch[16]()
+        return True
+    if block == 32:
+        dispatch[32]()
+        return True
+    if block == 64:
+        dispatch[64]()
+        return True
+    if block == 128:
+        dispatch[128]()
+        return True
+    if block == 256:
+        dispatch[256]()
+        return True
+    if block == 512:
+        dispatch[512]()
+        return True
     return False
 
 
@@ -148,20 +156,14 @@ def rotate_and_quant[per_block: Bool](
     def rotate_rows_and_quant[k_block: Int]():
         fwht_rotate_rows[k_block](work, rows, cols)
         if two_sided_head_dim != 0:
-            if not dispatch_fwht_block[
-                power_of_two_unrolling=FWHT_POWER_OF_TWO_UNROLLING,
-                dispatch=rotate_columns,
-            ](two_sided_head_dim):
+            if not dispatch_fwht_block[dispatch=rotate_columns](two_sided_head_dim):
                 abort(t"butterquant: unsupported M-axis FWHT block={two_sided_head_dim}")
         comptime if per_block:
             quant_rows_per_block[k_block](work, qi, scales, rows, cols)
         else:
             quant_rows_per_row(work, qi, scales, rows, cols)
 
-    if not dispatch_fwht_block[
-        power_of_two_unrolling=FWHT_POWER_OF_TWO_UNROLLING,
-        dispatch=rotate_rows_and_quant,
-    ](block):
+    if not dispatch_fwht_block[dispatch=rotate_rows_and_quant](block):
         abort(t"butterquant: unsupported K-axis FWHT block={block}")
 
 

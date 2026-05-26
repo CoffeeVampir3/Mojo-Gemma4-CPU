@@ -2,10 +2,12 @@ from .constants import (
     SIMD_F32_WIDTH,
     DEFAULT_PANEL_ROWS,
     DEFAULT_COPY_CHUNK_BYTES,
-    is_supported_fwht_block,
 )
 from .fwht import fwht_block, fwht_row
-from .weight import ButterquantEncoding, ButterquantWeight, ButterquantActivation
+from .weight import (
+    ButterquantWeight, ButterquantRouter, ButterquantActivation,
+    quant_k_block, quant_per_block, quant_has_colsum, router_has_bias,
+)
 from .kernels import (
     apply_gamma_in_place, gamma_sqrt_abs_in_place,
     row_absmax, quantize_inv,

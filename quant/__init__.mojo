@@ -7,6 +7,10 @@ from .recipe import (
 from .plan import (
     SlotIdentity, GammaRef, PassthroughPlan, QuantPlan, RouterPlan, SlotPlan,
     ColsumKind, ScratchCapacity,
+)
+from .manifest import (
+    QuantRole, QuantMember, QuantManifest, quant_manifest,
+    manifest_arena_bytes, member_rel_off, has_role,
     SCALE_SUFFIX, COLSUM_SUFFIX, GAUGE_SUFFIX, BIAS_SUFFIX,
 )
 from .quantizer import (

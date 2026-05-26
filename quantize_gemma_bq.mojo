@@ -5,7 +5,8 @@ from numa import NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
-from modeling.gemma_4_moe import Gemma4
+from modeling.gemma_4_moe_bq import Gemma4
+
 
 comptime SOURCE = "checkpoints/gemma-4-26B-A4B"
 comptime OUTPUT = "checkpoints/gemma-4-26B-A4B-bq/model.safetensors"

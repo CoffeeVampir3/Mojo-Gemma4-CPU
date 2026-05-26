@@ -22,7 +22,6 @@ from butterquant.kernels import (
     rotate_and_quant, router_center,
     colsum_per_row, colsum_per_block,
 )
-from butterquant.constants import is_supported_fwht_block
 
 from quant.recipe import (
     QuantRecipe, Passthrough, PerRowQuant, PerBlockQuant, RouterCenter,
@@ -33,8 +32,8 @@ from quant.recipe import (
 from quant.plan import (
     SlotIdentity, GammaRef, PassthroughPlan, QuantPlan, RouterPlan, SlotPlan,
     ColsumKind, ScratchCapacity,
-    SCALE_SUFFIX, COLSUM_SUFFIX, GAUGE_SUFFIX, BIAS_SUFFIX,
 )
+from quant.manifest import quant_manifest, QuantRole
 
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
@@ -540,8 +539,19 @@ struct Quantizer(Movable):
 
         var local = String(FT.NAME)
 
+        var offs = InlineArray[Int, 5](fill=-1)
+        comptime MANIFEST = quant_manifest[FT.ENCODING, FT.SHAPE, FT.QUANT]()
+        comptime for i in range(MANIFEST.count):
+            comptime MEMBER = MANIFEST.members[i]
+            var s1 = MEMBER.global_cols if MEMBER.out_ndim == 2 else 0
+            offs[MEMBER.role] = self.add_entry(
+                full + String(MEMBER.suffix), MEMBER.dtype,
+                MEMBER.global_rows, s1,
+                MEMBER.data_rows * MEMBER.data_cols * MEMBER.element_bytes)
+
         comptime if QV.isa[Passthrough]():
-            self.plan_passthrough(full, local, layer_idx, loc)
+            self.plan_passthrough(full, local, layer_idx, loc,
+                offs[QuantRole.WEIGHT])
 
         comptime if QV.isa[PerRowQuant]():
             comptime QT = QV[PerRowQuant]
@@ -560,7 +570,9 @@ struct Quantizer(Movable):
                 ck = ColsumKind.PER_BLOCK
             if not self.plan_quant(full, local, layer_idx, loc,
                 per_block=False, fwht=QT.fwht_block,
-                two_sided_m=tsm, gamma=gamma, colsum_kind=ck):
+                two_sided_m=tsm, gamma=gamma, colsum_kind=ck,
+                weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE],
+                cs_off=offs[QuantRole.COLSUM]):
                 return False
 
         comptime if QV.isa[PerBlockQuant]():
@@ -578,7 +590,9 @@ struct Quantizer(Movable):
                 ck = ColsumKind.PER_BLOCK
             if not self.plan_quant(full, local, layer_idx, loc,
                 per_block=True, fwht=QT.fwht_block,
-                two_sided_m=tsm, gamma=gamma, colsum_kind=ck):
+                two_sided_m=tsm, gamma=gamma, colsum_kind=ck,
+                weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE],
+                cs_off=offs[QuantRole.COLSUM]):
                 return False
 
         comptime if QV.isa[RouterCenter]():
@@ -586,17 +600,18 @@ struct Quantizer(Movable):
             var bias_name = String("")
             comptime if QT.bias_name != StaticString(""):
                 bias_name = prefix + String(QT.bias_name)
-            if not self.plan_router(full, local, layer_idx, loc, bias_name):
+            if not self.plan_router(full, local, layer_idx, loc, bias_name,
+                weight_off=offs[QuantRole.WEIGHT], gauge_off=offs[QuantRole.GAUGE],
+                bias_off=offs[QuantRole.BIAS]):
                 return False
 
         return True
 
     def plan_passthrough(
         mut self, name: String, local: String, layer_idx: Int,
-        loc: LocatedTensor,
+        loc: LocatedTensor, weight_off: Int,
     ):
         var bytes = loc.rows * loc.cols * size_of_dtype(loc.dtype)
-        var weight_off = self.add_entry(name, loc.dtype, loc.rows, loc.cols, bytes)
         var id = SlotIdentity(
             name=name, local_name=local, layer_idx=layer_idx,
             shard=loc.shard, src_offset=loc.data_start,
@@ -609,6 +624,7 @@ struct Quantizer(Movable):
         mut self, name: String, local: String, layer_idx: Int,
         loc: LocatedTensor, per_block: Bool,
         fwht: Int, two_sided_m: Int, gamma: GammaRef, colsum_kind: Int,
+        weight_off: Int, scale_off: Int, cs_off: Int,
     ) -> Bool:
         if loc.rows <= 0 or loc.cols <= 0:
             print(t"quant plan: invalid quant shape for {name}: {loc.rows}x{loc.cols}")
@@ -616,16 +632,10 @@ struct Quantizer(Movable):
         if not supports_decode_to_f32(loc.dtype):
             print(t"quant plan: unsupported source dtype for quant {name}: {loc.dtype}")
             return False
-        if not is_supported_fwht_block(fwht):
-            print(t"quant plan: unsupported K-axis FWHT block for {name}: {fwht}")
-            return False
         if loc.cols % fwht != 0:
             print(t"quant plan: cols {loc.cols} not divisible by K-axis FWHT block {fwht} for {name}")
             return False
         if two_sided_m != 0:
-            if not is_supported_fwht_block(two_sided_m):
-                print(t"quant plan: unsupported M-axis FWHT block for {name}: {two_sided_m}")
-                return False
             if loc.rows % two_sided_m != 0:
                 print(t"quant plan: rows {loc.rows} not divisible by M-axis FWHT block {two_sided_m} for {name}")
                 return False
@@ -637,29 +647,6 @@ struct Quantizer(Movable):
         if gamma.is_present():
             if not validate_gamma_tensor(gamma.name, headers_span(self.headers), loc.cols):
                 return False
-
-        var nb = loc.cols // fwht if per_block else 1
-        var weight_off = self.add_entry(
-            name, DType.int8, loc.rows, loc.cols, loc.rows * loc.cols)
-        var scale_off: Int
-        if per_block:
-            scale_off = self.add_entry(
-                name + SCALE_SUFFIX, DType.float32, loc.rows, nb,
-                loc.rows * nb * 4)
-        else:
-            scale_off = self.add_entry(
-                name + SCALE_SUFFIX, DType.float32, loc.rows, 0,
-                loc.rows * 4)
-        var cs_off = -1
-        if colsum_kind == ColsumKind.PER_ROW:
-            cs_off = self.add_entry(
-                name + COLSUM_SUFFIX, DType.float32, loc.rows, 0,
-                loc.rows * 4)
-        elif colsum_kind == ColsumKind.PER_BLOCK:
-            var cs_nb = loc.cols // fwht
-            cs_off = self.add_entry(
-                name + COLSUM_SUFFIX, DType.float32, loc.rows, cs_nb,
-                loc.rows * cs_nb * 4)
 
         var id = SlotIdentity(
             name=name, local_name=local, layer_idx=layer_idx,
@@ -678,6 +665,7 @@ struct Quantizer(Movable):
     def plan_router(
         mut self, name: String, local: String, layer_idx: Int,
         loc: LocatedTensor, bias_name: String,
+        weight_off: Int, gauge_off: Int, bias_off: Int,
     ) -> Bool:
         if loc.rows <= 0 or loc.cols <= 0:
             print(t"quant plan: invalid router shape for {name}: {loc.rows}x{loc.cols}")
@@ -693,14 +681,6 @@ struct Quantizer(Movable):
                     bias_name, headers_span(self.headers), loc.rows):
                 return False
 
-        var weight_off = self.add_entry(
-            name, DType.bfloat16, loc.rows, loc.cols, loc.rows * loc.cols * 2)
-        var gauge_off = self.add_entry(
-            name + GAUGE_SUFFIX, DType.bfloat16, loc.cols, 0, loc.cols * 2)
-        var bias_off = 0
-        if bias_name.byte_length() > 0:
-            bias_off = self.add_entry(
-                name + BIAS_SUFFIX, DType.float32, loc.rows, 0, loc.rows * 4)
         var id = SlotIdentity(
             name=name, local_name=local, layer_idx=layer_idx,
             shard=loc.shard, src_offset=loc.data_start,

@@ -7,10 +7,11 @@ from modeling.model_spec import (
     DISTRIBUTED, align_up,
 )
 from modeling.utilities import FieldwiseDefault
-from quant.recipe import (
-    QuantRecipe, Passthrough, PerRowQuant, PerBlockQuant, RouterCenter,
-    NoColsum, PerRowCs, PerBlockCs,
+from quant.recipe import QuantRecipe, Passthrough
+from quant.manifest import (
+    quant_manifest, manifest_arena_bytes, member_rel_off, has_role, QuantRole,
 )
+from butterquant.weight import ButterquantWeight, ButterquantRouter
 
 
 trait SlotLike:
@@ -103,47 +104,68 @@ struct Slot[
     ) -> Binding[Scalar[Self.ENCODING.DTYPE], degree]:
         return self.binding(ctx.arena_bases[0], ctx.arena_bases)
 
+    @always_inline
+    def bq_weight[degree: Int](
+        self, ctx: BindContext[degree],
+    ) -> ButterquantWeight[
+        Self.QUANT, Self.SHAPE.DATA_N, Self.SHAPE.DATA_M, degree,
+    ]:
+        """Bind the int8 weight + scale + colsum sidecars of a quantized slot
+        from the same per-slot offsets `emit_quant_descs` wrote them to. The
+        colsum binding points at the weight base when the recipe declares none;
+        `colsum_checked` gates access at comptime."""
+        comptime assert has_role[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.SCALE,
+        ](), "Slot.bq_weight requires a quantized slot with a scale sidecar."
+        comptime SCALE_OFF = member_rel_off[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.SCALE]()
+        comptime CS_OFF = member_rel_off[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.COLSUM]()
+        var base = ctx.layer_base + self.offset
+        var data = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=base)
+        var scale = UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=base + SCALE_OFF)
+        var colsum = UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=base + CS_OFF)
+        return ButterquantWeight[
+            Self.QUANT, Self.SHAPE.DATA_N, Self.SHAPE.DATA_M, degree,
+        ](ctx.bind(data), ctx.bind(scale), ctx.bind(colsum))
+
+    @always_inline
+    def bq_router[degree: Int](
+        self, ctx: BindContext[degree],
+    ) -> ButterquantRouter[
+        Self.QUANT, Self.SHAPE.DATA_N, Self.SHAPE.DATA_M, degree,
+    ]:
+        """Bind the centered bf16 weight + gauge + optional bias of a
+        RouterCenter slot. The bias binding points at the weight base when the
+        recipe declares none; `bias_checked` gates access at comptime."""
+        comptime assert has_role[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.GAUGE,
+        ](), "Slot.bq_router requires a router-centered slot with a gauge sidecar."
+        comptime GAUGE_OFF = member_rel_off[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.GAUGE]()
+        comptime BIAS_OFF = member_rel_off[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.BIAS]()
+        var base = ctx.layer_base + self.offset
+        var centered = UnsafePointer[BFloat16, MutAnyOrigin](
+            unsafe_from_address=base)
+        var gauge = UnsafePointer[BFloat16, MutAnyOrigin](
+            unsafe_from_address=base + GAUGE_OFF)
+        var bias = UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=base + BIAS_OFF)
+        return ButterquantRouter[
+            Self.QUANT, Self.SHAPE.DATA_N, Self.SHAPE.DATA_M, degree,
+        ](ctx.bind(centered), ctx.bind(gauge), ctx.bind(bias))
+
 
 @always_inline
 def slot_arena_bytes[
     encoding: Encoding, shape: ShapeLike, quant: QuantRecipe,
 ]() -> Int:
-    """Per-rank arena bytes for a slot: weight + every sidecar implied
-    by `quant`. Passthrough returns the source-dtype aligned byte size;
-    PerRow / PerBlock add an int8 weight, an f32 scale, and (when the
-    recipe asks) an f32 colsum; RouterCenter adds a bf16 centered weight,
-    a bf16 gauge over weight cols, and (when bias_name is set) an f32 bias."""
-    comptime if quant.isa[Passthrough]():
-        return shape.bytes[encoding]()
-
-    comptime if quant.isa[PerRowQuant]():
-        comptime QT = quant[PerRowQuant]
-        var total = shape.DATA_N * shape.DATA_M
-        total += shape.DATA_N * 4
-        comptime if QT.colsum.isa[PerRowCs]():
-            total += shape.DATA_N * 4
-        comptime if QT.colsum.isa[PerBlockCs]():
-            total += shape.DATA_N * (shape.DATA_M // QT.fwht_block) * 4
-        return total
-
-    comptime if quant.isa[PerBlockQuant]():
-        comptime QT = quant[PerBlockQuant]
-        comptime nb_local = shape.DATA_M // QT.fwht_block
-        var total = shape.DATA_N * shape.DATA_M
-        total += shape.DATA_N * nb_local * 4
-        comptime if QT.colsum.isa[PerBlockCs]():
-            total += shape.DATA_N * nb_local * 4
-        return total
-
-    comptime if quant.isa[RouterCenter]():
-        comptime QT = quant[RouterCenter]
-        var total = shape.DATA_N * shape.DATA_M * 2
-        total += shape.DATA_M * 2
-        comptime if QT.bias_name != StaticString(""):
-            total += shape.DATA_N * 4
-        return total
-
-    return shape.bytes[encoding]()
+    """Per-rank arena bytes for a slot: weight + every sidecar implied by
+    `quant`, summed from the shared manifest (`quant/manifest.mojo`)."""
+    return manifest_arena_bytes[encoding, shape, quant]()
 
 
 @always_inline
@@ -153,125 +175,23 @@ def emit_quant_descs[
 ](
     prefix: String, slot_arena_off: Int, mut ops: List[WeightDesc],
 ):
-    """Emit one WeightDesc per physical tensor in this slot's encoding:
-    the weight at slot_arena_off, then sidecars packed tightly after.
-    The sidecar shapes inherit the weight's row/col sharding through
-    SHAPE.DATA_N / DATA_M so the loader's emit_reads picks the same
-    row-shard / col-shard / replicated path for them."""
+    """Emit one WeightDesc per physical tensor in this slot's encoding, driven
+    by the shared manifest: the weight at slot_arena_off, then sidecars packed
+    tightly after at their manifest rel_offs. Member shapes carry the loader's
+    row-shard / col-shard / replicated parameters directly."""
     var full = prefix + String(name)
-    var off = slot_arena_off
-
-    comptime if quant.isa[Passthrough]():
+    comptime MANIFEST = quant_manifest[encoding, shape, quant]()
+    comptime for i in range(MANIFEST.count):
+        comptime MEMBER = MANIFEST.members[i]
         ops.append(WeightDesc(
-            name=full, arena_offset=off,
-            dtype=encoding.DTYPE, element_bytes=encoding.ELEMENT_BYTES,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M,
-            data_rows=shape.DATA_N, data_cols=shape.DATA_M,
+            name=full + String(MEMBER.suffix),
+            arena_offset=slot_arena_off + MEMBER.rel_off,
+            dtype=MEMBER.dtype, element_bytes=MEMBER.element_bytes,
+            global_rows=MEMBER.global_rows, global_cols=MEMBER.global_cols,
+            local_cols=MEMBER.local_cols,
+            data_rows=MEMBER.data_rows, data_cols=MEMBER.data_cols,
             target_rank=target_rank,
         ))
-        return
-
-    comptime if quant.isa[PerRowQuant]():
-        comptime QT = quant[PerRowQuant]
-        ops.append(WeightDesc(
-            name=full, arena_offset=off,
-            dtype=DType.int8, element_bytes=1,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M,
-            data_rows=shape.DATA_N, data_cols=shape.DATA_M,
-            target_rank=target_rank,
-        ))
-        off += shape.DATA_N * shape.DATA_M
-        ops.append(WeightDesc(
-            name=full + String(".scale"), arena_offset=off,
-            dtype=DType.float32, element_bytes=4,
-            global_rows=shape.GLOBAL_N, global_cols=1,
-            local_cols=1, data_rows=shape.DATA_N, data_cols=1,
-            target_rank=target_rank,
-        ))
-        off += shape.DATA_N * 4
-        comptime if QT.colsum.isa[PerRowCs]():
-            ops.append(WeightDesc(
-                name=full + String(".colsum"), arena_offset=off,
-                dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=1,
-                local_cols=1, data_rows=shape.DATA_N, data_cols=1,
-                target_rank=target_rank,
-            ))
-        comptime if QT.colsum.isa[PerBlockCs]():
-            comptime nb_global = shape.GLOBAL_M // QT.fwht_block
-            comptime nb_local = shape.DATA_M // QT.fwht_block
-            ops.append(WeightDesc(
-                name=full + String(".colsum"), arena_offset=off,
-                dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=nb_global,
-                local_cols=nb_local,
-                data_rows=shape.DATA_N, data_cols=nb_local,
-                target_rank=target_rank,
-            ))
-        return
-
-    comptime if quant.isa[PerBlockQuant]():
-        comptime QT = quant[PerBlockQuant]
-        comptime nb_global = shape.GLOBAL_M // QT.fwht_block
-        comptime nb_local = shape.DATA_M // QT.fwht_block
-        ops.append(WeightDesc(
-            name=full, arena_offset=off,
-            dtype=DType.int8, element_bytes=1,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M,
-            data_rows=shape.DATA_N, data_cols=shape.DATA_M,
-            target_rank=target_rank,
-        ))
-        off += shape.DATA_N * shape.DATA_M
-        ops.append(WeightDesc(
-            name=full + String(".scale"), arena_offset=off,
-            dtype=DType.float32, element_bytes=4,
-            global_rows=shape.GLOBAL_N, global_cols=nb_global,
-            local_cols=nb_local,
-            data_rows=shape.DATA_N, data_cols=nb_local,
-            target_rank=target_rank,
-        ))
-        off += shape.DATA_N * nb_local * 4
-        comptime if QT.colsum.isa[PerBlockCs]():
-            ops.append(WeightDesc(
-                name=full + String(".colsum"), arena_offset=off,
-                dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=nb_global,
-                local_cols=nb_local,
-                data_rows=shape.DATA_N, data_cols=nb_local,
-                target_rank=target_rank,
-            ))
-        return
-
-    comptime if quant.isa[RouterCenter]():
-        comptime QT = quant[RouterCenter]
-        ops.append(WeightDesc(
-            name=full, arena_offset=off,
-            dtype=DType.bfloat16, element_bytes=2,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M,
-            data_rows=shape.DATA_N, data_cols=shape.DATA_M,
-            target_rank=target_rank,
-        ))
-        off += shape.DATA_N * shape.DATA_M * 2
-        ops.append(WeightDesc(
-            name=full + String(".gauge"), arena_offset=off,
-            dtype=DType.bfloat16, element_bytes=2,
-            global_rows=shape.GLOBAL_M, global_cols=1,
-            local_cols=1, data_rows=shape.DATA_M, data_cols=1,
-            target_rank=target_rank,
-        ))
-        off += shape.DATA_M * 2
-        comptime if QT.bias_name != StaticString(""):
-            ops.append(WeightDesc(
-                name=prefix + String(QT.bias_name), arena_offset=off,
-                dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=1,
-                local_cols=1, data_rows=shape.DATA_N, data_cols=1,
-                target_rank=target_rank,
-            ))
 
 
 def stamp_offsets[T: AnyType](mut t: T, off_in: Int = 0) -> Int:

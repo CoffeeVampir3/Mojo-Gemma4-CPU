@@ -51,16 +51,6 @@ from modeling.modeling_common import (
 from modeling.slot import (
     Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
 )
-from quant.recipe import (
-    QuantRecipe, PerRowQuant, PerBlockQuant, RouterCenter,
-    SplitGamma, NoGamma, SingleSided, NoColsum, PerRowCs, PerBlockCs,
-)
-from quant.quantizer import Quantizer
-from linux.io_uring import (
-    IoRing, ReadMode, WriteMode, open_files_for_ring, close_fds,
-)
-from std.memory import alloc
-from std.collections import Dict
 from modeling.loader import discover_shards, load_weights_from_descs
 
 
@@ -151,38 +141,21 @@ struct Gemma4TailShapes[degree: Int]:
     comptime Embed = VocabularyRowSharded[C.VOCAB_SIZE, C.HIDDEN, Self.D]
 
 
-comptime SplitGainPerRowCs[fwht: Int, gamma: StaticString]: QuantRecipe = PerRowQuant(
-    fwht, SplitGamma(gamma), SingleSided(), PerRowCs(),
-)
-
-
-comptime PlainPerRowBlockCs[fwht: Int]: QuantRecipe = PerRowQuant(
-    fwht, NoGamma(), SingleSided(), PerBlockCs(),
-)
-
-
 struct SlidingAttnRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
-    var q_proj: Slot[BF16, Self.S.SlidingQ,  "self_attn.q_proj.weight",
-        SplitGainPerRowCs[128, "input_layernorm.weight"]]
-    var k_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.k_proj.weight",
-        SplitGainPerRowCs[128, "input_layernorm.weight"]]
-    var v_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.v_proj.weight",
-        SplitGainPerRowCs[128, "input_layernorm.weight"]]
-    var o_proj: Slot[BF16, Self.S.SlidingO,  "self_attn.o_proj.weight",
-        PlainPerRowBlockCs[C.HEAD_DIM_SLIDING]]
+    var q_proj: Slot[BF16, Self.S.SlidingQ,  "self_attn.q_proj.weight"]
+    var k_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.k_proj.weight"]
+    var v_proj: Slot[BF16, Self.S.SlidingKV, "self_attn.v_proj.weight"]
+    var o_proj: Slot[BF16, Self.S.SlidingO,  "self_attn.o_proj.weight"]
     var q_norm: Slot[BF16, Shape[C.HEAD_DIM_SLIDING, 1], "self_attn.q_norm.weight"]
     var k_norm: Slot[BF16, Shape[C.HEAD_DIM_SLIDING, 1], "self_attn.k_norm.weight"]
 
 
 struct FullAttnRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4Shapes[Self.degree]
-    var q_proj: Slot[BF16, Self.S.FullQ, "self_attn.q_proj.weight",
-        SplitGainPerRowCs[128, "input_layernorm.weight"]]
-    var k_proj: Slot[BF16, Self.S.FullK, "self_attn.k_proj.weight",
-        SplitGainPerRowCs[128, "input_layernorm.weight"]]
-    var o_proj: Slot[BF16, Self.S.FullO, "self_attn.o_proj.weight",
-        PlainPerRowBlockCs[C.HEAD_DIM_FULL]]
+    var q_proj: Slot[BF16, Self.S.FullQ, "self_attn.q_proj.weight"]
+    var k_proj: Slot[BF16, Self.S.FullK, "self_attn.k_proj.weight"]
+    var o_proj: Slot[BF16, Self.S.FullO, "self_attn.o_proj.weight"]
     var q_norm: Slot[BF16, Shape[C.HEAD_DIM_FULL, 1], "self_attn.q_norm.weight"]
     var k_norm: Slot[BF16, Shape[C.HEAD_DIM_FULL, 1], "self_attn.k_norm.weight"]
 
@@ -196,20 +169,14 @@ struct BodyRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     var post_ffn_norm_1: Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm_1.weight"]
     var post_ffn_norm_2: Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm_2.weight"]
     var post_ffn_norm:   Slot[BF16, Shape[C.HIDDEN, 1],         "post_feedforward_layernorm.weight"]
-    var gate_proj:       Slot[BF16, Self.S.GateUp,              "mlp.gate_proj.weight",
-        SplitGainPerRowCs[128, "pre_feedforward_layernorm.weight"]]
-    var up_proj:         Slot[BF16, Self.S.GateUp,              "mlp.up_proj.weight",
-        SplitGainPerRowCs[128, "pre_feedforward_layernorm.weight"]]
-    var down_proj:       Slot[BF16, Self.S.Down,                "mlp.down_proj.weight",
-        PlainPerRowBlockCs[64]]
-    var router_proj:     Slot[BF16, Self.S.RouterProj,          "router.proj.weight",
-        RouterCenter("")]
+    var gate_proj:       Slot[BF16, Self.S.GateUp,              "mlp.gate_proj.weight"]
+    var up_proj:         Slot[BF16, Self.S.GateUp,              "mlp.up_proj.weight"]
+    var down_proj:       Slot[BF16, Self.S.Down,                "mlp.down_proj.weight"]
+    var router_proj:     Slot[BF16, Self.S.RouterProj,          "router.proj.weight"]
     var router_scale:    Slot[BF16, Shape[C.HIDDEN, 1],         "router.scale"]
     var router_pes:      Slot[BF16, Shape[C.NUM_EXPERTS, 1],    "router.per_expert_scale"]
-    var experts_gate_up: Slot[BF16, Self.S.ExpertsGateUp,       "experts.gate_up_proj",
-        SplitGainPerRowCs[128, "pre_feedforward_layernorm_2.weight"]]
-    var experts_down:    Slot[BF16, Self.S.ExpertsDown,         "experts.down_proj",
-        PlainPerRowBlockCs[64]]
+    var experts_gate_up: Slot[BF16, Self.S.ExpertsGateUp,       "experts.gate_up_proj"]
+    var experts_down:    Slot[BF16, Self.S.ExpertsDown,         "experts.down_proj"]
     var layer_scalar:    Slot[BF16, Shape[1, 1],                "layer_scalar"]
 
 
@@ -1149,30 +1116,3 @@ struct Gemma4[
         var model = Self(arenas^, pools^, layout)
         model.model_init()
         return model^
-
-    @staticmethod
-    def quantize(
-        source_dir: Path, output_path: Path,
-        topo: NumaTopology, var pools: List[Self.Pool],
-    ) -> Bool:
-        """Quantize the source checkpoint to `output_path`. Slots are
-        dispatched as one job per pool, so caller-controlled topology
-        (typically via `with_topological_rank_dispatch`) determines how
-        much parallelism is applied."""
-        var q = Quantizer(source_dir, output_path)
-        if not q:
-            return False
-        for i in range(C.NUM_LAYERS):
-            var entry = LAYER_SCHEDULE[i]
-            var prefix = String(t"model.language_model.layers.{entry.idx}.")
-            if entry.kind == LayerKind.FULL:
-                if not q.plan_walk[FullLayerRefs[1]](prefix, entry.idx):
-                    return False
-            else:
-                if not q.plan_walk[SlidingLayerRefs[1]](prefix, entry.idx):
-                    return False
-        if not q.plan_walk[TailRefs[1]](String(""), -1):
-            return False
-        if not q.write_header():
-            return False
-        return q.execute(topo, pools^)
