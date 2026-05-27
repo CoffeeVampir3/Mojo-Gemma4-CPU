@@ -8,9 +8,9 @@ from butterquant.vnni import VNNI_BLK, VNNI_K_STEP, VNNI_N_STEP, VNNI_TILE_N
 
 
 @always_inline
-def accumulate_n_step[width: Int, PR: Int, K: Int](
-    act: I8Ptr,
-    m_panel: Int,
+def accumulate_tiles[
+    width: Int, PR: Int, row_ptr: def(Int) capturing [_] -> I8Ptr,
+](
     wpacked: I8Ptr,
     packed_base: Int,
     k_base: Int,
@@ -31,7 +31,7 @@ def accumulate_n_step[width: Int, PR: Int, K: Int](
             var ab = InlineArray[SIMD[DType.uint8, width * 4], PR](
                 uninitialized=True)
             comptime for r in range(PR):
-                ab[r] = act_broadcast_vnni[width](act + (m_panel + r) * K, k_pos)
+                ab[r] = act_broadcast_vnni[width](row_ptr(r), k_pos)
             var t0 = packed_off + dc * tile_dc_bytes
             var t1 = t0 + tile_ks_bytes
             comptime for p in range(passes):
@@ -50,6 +50,24 @@ def accumulate_n_step[width: Int, PR: Int, K: Int](
 
 
 @always_inline
+def accumulate_n_step[width: Int, PR: Int, K: Int](
+    act: I8Ptr,
+    m_panel: Int,
+    wpacked: I8Ptr,
+    packed_base: Int,
+    k_base: Int,
+    k_len: Int,
+    mut acc: InlineArray[SIMD[DType.int32, width], PR * (VNNI_N_STEP // width)],
+):
+    @parameter
+    def row_ptr(r: Int) -> I8Ptr:
+        return act + (m_panel + r) * K
+
+    accumulate_tiles[width, PR, row_ptr](
+        wpacked, packed_base, k_base, k_len, acc)
+
+
+@always_inline
 def accumulate_n_step_gathered[width: Int, PR: Int](
     rows: InlineArray[I8Ptr, PR],
     wpacked: I8Ptr,
@@ -58,36 +76,12 @@ def accumulate_n_step_gathered[width: Int, PR: Int](
     k_len: Int,
     mut acc: InlineArray[SIMD[DType.int32, width], PR * (VNNI_N_STEP // width)],
 ):
-    comptime passes = VNNI_TILE_N // width
-    comptime bytes_per_pass = width * VNNI_BLK
-    comptime acc_count = VNNI_N_STEP // width
-    comptime dc_count = VNNI_K_STEP // VNNI_BLK
-    comptime tile_dc_bytes = VNNI_TILE_N * VNNI_BLK
-    comptime tile_ks_bytes = dc_count * tile_dc_bytes
+    @parameter
+    def row_ptr(r: Int) -> I8Ptr:
+        return rows[r]
 
-    var packed_off = packed_base
-    for ks in range(0, k_len, VNNI_K_STEP):
-        for dc in range(dc_count):
-            var k_pos = k_base + ks + dc * VNNI_BLK
-            var ab = InlineArray[SIMD[DType.uint8, width * 4], PR](
-                uninitialized=True)
-            comptime for r in range(PR):
-                ab[r] = act_broadcast_vnni[width](rows[r], k_pos)
-            var t0 = packed_off + dc * tile_dc_bytes
-            var t1 = t0 + tile_ks_bytes
-            comptime for p in range(passes):
-                var w0 = (wpacked + t0 + p * bytes_per_pass).load[
-                    width = width * 4, non_temporal=True]()
-                comptime for r in range(PR):
-                    acc[r * acc_count + p] = dot_loaded[width](
-                        acc[r * acc_count + p], ab[r], w0)
-            comptime for p in range(passes):
-                var w1 = (wpacked + t1 + p * bytes_per_pass).load[
-                    width = width * 4, non_temporal=True]()
-                comptime for r in range(PR):
-                    acc[r * acc_count + passes + p] = dot_loaded[width](
-                        acc[r * acc_count + passes + p], ab[r], w1)
-        packed_off += 2 * tile_ks_bytes
+    accumulate_tiles[width, PR, row_ptr](
+        wpacked, packed_base, k_base, k_len, acc)
 
 
 @always_inline

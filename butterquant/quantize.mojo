@@ -1,4 +1,4 @@
-from butterquant.kernels import row_absmax, quantize_inv
+from butterquant.kernels import quant_segment
 from butterquant.types import F32Ptr, I8Ptr, WF
 
 
@@ -6,10 +6,7 @@ from butterquant.types import F32Ptr, I8Ptr, WF
 def quantize_activation_per_row(
     work: F32Ptr, qi: I8Ptr, sa: F32Ptr, cols: Int,
 ):
-    var amax = row_absmax(work, cols)
-    sa[0] = amax
-    var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
-    quantize_inv(work, qi, inv, cols)
+    quant_segment[False](work, qi, sa, cols)
 
 
 @always_inline
@@ -23,7 +20,4 @@ def quantize_activation_per_block[block: Int](
     var nb = cols // block
     for b in range(nb):
         var off = b * block
-        var amax = row_absmax(work + off, block)
-        sa[b] = amax
-        var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
-        quantize_inv(work + off, qi + off, inv, block)
+        quant_segment[False](work + off, qi + off, sa + b, block)

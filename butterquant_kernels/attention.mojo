@@ -17,23 +17,14 @@ from kernels.logsum_merge import (
 from kernels.flash_attention_prefill import dispatch_merge_flash_prefill_partials
 from kernels.dispatch_heuristics import ROPE_INLINE_TOKENS
 
-from butterquant.dot_products import vpdpbusd
+from butterquant.dot_products import vnni_shifted_dot
 from butterquant.head_prep import prep_head_qk_i8, prep_head_v_i8
-from butterquant.types import I8Ptr, WI
+from butterquant.types import I8Ptr
 
 
 @always_inline
 def vnni_score_dot[head_dim: Int](k_i8: I8Ptr, q_i8: I8Ptr) -> Int32:
-    comptime bytes = WI * 4
-    comptime assert head_dim % bytes == 0, (
-        "score head_dim must be a multiple of WI*4")
-    var acc = SIMD[DType.int32, WI](0)
-    for k in range(0, head_dim, bytes):
-        var kv = (k_i8 + k).bitcast[UInt8]().load[width=bytes]() ^ SIMD[
-            DType.uint8, bytes](0x80)
-        var qv = (q_i8 + k).load[width=bytes]()
-        acc = vpdpbusd[WI](acc, kv, qv)
-    return acc.reduce_add()
+    return vnni_shifted_dot[head_dim, False](k_i8, q_i8)[0].reduce_add()
 
 
 @always_inline
@@ -54,12 +45,16 @@ def bq_process_kv_tile[
     comptime inv127 = Float32(1.0) / Float32(127.0)
     comptime inv127sq = inv127 * inv127
 
+    var slots = InlineArray[Int, TILE](uninitialized=True)
+    for t in range(tile_len):
+        slots[t] = KV.slot(start_pos, pos + t)
+
     comptime for q_idx in range(num_q):
         comptime kv_h = q_idx // gqa_ratio
 
         var scores = SIMD[DType.float32, TILE](-1e30)
         for t in range(tile_len):
-            var s_idx = KV.slot(start_pos, pos + t)
+            var s_idx = slots[t]
             var k_head = k_base + s_idx * kv_stride + kv_h * head_dim
             var r = vnni_score_dot[head_dim](k_head, q_ptrs[q_idx])
             var ks = k_scale[s_idx * num_kv + kv_h]
@@ -75,7 +70,7 @@ def bq_process_kv_tile[
         m[q_idx] = m_new
 
         for t in range(tile_len):
-            var s_idx = KV.slot(start_pos, pos + t)
+            var s_idx = slots[t]
             var v_head = v_base + s_idx * kv_stride + kv_h * head_dim
             var vs = v_scale[s_idx * num_kv + kv_h]
             accumulate_scaled[cols=head_dim](

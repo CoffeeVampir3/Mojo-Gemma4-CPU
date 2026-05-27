@@ -2,7 +2,8 @@ The purpose of inspectables is to provide easy to inspect assembly-reproductions
 
 Use asserts off to disable bounds checking:
 
-pixi run mojo build -D ASSERT=none main.mojo
+Test for both alderlake and sapphirerapids architectures.
+pixi run mojo build -D ASSERT=none --march=alderlake -g0 -O3 main.mojo
 
 Benchmark keep will keep a value alive without needing to do anything fancy:
 

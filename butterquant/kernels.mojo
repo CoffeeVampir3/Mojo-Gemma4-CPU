@@ -64,6 +64,19 @@ def quantize_inv(work: PtrF32, qi: PtrI8, inv: Float32, n: Int):
         k += WIDTH
 
 
+@always_inline
+def quant_segment[store_divided: Bool](
+    work: PtrF32, qi: PtrI8, scale_slot: PtrF32, n: Int,
+):
+    var amax = row_absmax(work, n)
+    comptime if store_divided:
+        scale_slot[0] = amax / Float32(127.0)
+    else:
+        scale_slot[0] = amax
+    var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
+    quantize_inv(work, qi, inv, n)
+
+
 def fwht_rotate_rows[block: Int](work: PtrF32, rows: Int, cols: Int):
     if cols % block != 0:
         abort(t"butterquant: cols={cols} not divisible by K-axis FWHT block={block}")
@@ -75,7 +88,7 @@ def fwht_rotate_columns[head_dim: Int](work: PtrF32, rows: Int, cols: Int):
     if rows % head_dim != 0:
         abort(t"butterquant: rows={rows} not divisible by M-axis FWHT block={head_dim}")
     var scratch_buf = List[Float32](length=head_dim, fill=Float32(0))
-    var scratch = PtrF32(unsafe_from_address=Int(scratch_buf.unsafe_ptr()))
+    var scratch = scratch_buf.unsafe_ptr().as_any_origin()
     var num_heads = rows // head_dim
     for h in range(num_heads):
         var base = h * head_dim
@@ -90,12 +103,7 @@ def fwht_rotate_columns[head_dim: Int](work: PtrF32, rows: Int, cols: Int):
 
 def quant_rows_per_row(work: PtrF32, qi: PtrI8, scales: PtrF32, rows: Int, cols: Int):
     for r in range(rows):
-        var work_row = work + r * cols
-        var qi_row = qi + r * cols
-        var amax = row_absmax(work_row, cols)
-        scales[r] = amax / Float32(127.0)
-        var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
-        quantize_inv(work_row, qi_row, inv, cols)
+        quant_segment[True](work + r * cols, qi + r * cols, scales + r, cols)
 
 
 def quant_rows_per_block[block: Int](
@@ -108,10 +116,7 @@ def quant_rows_per_block[block: Int](
         var scale_row = scales + r * num_blocks
         for b in range(num_blocks):
             var off = b * block
-            var amax = row_absmax(work_row + off, block)
-            scale_row[b] = amax / Float32(127.0)
-            var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
-            quantize_inv(work_row + off, qi_row + off, inv, block)
+            quant_segment[True](work_row + off, qi_row + off, scale_row + b, block)
 
 
 def dispatch_fwht_block[

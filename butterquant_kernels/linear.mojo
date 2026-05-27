@@ -67,7 +67,9 @@ def dispatch_bq_norm_quant[
 
 
 @fieldwise_init
-struct BqLinearKernel[N: Int, K: Int, MR: Int](RangePartitionedKernel):
+struct BqLinearKernel[
+    N: Int, K: Int, MR: Int, numer: Int = 1, denom: Int = 1,
+](RangePartitionedKernel):
     var act: I8Ptr
     var act_scale: F32Ptr
     var weight: I8Ptr
@@ -79,9 +81,11 @@ struct BqLinearKernel[N: Int, K: Int, MR: Int](RangePartitionedKernel):
     var end: Int
 
     def execute(mut self):
+        var my_start = self.start * Self.numer // Self.denom
+        var my_end = self.end * Self.numer // Self.denom
         gemm_i8_per_row[Self.N, Self.K, Self.MR, DType.bfloat16](
             self.act, self.m, self.act_scale, self.weight, self.wsc,
-            self.colsum, self.output, self.start, self.end)
+            self.colsum, self.output, my_start, my_end)
 
     @always_inline
     def install_range(mut self, start: Int, end: Int):
@@ -215,33 +219,6 @@ def dispatch_bq_block_linear[
         inline_threshold_bytes=GEMV_INLINE_ROWS * m)
 
 
-@fieldwise_init
-struct ScaledBqLinearKernel[
-    N: Int, K: Int, MR: Int, numer: Int, denom: Int,
-](RangePartitionedKernel):
-    var act: I8Ptr
-    var act_scale: F32Ptr
-    var weight: I8Ptr
-    var wsc: F32Ptr
-    var colsum: F32Ptr
-    var output: BF16Ptr
-    var m: Int
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        var my_start = self.start * Self.numer // Self.denom
-        var my_end = self.end * Self.numer // Self.denom
-        gemm_i8_per_row[Self.N, Self.K, Self.MR, DType.bfloat16](
-            self.act, self.m, self.act_scale, self.weight, self.wsc,
-            self.colsum, self.output, my_start, my_end)
-
-    @always_inline
-    def install_range(mut self, start: Int, end: Int):
-        self.start = start
-        self.end = end
-
-
 def dispatch_bq_qkv[
     P: BurstThreadPool, quant: QuantRecipe, qn: Int, kvn: Int, m: Int, tp: Int, //,
     MR: Int = 4, max_worker_count: Int = 128,
@@ -263,9 +240,9 @@ def dispatch_bq_qkv[
     comptime q_tiles = qn // VNNI_N_STEP
     comptime kv_tiles = kvn // VNNI_N_STEP
     comptime total_tiles = q_tiles + kv_tiles + kv_tiles
-    comptime QKern = ScaledBqLinearKernel[qn, m, MR, q_tiles, total_tiles]
-    comptime KKern = ScaledBqLinearKernel[kvn, m, MR, kv_tiles, total_tiles]
-    comptime VKern = ScaledBqLinearKernel[kvn, m, MR, kv_tiles, total_tiles]
+    comptime QKern = BqLinearKernel[qn, m, MR, q_tiles, total_tiles]
+    comptime KKern = BqLinearKernel[kvn, m, MR, kv_tiles, total_tiles]
+    comptime VKern = BqLinearKernel[kvn, m, MR, kv_tiles, total_tiles]
     comptime QK = Chain[QKern, KKern]
     comptime QKV = Chain[QK, VKern]
 

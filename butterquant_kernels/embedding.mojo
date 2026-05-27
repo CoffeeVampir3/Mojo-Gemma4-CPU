@@ -34,8 +34,7 @@ struct BqEmbedLookupKernel[
     def execute(mut self):
         comptime nb = Self.hidden // Self.block
         var work = InlineArray[Float32, Self.hidden](uninitialized=True)
-        var wp = UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=Int(UnsafePointer(to=work[0])))
+        var wp = UnsafePointer(to=work[0]).as_any_origin()
         for tok in range(self.start, self.end):
             var tid = Int(self.token_ids[tok])
             var owner = tid // Self.shard_rows

@@ -84,13 +84,16 @@ def process_kv_tile[
     mut l: InlineArray[Float32, num_q],
     read acc_ptrs: InlineArray[F32Ptr, num_q],
 ):
+    var slots = InlineArray[Int, TILE](uninitialized=True)
+    for t in range(tile_len):
+        slots[t] = KV.slot(start_pos, pos + t)
+
     comptime for q_idx in range(num_q):
         comptime kv_h = q_idx // gqa_ratio
 
         var scores = SIMD[DType.float32, TILE](-1e30)
         for t in range(tile_len):
-            var s_idx = KV.slot(start_pos, pos + t)
-            var k_head = k_base + s_idx * kv_stride + kv_h * head_dim
+            var k_head = k_base + slots[t] * kv_stride + kv_h * head_dim
             scores[t] = dot_to_scalar[head_dim](q_ptrs[q_idx], k_head)
 
         var sm = online_softmax_tile[TILE](scores, m[q_idx])
@@ -103,7 +106,6 @@ def process_kv_tile[
         m[q_idx] = m_new
 
         for t in range(tile_len):
-            var s_idx = KV.slot(start_pos, pos + t)
-            var v_head = v_base + s_idx * kv_stride + kv_h * head_dim
+            var v_head = v_base + slots[t] * kv_stride + kv_h * head_dim
             accumulate_scaled[cols=head_dim](
                 v_head, weights[t], acc_ptrs[q_idx])

@@ -38,22 +38,30 @@ def dot_loaded[width: Int](
 
 
 @always_inline
-def i8_vnni_block_dot[block: Int](a: I8Ptr, b: I8Ptr) -> Int32:
+def vnni_shifted_dot[block: Int, emit_rhs_sum: Bool](
+    a: I8Ptr, b: I8Ptr,
+) -> Tuple[SIMD[DType.int32, WI], Int32]:
     comptime assert CompilationTarget.has_vnni(), (
-        "butterquant head dot requires VNNI")
+        "butterquant VNNI dot requires VNNI")
     comptime bytes = WI * 4
     comptime assert block % bytes == 0, (
         "VNNI dot block must be a multiple of four i32 SIMD vectors")
-    var dot_acc = SIMD[DType.int32, WI](0)
-    var weight_sum = Int32(0)
+    var acc = SIMD[DType.int32, WI](0)
+    var rhs_sum = Int32(0)
     for k in range(0, block, bytes):
         var av = (a + k).bitcast[UInt8]().load[width=bytes]() ^ SIMD[
             DType.uint8, bytes](0x80)
         var bv = (b + k).load[width=bytes]()
-        dot_acc = vpdpbusd[WI](dot_acc, av, bv)
-        comptime for i in range(bytes):
-            weight_sum += Int32(bv[i])
-    return dot_acc.reduce_add() - Int32(128) * weight_sum
+        acc = vpdpbusd[WI](acc, av, bv)
+        comptime if emit_rhs_sum:
+            rhs_sum += bv.cast[DType.int32]().reduce_add()
+    return (acc, rhs_sum)
+
+
+@always_inline
+def i8_vnni_block_dot[block: Int](a: I8Ptr, b: I8Ptr) -> Int32:
+    var r = vnni_shifted_dot[block, True](a, b)
+    return r[0].reduce_add() - Int32(128) * r[1]
 
 
 @always_inline

@@ -1,4 +1,4 @@
-from std.memory import Span, UnsafePointer
+from std.memory import Span
 from std.sys.info import simd_width_of
 from std.pathlib import Path
 from std.time import perf_counter_ns
@@ -17,23 +17,76 @@ comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-bq"
 comptime VOCAB = Gemma4BaseConfig.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 128
+comptime BOS_TOKEN_ID = 2
+comptime EOS_TOKEN_ID = 1
 
 
-def greedy_argmax[degree: Int](
+def elapsed_ms_since(start_ns: UInt) -> Int:
+    return Int((perf_counter_ns() - start_ns) / 1_000_000)
+
+
+def tokens_per_second(token_count: Int, elapsed_ms: Int) -> Int:
+    if elapsed_ms == 0:
+        return 0
+    return token_count * 1000 // elapsed_ms
+
+
+def encode_prompt(
+    mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
+    prompt: String,
+) -> List[Int]:
+    var token_ids = List[Int]()
+    token_ids.append(BOS_TOKEN_ID)
+    var encoded = tok.encode(prompt)
+    for i in range(len(encoded)):
+        token_ids.append(encoded[i])
+    return token_ids^
+
+
+def int32_tokens(read token_ids: List[Int]) -> List[Int32]:
+    var out = List[Int32](capacity=len(token_ids))
+    for i in range(len(token_ids)):
+        out.append(Int32(token_ids[i]))
+    return out^
+
+
+def merged_ids(read prompt_ids: List[Int], read generated_ids: List[Int]) -> List[Int]:
+    var out = List[Int](capacity=len(prompt_ids) + len(generated_ids))
+    for i in range(len(prompt_ids)):
+        out.append(prompt_ids[i])
+    for i in range(len(generated_ids)):
+        out.append(generated_ids[i])
+    return out^
+
+
+def print_prompt(prompt: String, read token_ids: List[Int]):
+    var prompt_repr = repr(prompt)
+    print(t"prompt: {prompt_repr}")
+    var n_tokens = len(token_ids)
+    print(t"tokens: {n_tokens} ids:", end="")
+    for i in range(n_tokens):
+        print("", token_ids[i], end="")
+    print()
+
+
+def greedy_next_token[degree: Int](
     read view: TemporalLogitsView[VOCAB, degree],
-) -> Tuple[Int, Float32]:
+) -> Int:
     comptime width = simd_width_of[DType.float32]()
-    var best_val = Float32(-1e30)
+    var best_val: Float32 = -1e30
     var best_idx = 0
 
     for j in range(0, VOCAB, width):
-        var v = view.load_f32[width](j)
-        for k in range(width):
-            if v[k] > best_val:
-                best_val = v[k]
-                best_idx = j + k
+        var values = view.load_f32[width](j)
+        var local_best = values.reduce_max()[0]
+        if local_best > best_val:
+            best_val = local_best
+            for k in range(width):
+                if values[k] == local_best:
+                    best_idx = j + k
+                    break
 
-    return (best_idx, best_val)
+    return best_idx
 
 
 def load_and_run[
@@ -50,62 +103,51 @@ def load_and_run[
     if not model_opt:
         return
     var model = model_opt.take()
-    var load_ms = (perf_counter_ns() - t0) / 1_000_000
+    var load_ms = elapsed_ms_since(t0)
     print(t"model loaded in {load_ms} ms")
     print()
 
     var prompt_len = len(token_ids)
 
-    var tok_buf = List[Int32](capacity=prompt_len)
-    for i in range(prompt_len):
-        tok_buf.append(Int32(token_ids[i]))
+    var tok_buf = int32_tokens(token_ids)
+    var step_buf = List[Int32](capacity=1)
+    step_buf.append(0)
 
     var generated = List[Int]()
     var next_id = 0
     var pos = 0
-    var prefill_ms = UInt(0)
+    var prefill_ms = 0
     var decode_start = perf_counter_ns()
 
     while len(generated) < MAX_NEW_TOKENS:
         var logits: TemporalLogitsView[VOCAB, degree]
         if pos == 0:
             var t1 = perf_counter_ns()
-            logits = model.forward(
-                Span[Int32, origin_of(tok_buf)](
-                    ptr=tok_buf.unsafe_ptr(), length=prompt_len),
-                0)
-            prefill_ms = (perf_counter_ns() - t1) / 1_000_000
+            logits = model.forward(Span(tok_buf), 0)
+            prefill_ms = elapsed_ms_since(t1)
             pos = prompt_len
             decode_start = perf_counter_ns()
         else:
-            var step_id = Int32(next_id)
-            logits = model.forward(
-                Span[Int32, origin_of(step_id)](
-                    ptr=UnsafePointer(to=step_id), length=1),
-                pos)
+            step_buf[0] = Int32(next_id)
+            logits = model.forward(Span(step_buf), pos)
             pos += 1
 
-        next_id = greedy_argmax[degree](logits)[0]
+        next_id = greedy_next_token[degree](logits)
         logits^.release()
         generated.append(next_id)
 
-        if next_id == 1:
+        if next_id == EOS_TOKEN_ID:
             break
 
-    var prefill_tps = Int(Float64(prompt_len) / (Float64(prefill_ms) / 1000.0))
+    var prefill_tps = tokens_per_second(prompt_len, prefill_ms)
     print(t"prompt  | {prompt_len} tokens | {prefill_ms} ms | {prefill_tps} t/s")
 
-    var decode_elapsed_ms = (perf_counter_ns() - decode_start) / 1_000_000
+    var decode_elapsed_ms = elapsed_ms_since(decode_start)
     var decode_tokens = len(generated) - 1
-    var decode_tps = Int(Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0))
+    var decode_tps = tokens_per_second(decode_tokens, decode_elapsed_ms)
     print(t"decode  | {decode_tokens} tokens | {decode_elapsed_ms} ms | {decode_tps} t/s")
 
-    var all_ids = List[Int]()
-    for i in range(len(token_ids)):
-        all_ids.append(token_ids[i])
-    for i in range(len(generated)):
-        all_ids.append(generated[i])
-
+    var all_ids = merged_ids(token_ids, generated)
     var full_text = tok.decode(all_ids)
     print()
     var n_generated = len(generated)
@@ -120,21 +162,9 @@ def main():
         return
     var tok = tok_opt.take()
 
-    var prompt = """Meepington 5000"""
-
-
-    var token_ids = List[Int]()
-    token_ids.append(2)  # <bos>
-    var encoded = tok.encode(prompt)
-    for i in range(len(encoded)):
-        token_ids.append(encoded[i])
-    var prompt_repr = repr(prompt)
-    print(t"prompt: {prompt_repr}")
-    var n_tokens = len(token_ids)
-    print(t"tokens: {n_tokens} ids:", end="")
-    for i in range(len(token_ids)):
-        print("", token_ids[i], end="")
-    print()
+    var prompt = "Meepington 5000"
+    var token_ids = encode_prompt(tok, prompt)
+    print_prompt(prompt, token_ids)
 
     var topo = NumaTopology()
     var nodes = topo.num_nodes()

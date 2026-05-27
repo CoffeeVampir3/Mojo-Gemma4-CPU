@@ -22,8 +22,7 @@ def prepare_norm_activation[
     comptime assert hidden % block == 0, (
         "hidden must be block-aligned")
     var work = InlineArray[Float32, hidden](uninitialized=True)
-    var wp = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=work[0])))
+    var wp = UnsafePointer(to=work[0]).as_any_origin()
 
     var sum_sq = rms_reduce_row[hidden](src)
     var inv_rms = sqrt_n / sqrt[DType.float32, 1](sum_sq + n_eps)
@@ -73,8 +72,7 @@ def prepare_block_activation[
         "cols must be a multiple of the f32 SIMD width")
     comptime assert cols % block == 0, "cols must be block-aligned"
     var work = InlineArray[Float32, cols](uninitialized=True)
-    var wp = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=work[0])))
+    var wp = UnsafePointer(to=work[0]).as_any_origin()
 
     var k = 0
     while k + WF <= cols:

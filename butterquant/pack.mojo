@@ -1,6 +1,6 @@
 from std.collections import InlineArray
 from std.math import min
-from std.memory import UnsafePointer
+from std.memory import Span
 
 from numa import NumaArena
 from threading.threading_traits import BurstThreadPool
@@ -33,8 +33,8 @@ struct PackColsumTask(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct PackColsumKernel(WorkerRangePartitionedKernel):
-    var tasks: UnsafePointer[PackColsumTask, MutAnyOrigin]
+struct PackColsumKernel[tasks_origin: ImmutOrigin](WorkerRangePartitionedKernel):
+    var tasks: Span[PackColsumTask, Self.tasks_origin]
     var arena_base: Int
     var scratch_base: Int
     var worker_id: Int
@@ -74,8 +74,8 @@ def dispatch_pack_colsum[
     var num_tasks = len(tasks)
     if num_tasks == 0:
         return
-    var tasks_ptr = UnsafePointer[PackColsumTask, MutAnyOrigin](
-        unsafe_from_address=Int(tasks.unsafe_ptr()))
+    var view = Span(tasks)
+    comptime K = PackColsumKernel[origin_of(tasks)]
 
     var scratch = List[NumaArena[alignment=PACK_SCRATCH_ALIGN]](capacity=tp)
     for r in range(tp):
@@ -86,9 +86,9 @@ def dispatch_pack_colsum[
             "dispatch_pack_colsum: scratch allocation failed")
 
     @parameter
-    def proto_for(r: Int) -> PackColsumKernel:
-        return PackColsumKernel(
-            tasks=tasks_ptr,
+    def proto_for(r: Int) -> K:
+        return K(
+            tasks=view,
             arena_base=arena_bases[r],
             scratch_base=Int(scratch[r].base.value()),
             worker_id=0, start=0, end=0)
