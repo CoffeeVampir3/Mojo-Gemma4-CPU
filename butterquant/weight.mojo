@@ -1,7 +1,7 @@
 from kernels.helpers import Binding
 from quant.recipe import (
-    QuantRecipe, PerRowQuant, PerBlockQuant, RouterCenter,
-    PerRowCs, PerBlockCs,
+    QuantRecipe, PerRowQuant, PerBlockQuant,
+    PerRowCs, PerBlockCs, VnniPacked,
 )
 
 
@@ -20,6 +20,24 @@ def quant_per_block[q: QuantRecipe]() -> Bool:
 
 
 @always_inline
+def quant_vnni_packed[q: QuantRecipe]() -> Bool:
+    comptime if q.isa[PerRowQuant]():
+        return q[PerRowQuant].pack.isa[VnniPacked]()
+    comptime if q.isa[PerBlockQuant]():
+        return q[PerBlockQuant].pack.isa[VnniPacked]()
+    return False
+
+
+@always_inline
+def quant_colsum_per_block[q: QuantRecipe]() -> Bool:
+    comptime if q.isa[PerRowQuant]():
+        return q[PerRowQuant].colsum.isa[PerBlockCs]()
+    comptime if q.isa[PerBlockQuant]():
+        return q[PerBlockQuant].colsum.isa[PerBlockCs]()
+    return False
+
+
+@always_inline
 def quant_has_colsum[q: QuantRecipe]() -> Bool:
     comptime if q.isa[PerRowQuant]():
         comptime QT = q[PerRowQuant]
@@ -29,19 +47,10 @@ def quant_has_colsum[q: QuantRecipe]() -> Bool:
     return False
 
 
-@always_inline
-def router_has_bias[q: QuantRecipe]() -> Bool:
-    comptime if q.isa[RouterCenter]():
-        return q[RouterCenter].bias_name != StaticString("")
-    return False
-
-
 @fieldwise_init
 struct ButterquantWeight[quant: QuantRecipe, n: Int, m: Int, tp: Int](
     Copyable, ImplicitlyCopyable,
 ):
-    comptime K_BLOCK = quant_k_block[Self.quant]()
-    comptime PER_BLOCK = quant_per_block[Self.quant]()
     comptime HAS_COLSUM = quant_has_colsum[Self.quant]()
 
     var data: Binding[Int8, Self.tp]
@@ -59,20 +68,18 @@ struct ButterquantWeight[quant: QuantRecipe, n: Int, m: Int, tp: Int](
 struct ButterquantRouter[quant: QuantRecipe, n: Int, m: Int, tp: Int](
     Copyable, ImplicitlyCopyable,
 ):
-    comptime HAS_BIAS = router_has_bias[Self.quant]()
-
     var centered: Binding[BFloat16, Self.tp]
-    var gauge: Binding[BFloat16, Self.tp]
-    var bias: Binding[Float32, Self.tp]
-
-    @always_inline
-    def bias_checked(self) -> Binding[Float32, Self.tp]:
-        comptime assert Self.HAS_BIAS, (
-            "ButterquantRouter recipe declared no bias but tried to access one.")
-        return self.bias
+    var gauge: Optional[Binding[BFloat16, Self.tp]]
+    var bias: Optional[Binding[Float32, Self.tp]]
 
 
 @fieldwise_init
 struct ButterquantActivation[tp: Int](Copyable, ImplicitlyCopyable):
+    var data: Binding[Int8, Self.tp]
+    var scale: Binding[Float32, Self.tp]
+
+
+@fieldwise_init
+struct ButterquantBlockActivation[tp: Int](Copyable, ImplicitlyCopyable):
     var data: Binding[Int8, Self.tp]
     var scale: Binding[Float32, Self.tp]

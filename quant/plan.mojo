@@ -1,12 +1,6 @@
 from std.utils.variant import Variant
 
 
-struct ColsumKind:
-    comptime NONE = 0
-    comptime PER_ROW = 1
-    comptime PER_BLOCK = 2
-
-
 @fieldwise_init
 struct SlotIdentity(Copyable, Movable):
     """`name` is the full safetensors key (e.g.
@@ -53,9 +47,7 @@ struct QuantPlan(Copyable, Movable):
     var fwht_block: Int
     var two_sided_m: Int
     var gamma: GammaRef
-    var colsum_kind: Int
     var scale_off: Int
-    var cs_off: Int
 
 
 @fieldwise_init
@@ -65,6 +57,7 @@ struct RouterPlan(Copyable, Movable):
     per §13.4."""
     var id: SlotIdentity
     var gauge_off: Int
+    var emit_gauge: Bool
     var bias_name: String
     var bias_off: Int
 
@@ -81,11 +74,10 @@ struct ScratchCapacity(TrivialRegisterPassable):
     var max_cols: Int
     var max_src_bytes_per: Int
     var max_scale_per_row: Int
-    var max_cs_per_row: Int
 
     @staticmethod
     def zero(max_panel_rows: Int) -> Self:
-        return Self(max_panel_rows, 0, 0, 1, 0)
+        return Self(max_panel_rows, 0, 0, 1)
 
     @always_inline
     def absorb_quant(mut self, p: QuantPlan, src_bytes_per: Int):
@@ -96,10 +88,3 @@ struct ScratchCapacity(TrivialRegisterPassable):
         var spr = (p.id.cols // p.fwht_block) if p.per_block else 1
         if spr > self.max_scale_per_row:
             self.max_scale_per_row = spr
-        if p.colsum_kind == ColsumKind.PER_ROW:
-            if 1 > self.max_cs_per_row:
-                self.max_cs_per_row = 1
-        elif p.colsum_kind == ColsumKind.PER_BLOCK:
-            var cpr = p.id.cols // p.fwht_block
-            if cpr > self.max_cs_per_row:
-                self.max_cs_per_row = cpr

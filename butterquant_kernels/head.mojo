@@ -5,9 +5,9 @@ from kernels.helpers import (
 from kernels.dispatch_heuristics import GEMV_INLINE_ROWS
 from kernels.gemv import softcap_value
 
-from butterquant.runtime import (
-    prepare_head_activation, head_logit_row, F32Ptr, I8Ptr,
-)
+from butterquant.dot_products import head_logit_row
+from butterquant.runtime import prepare_head_activation
+from butterquant.types import F32Ptr, I8Ptr
 from butterquant.weight import (
     ButterquantWeight, ButterquantActivation, quant_k_block, quant_per_block,
 )

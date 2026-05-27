@@ -3,7 +3,7 @@ from std.collections import InlineArray
 from modeling.model_spec import Encoding, ShapeLike, align_up
 from quant.recipe import (
     QuantRecipe, Passthrough, PerRowQuant, PerBlockQuant, RouterCenter,
-    NoColsum, PerRowCs, PerBlockCs,
+    SoftmaxRouterCenter, NoColsum, PerRowCs, PerBlockCs, RowMajor,
 )
 
 
@@ -81,25 +81,27 @@ def quant_manifest[
         out.push(QuantMember(
             role=QuantRole.WEIGHT, suffix=StaticString(""),
             dtype=encoding.DTYPE, element_bytes=encoding.ELEMENT_BYTES,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
+            global_rows=shape.SIZE_ON_DISK_N, global_cols=shape.SIZE_ON_DISK_M,
+            local_cols=shape.DATA_M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
             out_ndim=2, reserved_bytes=shape.bytes[encoding](), rel_off=0))
         return out^
 
     comptime if quant.isa[PerRowQuant]():
         comptime QT = quant[PerRowQuant]
+        comptime assert (not QT.pack.isa[RowMajor]()) or QT.colsum.isa[NoColsum](), (
+            "RowMajor weight with a colsum is not supported")
         var off = 0
         out.push(QuantMember(
             role=QuantRole.WEIGHT, suffix=StaticString(""),
             dtype=DType.int8, element_bytes=1,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
+            global_rows=shape.SIZE_ON_DISK_N, global_cols=shape.SIZE_ON_DISK_M,
+            local_cols=shape.DATA_M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
             out_ndim=2, reserved_bytes=shape.DATA_N * shape.DATA_M, rel_off=off))
         off += shape.DATA_N * shape.DATA_M
         out.push(QuantMember(
             role=QuantRole.SCALE, suffix=SCALE_SUFFIX,
             dtype=DType.float32, element_bytes=4,
-            global_rows=shape.GLOBAL_N, global_cols=1, local_cols=1,
+            global_rows=shape.SIZE_ON_DISK_N, global_cols=1, local_cols=1,
             data_rows=shape.DATA_N, data_cols=1,
             out_ndim=1, reserved_bytes=shape.DATA_N * 4, rel_off=off))
         off += shape.DATA_N * 4
@@ -107,16 +109,16 @@ def quant_manifest[
             out.push(QuantMember(
                 role=QuantRole.COLSUM, suffix=COLSUM_SUFFIX,
                 dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=1, local_cols=1,
+                global_rows=shape.SIZE_ON_DISK_N, global_cols=1, local_cols=1,
                 data_rows=shape.DATA_N, data_cols=1,
                 out_ndim=1, reserved_bytes=shape.DATA_N * 4, rel_off=off))
         comptime if QT.colsum.isa[PerBlockCs]():
-            comptime nb_global = shape.GLOBAL_M // QT.fwht_block
+            comptime nb_global = shape.SIZE_ON_DISK_M // QT.fwht_block
             comptime nb_local = shape.DATA_M // QT.fwht_block
             out.push(QuantMember(
                 role=QuantRole.COLSUM, suffix=COLSUM_SUFFIX,
                 dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=nb_global,
+                global_rows=shape.SIZE_ON_DISK_N, global_cols=nb_global,
                 local_cols=nb_local, data_rows=shape.DATA_N, data_cols=nb_local,
                 out_ndim=2, reserved_bytes=shape.DATA_N * nb_local * 4,
                 rel_off=off))
@@ -124,20 +126,22 @@ def quant_manifest[
 
     comptime if quant.isa[PerBlockQuant]():
         comptime QT = quant[PerBlockQuant]
-        comptime nb_global = shape.GLOBAL_M // QT.fwht_block
+        comptime assert (not QT.pack.isa[RowMajor]()) or QT.colsum.isa[NoColsum](), (
+            "RowMajor weight with a colsum is not supported")
+        comptime nb_global = shape.SIZE_ON_DISK_M // QT.fwht_block
         comptime nb_local = shape.DATA_M // QT.fwht_block
         var off = 0
         out.push(QuantMember(
             role=QuantRole.WEIGHT, suffix=StaticString(""),
             dtype=DType.int8, element_bytes=1,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
+            global_rows=shape.SIZE_ON_DISK_N, global_cols=shape.SIZE_ON_DISK_M,
+            local_cols=shape.DATA_M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
             out_ndim=2, reserved_bytes=shape.DATA_N * shape.DATA_M, rel_off=off))
         off += shape.DATA_N * shape.DATA_M
         out.push(QuantMember(
             role=QuantRole.SCALE, suffix=SCALE_SUFFIX,
             dtype=DType.float32, element_bytes=4,
-            global_rows=shape.GLOBAL_N, global_cols=nb_global,
+            global_rows=shape.SIZE_ON_DISK_N, global_cols=nb_global,
             local_cols=nb_local, data_rows=shape.DATA_N, data_cols=nb_local,
             out_ndim=2, reserved_bytes=shape.DATA_N * nb_local * 4, rel_off=off))
         off += shape.DATA_N * nb_local * 4
@@ -145,7 +149,7 @@ def quant_manifest[
             out.push(QuantMember(
                 role=QuantRole.COLSUM, suffix=COLSUM_SUFFIX,
                 dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=nb_global,
+                global_rows=shape.SIZE_ON_DISK_N, global_cols=nb_global,
                 local_cols=nb_local, data_rows=shape.DATA_N, data_cols=nb_local,
                 out_ndim=2, reserved_bytes=shape.DATA_N * nb_local * 4,
                 rel_off=off))
@@ -157,15 +161,15 @@ def quant_manifest[
         out.push(QuantMember(
             role=QuantRole.WEIGHT, suffix=StaticString(""),
             dtype=DType.bfloat16, element_bytes=2,
-            global_rows=shape.GLOBAL_N, global_cols=shape.GLOBAL_M,
-            local_cols=shape.M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
+            global_rows=shape.SIZE_ON_DISK_N, global_cols=shape.SIZE_ON_DISK_M,
+            local_cols=shape.DATA_M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
             out_ndim=2, reserved_bytes=shape.DATA_N * shape.DATA_M * 2,
             rel_off=off))
         off += shape.DATA_N * shape.DATA_M * 2
         out.push(QuantMember(
             role=QuantRole.GAUGE, suffix=GAUGE_SUFFIX,
             dtype=DType.bfloat16, element_bytes=2,
-            global_rows=shape.GLOBAL_M, global_cols=1, local_cols=1,
+            global_rows=shape.SIZE_ON_DISK_M, global_cols=1, local_cols=1,
             data_rows=shape.DATA_M, data_cols=1,
             out_ndim=1, reserved_bytes=shape.DATA_M * 2, rel_off=off))
         off += shape.DATA_M * 2
@@ -173,9 +177,19 @@ def quant_manifest[
             out.push(QuantMember(
                 role=QuantRole.BIAS, suffix=BIAS_SUFFIX,
                 dtype=DType.float32, element_bytes=4,
-                global_rows=shape.GLOBAL_N, global_cols=1, local_cols=1,
+                global_rows=shape.SIZE_ON_DISK_N, global_cols=1, local_cols=1,
                 data_rows=shape.DATA_N, data_cols=1,
                 out_ndim=1, reserved_bytes=shape.DATA_N * 4, rel_off=off))
+        return out^
+
+    comptime if quant.isa[SoftmaxRouterCenter]():
+        out.push(QuantMember(
+            role=QuantRole.WEIGHT, suffix=StaticString(""),
+            dtype=DType.bfloat16, element_bytes=2,
+            global_rows=shape.SIZE_ON_DISK_N, global_cols=shape.SIZE_ON_DISK_M,
+            local_cols=shape.DATA_M, data_rows=shape.DATA_N, data_cols=shape.DATA_M,
+            out_ndim=2, reserved_bytes=shape.DATA_N * shape.DATA_M * 2,
+            rel_off=0))
         return out^
 
     return out^

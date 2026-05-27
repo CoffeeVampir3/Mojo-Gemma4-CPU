@@ -3,7 +3,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
 from .types import F32Ptr, I8Ptr
-from .vnni_dot import act_broadcast_vnni, vpdpbusd
+from .vnni_dot import act_broadcast_vnni, dot_loaded
 from .vnni_layout import (
     VNNI_BLK, VNNI_K_STEP, VNNI_N_STEP, VNNI_TILE_N, compute_n_block,
 )
@@ -42,13 +42,13 @@ def accumulate_n_step[
                 var w0 = (wpacked + t0 + p * bytes_per_pass).load[
                     width = width * 4, non_temporal=True]()
                 comptime for r in range(PR):
-                    acc[r * acc_count + p] = vpdpbusd[width](
+                    acc[r * acc_count + p] = dot_loaded[width](
                         acc[r * acc_count + p], ab[r], w0)
             comptime for p in range(passes):
                 var w1 = (wpacked + t1 + p * bytes_per_pass).load[
                     width = width * 4, non_temporal=True]()
                 comptime for r in range(PR):
-                    acc[r * acc_count + passes + p] = vpdpbusd[width](
+                    acc[r * acc_count + passes + p] = dot_loaded[width](
                         acc[r * acc_count + passes + p], ab[r], w1)
         packed_off += 2 * tile_ks_bytes
 
@@ -69,7 +69,7 @@ def gemm_i8_panel[
     subrange: Int,
 ):
     """PR output rows; each weight tile is loaded once and reused across rows.
-    Per-K-block dequant; fwht_block == K collapses to the per-row form."""
+    Per-K-block dequant; one block is just the same true-block path."""
     comptime width = simd_width_of[DType.int32]()
     comptime num_blocks = K // fwht_block
     comptime acc_count = VNNI_N_STEP // width
@@ -81,60 +81,38 @@ def gemm_i8_panel[
     for nb in range(0, subrange, n_block):
         var nb_size = min(n_block, subrange - nb)
         for ns in range(0, nb_size, VNNI_N_STEP):
-
-            comptime if num_blocks == 1:
-                var acc = InlineArray[
+            var f32_acc = InlineArray[
+                SIMD[DType.float32, width], PR * acc_count](
+                fill=SIMD[DType.float32, width](0))
+            for blk in range(num_blocks):
+                var iacc = InlineArray[
                     SIMD[DType.int32, width], PR * acc_count](
                     fill=SIMD[DType.int32, width](0))
                 accumulate_n_step[width, PR, K](
-                    act, m_panel, wpacked, packed_off, 0, K, acc)
+                    act, m_panel, wpacked, packed_off,
+                    blk * fwht_block, fwht_block, iacc)
 
                 comptime for r in range(PR):
-                    var sc = block_scales[m_panel + r] * inv127
+                    var bd = block_scales[
+                        (m_panel + r) * num_blocks + blk] * inv127
                     comptime for a in range(acc_count):
                         var n_base = nb + ns + a * width
-                        var cs = (block_colsums + n_base).load[width=width]()
+                        var cs = (block_colsums
+                            + blk * colsum_stride + n_base).load[
+                            width=width]()
                         var corrected = (
-                            acc[r * acc_count + a].cast[DType.float32]()
+                            iacc[r * acc_count + a].cast[DType.float32]()
                             - Float32(128) * cs)
-                        var res = (
-                            corrected * sc * (wsc + n_base).load[width=width]())
-                        (dst + (m_panel + r) * out_stride + n_base).store(
-                            res.cast[Out]())
+                        f32_acc[r * acc_count + a] += corrected * bd
 
-            else:
-                var f32_acc = InlineArray[
-                    SIMD[DType.float32, width], PR * acc_count](
-                    fill=SIMD[DType.float32, width](0))
-                for blk in range(num_blocks):
-                    var iacc = InlineArray[
-                        SIMD[DType.int32, width], PR * acc_count](
-                        fill=SIMD[DType.int32, width](0))
-                    accumulate_n_step[width, PR, K](
-                        act, m_panel, wpacked, packed_off,
-                        blk * fwht_block, fwht_block, iacc)
-
-                    comptime for r in range(PR):
-                        var bd = block_scales[
-                            (m_panel + r) * num_blocks + blk] * inv127
-                        comptime for a in range(acc_count):
-                            var n_base = nb + ns + a * width
-                            var cs = (block_colsums
-                                + blk * colsum_stride + n_base).load[
-                                width=width]()
-                            var corrected = (
-                                iacc[r * acc_count + a].cast[DType.float32]()
-                                - Float32(128) * cs)
-                            f32_acc[r * acc_count + a] += corrected * bd
-
-                comptime for r in range(PR):
-                    comptime for a in range(acc_count):
-                        var n_base = nb + ns + a * width
-                        var res = (
-                            f32_acc[r * acc_count + a]
-                            * (wsc + n_base).load[width=width]())
-                        (dst + (m_panel + r) * out_stride + n_base).store(
-                            res.cast[Out]())
+            comptime for r in range(PR):
+                comptime for a in range(acc_count):
+                    var n_base = nb + ns + a * width
+                    var res = (
+                        f32_acc[r * acc_count + a]
+                        * (wsc + n_base).load[width=width]())
+                    (dst + (m_panel + r) * out_stride + n_base).store(
+                        res.cast[Out]())
 
 
 def gemm_i8[
@@ -157,8 +135,8 @@ def gemm_i8[
     block_colsums:[K/fwht_block, N] per-K-block weight colsums.
     dst:          [m, N] in Out dtype.
 
-    fwht_block must be a multiple of VNNI_K_STEP (>= 64); fwht_block == K is
-    the per-row form. Walks m in MR-row panels with a 1-row tail."""
+    fwht_block must be a multiple of VNNI_K_STEP (>= 64). Walks m in MR-row
+    panels with a 1-row tail."""
     debug_assert(K % VNNI_K_STEP == 0, "gemm_i8: K must be a multiple of 64")
     debug_assert(fwht_block % VNNI_K_STEP == 0,
         "gemm_i8: fwht_block must be a multiple of VNNI_K_STEP (>= 64)")

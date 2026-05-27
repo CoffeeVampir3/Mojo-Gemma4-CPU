@@ -8,9 +8,10 @@ from kernels.helpers import (
 from kernels.dispatch_heuristics import EMBED_INLINE_TOKENS
 
 from butterquant.fwht import fwht_row
-from butterquant.runtime import (
-    dequant_weight_row_per_block, scale_cast_row, zero_row, F32Ptr, I8Ptr,
+from butterquant.dequantize import (
+    dequant_weight_row_per_block, scale_cast_row, zero_row,
 )
+from butterquant.types import F32Ptr, I8Ptr
 from butterquant.weight import (
     ButterquantWeight, quant_k_block, quant_per_block,
 )
@@ -69,7 +70,6 @@ def dispatch_bq_embed_lookup[
     seq_len: Int,
     mut pools: List[P],
 ):
-    """Unowned tokens write zero; caller follows with allreduce to replicate."""
     comptime assert quant_per_block[quant](), "embed lookup expects a per-block weight scale"
     comptime K = BqEmbedLookupKernel[
         tok_origin, m, quant_k_block[quant](), scale, shard_rows,

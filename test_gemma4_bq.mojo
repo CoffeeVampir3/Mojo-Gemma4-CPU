@@ -1,4 +1,5 @@
 from std.memory import Span, UnsafePointer
+from std.sys.info import simd_width_of
 from std.pathlib import Path
 from std.time import perf_counter_ns
 
@@ -9,10 +10,30 @@ from threading.topological_dispatch import with_topological_rank_dispatch
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
 from modeling.gemma4_common import Gemma4BaseConfig
 from modeling.gemma_4_moe_bq import Gemma4
+from modeling.temporal_scratch import TemporalLogitsView
 
 
 comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-bq"
+comptime VOCAB = Gemma4BaseConfig.VOCAB_SIZE
+comptime MAX_NEW_TOKENS = 128
+
+
+def greedy_argmax[degree: Int](
+    read view: TemporalLogitsView[VOCAB, degree],
+) -> Tuple[Int, Float32]:
+    comptime width = simd_width_of[DType.float32]()
+    var best_val = Float32(-1e30)
+    var best_idx = 0
+
+    for j in range(0, VOCAB, width):
+        var v = view.load_f32[width](j)
+        for k in range(width):
+            if v[k] > best_val:
+                best_val = v[k]
+                best_idx = j + k
+
+    return (best_idx, best_val)
 
 
 def load_and_run[
@@ -34,17 +55,62 @@ def load_and_run[
     print()
 
     var prompt_len = len(token_ids)
+
     var tok_buf = List[Int32](capacity=prompt_len)
     for i in range(prompt_len):
         tok_buf.append(Int32(token_ids[i]))
 
-    var t1 = perf_counter_ns()
-    model.forward(
-        Span[Int32, origin_of(tok_buf)](
-            ptr=tok_buf.unsafe_ptr(), length=prompt_len),
-        0)
-    var embed_ms = (perf_counter_ns() - t1) / 1_000_000
-    print(t"embed | {prompt_len} tokens | {embed_ms} ms")
+    var generated = List[Int]()
+    var next_id = 0
+    var pos = 0
+    var prefill_ms = UInt(0)
+    var decode_start = perf_counter_ns()
+
+    while len(generated) < MAX_NEW_TOKENS:
+        var logits: TemporalLogitsView[VOCAB, degree]
+        if pos == 0:
+            var t1 = perf_counter_ns()
+            logits = model.forward(
+                Span[Int32, origin_of(tok_buf)](
+                    ptr=tok_buf.unsafe_ptr(), length=prompt_len),
+                0)
+            prefill_ms = (perf_counter_ns() - t1) / 1_000_000
+            pos = prompt_len
+            decode_start = perf_counter_ns()
+        else:
+            var step_id = Int32(next_id)
+            logits = model.forward(
+                Span[Int32, origin_of(step_id)](
+                    ptr=UnsafePointer(to=step_id), length=1),
+                pos)
+            pos += 1
+
+        next_id = greedy_argmax[degree](logits)[0]
+        logits^.release()
+        generated.append(next_id)
+
+        if next_id == 1:
+            break
+
+    var prefill_tps = Int(Float64(prompt_len) / (Float64(prefill_ms) / 1000.0))
+    print(t"prompt  | {prompt_len} tokens | {prefill_ms} ms | {prefill_tps} t/s")
+
+    var decode_elapsed_ms = (perf_counter_ns() - decode_start) / 1_000_000
+    var decode_tokens = len(generated) - 1
+    var decode_tps = Int(Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0))
+    print(t"decode  | {decode_tokens} tokens | {decode_elapsed_ms} ms | {decode_tps} t/s")
+
+    var all_ids = List[Int]()
+    for i in range(len(token_ids)):
+        all_ids.append(token_ids[i])
+    for i in range(len(generated)):
+        all_ids.append(generated[i])
+
+    var full_text = tok.decode(all_ids)
+    print()
+    var n_generated = len(generated)
+    print(t"=== generated {n_generated} tokens ===")
+    print(full_text)
 
 
 def main():
@@ -55,6 +121,7 @@ def main():
     var tok = tok_opt.take()
 
     var prompt = """Meepington 5000"""
+
 
     var token_ids = List[Int]()
     token_ids.append(2)  # <bos>
@@ -75,13 +142,13 @@ def main():
     print(t"{nodes} NUMA nodes, {iso} isolated cpus")
 
     @parameter
-    def dispatch_gemma4_bq_tp[
+    def dispatch_gemma4_tp[
         P: BurstThreadPool, //, degree: Int,
     ](var selected_pools: List[P]):
         load_and_run[degree=degree](topo, selected_pools^, tok, token_ids)
 
     with_topological_rank_dispatch[
         power_of_two_unrolling=3,
-        dispatch=dispatch_gemma4_bq_tp,
+        dispatch=dispatch_gemma4_tp,
     ](
         topo, "mode: isolated (spin-only)", "mode: cold (spin-backoff)")

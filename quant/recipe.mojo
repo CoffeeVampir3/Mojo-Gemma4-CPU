@@ -52,11 +52,25 @@ comptime PerBlockColsumMode = Variant[NoColsum, PerBlockCs]
 
 
 @fieldwise_init
+struct VnniPacked(Copyable, Movable, ImplicitlyCopyable):
+    pass
+
+
+@fieldwise_init
+struct RowMajor(Copyable, Movable, ImplicitlyCopyable):
+    pass
+
+
+comptime PackMode = Variant[VnniPacked, RowMajor]
+
+
+@fieldwise_init
 struct PerRowQuant(Copyable, Movable, ImplicitlyCopyable):
     var fwht_block: Int
     var gamma: GammaMode
     var rotation: RotationMode
     var colsum: ColsumMode
+    var pack: PackMode
 
 
 @fieldwise_init
@@ -65,6 +79,7 @@ struct PerBlockQuant(Copyable, Movable, ImplicitlyCopyable):
     var gamma: GammaMode
     var rotation: RotationMode
     var colsum: PerBlockColsumMode
+    var pack: PackMode
 
 
 @fieldwise_init
@@ -76,10 +91,19 @@ struct RouterCenter(Copyable, Movable, ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct SoftmaxRouterCenter(Copyable, Movable, ImplicitlyCopyable):
+    """Centered-bf16 router for shift-invariant softmax/top-k routers. The
+    gauge is intentionally not stored because subtracting one per-token scalar
+    from every expert logit leaves softmax probabilities and top-k unchanged."""
+    pass
+
+
+@fieldwise_init
 struct Passthrough(Copyable, Movable, ImplicitlyCopyable):
     pass
 
 
 comptime QuantRecipe = Variant[
     Passthrough, PerRowQuant, PerBlockQuant, RouterCenter,
+    SoftmaxRouterCenter,
 ]

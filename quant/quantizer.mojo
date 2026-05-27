@@ -1,5 +1,5 @@
 from std.collections import Dict, InlineArray
-from std.math import max, min
+from std.math import min
 from std.memory import Span, UnsafePointer, alloc
 from std.pathlib import Path
 from std.reflection import reflect
@@ -19,19 +19,16 @@ from modeling.slot import SlotLike, SlotGroup
 
 from butterquant.kernels import (
     apply_gamma_in_place, gamma_sqrt_abs_in_place,
-    rotate_and_quant, router_center,
-    colsum_per_row, colsum_per_block,
+    rotate_and_quant, router_center, router_center_softmax,
 )
 
 from quant.recipe import (
-    QuantRecipe, Passthrough, PerRowQuant, PerBlockQuant, RouterCenter,
-    NoGamma, SplitGamma, AbsorbedGamma,
-    SingleSided, TwoSided,
-    NoColsum, PerRowCs, PerBlockCs,
+    Passthrough, PerRowQuant, PerBlockQuant, RouterCenter,
+    SoftmaxRouterCenter, SplitGamma, AbsorbedGamma, TwoSided,
 )
 from quant.plan import (
     SlotIdentity, GammaRef, PassthroughPlan, QuantPlan, RouterPlan, SlotPlan,
-    ColsumKind, ScratchCapacity,
+    ScratchCapacity,
 )
 from quant.manifest import quant_manifest, QuantRole
 
@@ -374,7 +371,6 @@ struct QuantScratch(Movable):
     var work: PtrF32
     var qi: PtrI8
     var scales: PtrF32
-    var cs: PtrF32
     var ready: Bool
 
     def __init__(out self, cap: ScratchCapacity):
@@ -383,19 +379,16 @@ struct QuantScratch(Movable):
         self.work = PtrF32.unsafe_dangling()
         self.qi = PtrI8.unsafe_dangling()
         self.scales = PtrF32.unsafe_dangling()
-        self.cs = PtrF32.unsafe_dangling()
         var pr = cap.max_panel_rows
         var cols = cap.max_cols
         if pr <= 0 or cols <= 0:
             return
         var src_bytes_per = cap.max_src_bytes_per if cap.max_src_bytes_per > 0 else 1
         var scale_per = cap.max_scale_per_row if cap.max_scale_per_row > 0 else 1
-        var cs_per = cap.max_cs_per_row if cap.max_cs_per_row > 0 else 1
         self.src_buf = alloc[UInt8](pr * cols * src_bytes_per).as_any_origin()
         self.work = alloc[Float32](pr * cols).as_any_origin()
         self.qi = alloc[Scalar[DType.int8]](pr * cols).as_any_origin()
         self.scales = alloc[Float32](pr * scale_per).as_any_origin()
-        self.cs = alloc[Float32](pr * cs_per).as_any_origin()
         self.ready = True
 
     def __del__(deinit self):
@@ -405,7 +398,6 @@ struct QuantScratch(Movable):
         self.work.free()
         self.qi.free()
         self.scales.free()
-        self.cs.free()
 
     def __bool__(self) -> Bool:
         return self.ready
@@ -516,8 +508,8 @@ struct Quantizer(Movable):
         return True
 
     def plan_slot[FT: SlotLike](mut self, prefix: String, layer_idx: Int) -> Bool:
-        comptime ROWS = FT.SHAPE.GLOBAL_N
-        comptime COLS = FT.SHAPE.GLOBAL_M
+        comptime ROWS = FT.SHAPE.SIZE_ON_DISK_N
+        comptime COLS = FT.SHAPE.SIZE_ON_DISK_M
         comptime SRC = FT.ENCODING.DTYPE
         comptime QV = FT.QUANT
 
@@ -543,11 +535,12 @@ struct Quantizer(Movable):
         comptime MANIFEST = quant_manifest[FT.ENCODING, FT.SHAPE, FT.QUANT]()
         comptime for i in range(MANIFEST.count):
             comptime MEMBER = MANIFEST.members[i]
-            var s1 = MEMBER.global_cols if MEMBER.out_ndim == 2 else 0
-            offs[MEMBER.role] = self.add_entry(
-                full + String(MEMBER.suffix), MEMBER.dtype,
-                MEMBER.global_rows, s1,
-                MEMBER.data_rows * MEMBER.data_cols * MEMBER.element_bytes)
+            comptime if MEMBER.role != QuantRole.COLSUM:
+                var s1 = MEMBER.global_cols if MEMBER.out_ndim == 2 else 0
+                offs[MEMBER.role] = self.add_entry(
+                    full + String(MEMBER.suffix), MEMBER.dtype,
+                    MEMBER.global_rows, s1,
+                    MEMBER.data_rows * MEMBER.data_cols * MEMBER.element_bytes)
 
         comptime if QV.isa[Passthrough]():
             self.plan_passthrough(full, local, layer_idx, loc,
@@ -563,16 +556,10 @@ struct Quantizer(Movable):
                 gamma = GammaRef(prefix + String(QT.gamma[SplitGamma].name), False)
             comptime if QT.gamma.isa[AbsorbedGamma]():
                 gamma = GammaRef(prefix + String(QT.gamma[AbsorbedGamma].name), True)
-            var ck = ColsumKind.NONE
-            comptime if QT.colsum.isa[PerRowCs]():
-                ck = ColsumKind.PER_ROW
-            comptime if QT.colsum.isa[PerBlockCs]():
-                ck = ColsumKind.PER_BLOCK
             if not self.plan_quant(full, local, layer_idx, loc,
                 per_block=False, fwht=QT.fwht_block,
-                two_sided_m=tsm, gamma=gamma, colsum_kind=ck,
-                weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE],
-                cs_off=offs[QuantRole.COLSUM]):
+                two_sided_m=tsm, gamma=gamma,
+                weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE]):
                 return False
 
         comptime if QV.isa[PerBlockQuant]():
@@ -585,14 +572,10 @@ struct Quantizer(Movable):
                 gamma = GammaRef(prefix + String(QT.gamma[SplitGamma].name), False)
             comptime if QT.gamma.isa[AbsorbedGamma]():
                 gamma = GammaRef(prefix + String(QT.gamma[AbsorbedGamma].name), True)
-            var ck = ColsumKind.NONE
-            comptime if QT.colsum.isa[PerBlockCs]():
-                ck = ColsumKind.PER_BLOCK
             if not self.plan_quant(full, local, layer_idx, loc,
                 per_block=True, fwht=QT.fwht_block,
-                two_sided_m=tsm, gamma=gamma, colsum_kind=ck,
-                weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE],
-                cs_off=offs[QuantRole.COLSUM]):
+                two_sided_m=tsm, gamma=gamma,
+                weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE]):
                 return False
 
         comptime if QV.isa[RouterCenter]():
@@ -602,7 +585,13 @@ struct Quantizer(Movable):
                 bias_name = prefix + String(QT.bias_name)
             if not self.plan_router(full, local, layer_idx, loc, bias_name,
                 weight_off=offs[QuantRole.WEIGHT], gauge_off=offs[QuantRole.GAUGE],
-                bias_off=offs[QuantRole.BIAS]):
+                emit_gauge=True, bias_off=offs[QuantRole.BIAS]):
+                return False
+
+        comptime if QV.isa[SoftmaxRouterCenter]():
+            if not self.plan_router(full, local, layer_idx, loc, String(""),
+                weight_off=offs[QuantRole.WEIGHT], gauge_off=-1,
+                emit_gauge=False, bias_off=-1):
                 return False
 
         return True
@@ -623,8 +612,8 @@ struct Quantizer(Movable):
     def plan_quant(
         mut self, name: String, local: String, layer_idx: Int,
         loc: LocatedTensor, per_block: Bool,
-        fwht: Int, two_sided_m: Int, gamma: GammaRef, colsum_kind: Int,
-        weight_off: Int, scale_off: Int, cs_off: Int,
+        fwht: Int, two_sided_m: Int, gamma: GammaRef,
+        weight_off: Int, scale_off: Int,
     ) -> Bool:
         if loc.rows <= 0 or loc.cols <= 0:
             print(t"quant plan: invalid quant shape for {name}: {loc.rows}x{loc.cols}")
@@ -639,11 +628,6 @@ struct Quantizer(Movable):
             if loc.rows % two_sided_m != 0:
                 print(t"quant plan: rows {loc.rows} not divisible by M-axis FWHT block {two_sided_m} for {name}")
                 return False
-        if (colsum_kind != ColsumKind.NONE
-                and colsum_kind != ColsumKind.PER_ROW
-                and colsum_kind != ColsumKind.PER_BLOCK):
-            print(t"quant plan: unsupported colsum kind {colsum_kind} for {name}")
-            return False
         if gamma.is_present():
             if not validate_gamma_tensor(gamma.name, headers_span(self.headers), loc.cols):
                 return False
@@ -655,8 +639,7 @@ struct Quantizer(Movable):
             weight_off=weight_off,
         )
         var plan = QuantPlan(
-            id^, per_block, fwht, two_sided_m, gamma.copy(),
-            colsum_kind, scale_off, cs_off,
+            id^, per_block, fwht, two_sided_m, gamma.copy(), scale_off,
         )
         self.scratch_cap.absorb_quant(plan, size_of_dtype(loc.dtype))
         self.slots.append(plan^)
@@ -665,7 +648,7 @@ struct Quantizer(Movable):
     def plan_router(
         mut self, name: String, local: String, layer_idx: Int,
         loc: LocatedTensor, bias_name: String,
-        weight_off: Int, gauge_off: Int, bias_off: Int,
+        weight_off: Int, gauge_off: Int, emit_gauge: Bool, bias_off: Int,
     ) -> Bool:
         if loc.rows <= 0 or loc.cols <= 0:
             print(t"quant plan: invalid router shape for {name}: {loc.rows}x{loc.cols}")
@@ -687,7 +670,7 @@ struct Quantizer(Movable):
             src_dtype=loc.dtype, rows=loc.rows, cols=loc.cols,
             weight_off=weight_off,
         )
-        self.slots.append(RouterPlan(id^, gauge_off, bias_name, bias_off))
+        self.slots.append(RouterPlan(id^, gauge_off, emit_gauge, bias_name, bias_off))
         return True
 
     def add_entry(
@@ -763,13 +746,6 @@ struct Quantizer(Movable):
 @always_inline
 def size_of_dtype(dt: DType) -> Int:
     return dtype_byte_size(dt)
-
-
-@always_inline
-def colsum_label(kind: Int) -> StaticString:
-    if kind == ColsumKind.PER_ROW: return "row"
-    if kind == ColsumKind.PER_BLOCK: return "block"
-    return "none"
 
 
 @always_inline
@@ -870,19 +846,20 @@ struct QuantWorker(Movable):
         elif plan.isa[QuantPlan]():
             var qp = plan[QuantPlan].copy()
             var shape = StaticString("per-block") if qp.per_block else StaticString("per-row")
-            var cs = colsum_label(qp.colsum_kind)
             var g = gamma_label(qp.gamma)
             if qp.two_sided_m != 0:
                 self.log_line(qp.id,
-                    t"{shape} fwht={qp.fwht_block} 2x={qp.two_sided_m} cs={cs} γ={g}")
+                    t"{shape} fwht={qp.fwht_block} 2x={qp.two_sided_m} γ={g}")
             else:
                 self.log_line(qp.id,
-                    t"{shape} fwht={qp.fwht_block} cs={cs} γ={g}")
+                    t"{shape} fwht={qp.fwht_block} γ={g}")
         elif plan.isa[RouterPlan]():
             var rp = plan[RouterPlan].copy()
             if rp.bias_name.byte_length() > 0:
                 self.log_line(rp.id,
                     t"router-center +bias({rp.bias_name})")
+            elif not rp.emit_gauge:
+                self.log_line(rp.id, t"softmax-router-center")
             else:
                 self.log_line(rp.id, t"router-center")
 
@@ -980,13 +957,6 @@ struct QuantWorker(Movable):
 
         var nb = p.id.cols // p.fwht_block if p.per_block else 1
         var scale_per_row = nb if p.per_block else 1
-        var cs_per_row: Int
-        if p.colsum_kind == ColsumKind.PER_ROW:
-            cs_per_row = 1
-        elif p.colsum_kind == ColsumKind.PER_BLOCK:
-            cs_per_row = p.id.cols // p.fwht_block
-        else:
-            cs_per_row = 0
 
         var pr = min(PANEL_ROWS, p.id.rows)
         var row_off = 0
@@ -1016,20 +986,11 @@ struct QuantWorker(Movable):
                     p.fwht_block, self.scratch.work, self.scratch.qi,
                     self.scratch.scales, panel_rows, p.id.cols, p.two_sided_m)
 
-            if p.colsum_kind == ColsumKind.PER_ROW:
-                colsum_per_row(self.scratch.qi, self.scratch.cs,
-                    panel_rows, p.id.cols)
-            elif p.colsum_kind == ColsumKind.PER_BLOCK:
-                colsum_per_block(self.scratch.qi, self.scratch.cs,
-                    p.fwht_block, panel_rows, p.id.cols)
-
             var w_off = self.data_start + p.id.weight_off + row_off * p.id.cols
             var s_off = (self.data_start + p.scale_off
                 + row_off * scale_per_row * 4)
-            var c_off = (self.data_start + p.cs_off
-                + row_off * cs_per_row * 4) if cs_per_row > 0 else 0
 
-            var ops = InlineArray[WriteOp[], 3](uninitialized=True)
+            var ops = InlineArray[WriteOp[], 2](uninitialized=True)
             ops[0] = WriteOp(
                 file_idx=self.output_fd_idx, offset=w_off,
                 length=panel_rows * p.id.cols,
@@ -1039,12 +1000,6 @@ struct QuantWorker(Movable):
                 length=panel_rows * scale_per_row * 4,
                 src=self.scratch.scales.bitcast[UInt8](), id=1)
             var n_ops = 2
-            if cs_per_row > 0:
-                ops[2] = WriteOp(
-                    file_idx=self.output_fd_idx, offset=c_off,
-                    length=panel_rows * cs_per_row * 4,
-                    src=self.scratch.cs.bitcast[UInt8](), id=2)
-                n_ops = 3
 
             var ops_span = Span[WriteOp[], MutAnyOrigin](
                 ptr=UnsafePointer[WriteOp[], MutAnyOrigin](
@@ -1067,26 +1022,38 @@ struct QuantWorker(Movable):
         var src_buf = alloc[UInt8](rows * cols * src_bytes_per).as_any_origin()
         var gauge_f32 = alloc[Float32](cols).as_any_origin()
         var centered = alloc[Scalar[DType.bfloat16]](rows * cols).as_any_origin()
-        var gauge_bf16 = alloc[Scalar[DType.bfloat16]](cols).as_any_origin()
+        var gauge_bf16 = PtrBF16.unsafe_dangling()
+        if p.emit_gauge:
+            gauge_bf16 = alloc[Scalar[DType.bfloat16]](cols).as_any_origin()
 
         var ok = read_sync(self.ring, p.id.shard, p.id.src_offset,
             rows * cols * src_bytes_per, src_buf)
 
         if ok:
             if p.id.src_dtype == DType.bfloat16:
-                router_center[DType.bfloat16](
-                    src_buf.bitcast[Scalar[DType.bfloat16]](),
-                    gauge_f32, centered, gauge_bf16, rows, cols)
+                if p.emit_gauge:
+                    router_center[DType.bfloat16](
+                        src_buf.bitcast[Scalar[DType.bfloat16]](),
+                        gauge_f32, centered, gauge_bf16, rows, cols)
+                else:
+                    router_center_softmax[DType.bfloat16](
+                        src_buf.bitcast[Scalar[DType.bfloat16]](),
+                        gauge_f32, centered, rows, cols)
             else:
-                router_center[DType.float32](
-                    src_buf.bitcast[Float32](),
-                    gauge_f32, centered, gauge_bf16, rows, cols)
+                if p.emit_gauge:
+                    router_center[DType.float32](
+                        src_buf.bitcast[Float32](),
+                        gauge_f32, centered, gauge_bf16, rows, cols)
+                else:
+                    router_center_softmax[DType.float32](
+                        src_buf.bitcast[Float32](),
+                        gauge_f32, centered, rows, cols)
 
             ok = write_sync(self.ring, self.output_fd_idx,
                 self.data_start + p.id.weight_off, rows * cols * 2,
                 centered.bitcast[UInt8]())
 
-        if ok:
+        if ok and p.emit_gauge:
             ok = write_sync(self.ring, self.output_fd_idx,
                 self.data_start + p.gauge_off, cols * 2,
                 gauge_bf16.bitcast[UInt8]())
@@ -1097,7 +1064,8 @@ struct QuantWorker(Movable):
         src_buf.free()
         gauge_f32.free()
         centered.free()
-        gauge_bf16.free()
+        if p.emit_gauge:
+            gauge_bf16.free()
         return ok
 
     def write_router_bias(mut self, ref p: RouterPlan) -> Bool:
@@ -1142,12 +1110,7 @@ def estimate_slot_bytes(plan: SlotPlan) -> Int:
         var weight = rows * cols
         var nb = (cols // q.fwht_block) if q.per_block else 1
         var scale = rows * nb * 4
-        var cs = 0
-        if q.colsum_kind == ColsumKind.PER_ROW:
-            cs = rows * 4
-        elif q.colsum_kind == ColsumKind.PER_BLOCK:
-            cs = rows * (cols // q.fwht_block) * 4
-        return src + weight + scale + cs
+        return src + weight + scale
     if plan.isa[RouterPlan]():
         var r = plan[RouterPlan].copy()
         return r.id.rows * r.id.cols * 3

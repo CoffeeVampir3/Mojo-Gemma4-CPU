@@ -418,23 +418,11 @@ $$V_{i_8}[g, t, k] = Q_{S_V[g, t]}(v_{g, t, k}), \qquad V_{\text{scale}}[g, t] =
 
 No FWHT is applied at cache write time. The cache layout, scale storage, and downstream V-aggregation are identical to §8.3.
 
-## 8.5 Storage layout
+## 8.5 Storage footprint
 
-The cache is indexed by position group of $W$ consecutive positions per group, where $W$ is the i32 SIMD lane count of the score dot instruction. $B_{\text{vnni}}$ is the inner VNNI dot width (4 for current AVX-512 and AMX VNNI).
+Per cached position per head, the cache holds $d_{\text{head}}$ int8 K values and $d_{\text{head}}$ int8 V values, plus the per-(head, position) f32 scales $K_{\text{scale}}$ and $V_{\text{scale}}$ of §8.1. The byte footprint is $d_{\text{head}}$ bytes for K and $d_{\text{head}}$ bytes for V at each position, independent of arrangement.
 
-K layout per head per pos_group:
-
-$$[d_{\text{head}} / B_{\text{vnni}}] \times [W \times B_{\text{vnni}}] \quad \text{u8 or i8 bytes}.$$
-
-Each $W \times B_{\text{vnni}}$ tile holds $W$ positions × $B_{\text{vnni}}$ K-axis values.
-
-V layout per head per pos_group:
-
-$$[d_{\text{head}} / W] \times [W / B_{\text{vnni}}] \times [W \times B_{\text{vnni}}] \quad \text{i8 bytes}.$$
-
-The V layout is transposed relative to K: $W$ is the channel axis (the lane index of the V-aggregation dot), and $B_{\text{vnni}}$ is the position-within-group axis (the inner VNNI axis).
-
-The total bytes per pos_group are $d_{\text{head}} \cdot W$ for both K and V.
+The physical layout of these bytes — contiguous per position, grouped across positions, or transposed between the K and V tensors — is not fixed by this encoding. It is an implementation choice of the score (§10) and V-aggregation (§11) kernels, determined by their dot-product access patterns, and the K encoding (i8 or u8, §8.2) follows the score dot's operand convention. The dequantized score and attention output are identical across layouts.
 
 ---
 
@@ -495,51 +483,29 @@ For positions outside the valid context (causal or padding), $s[h, p, g, t] \lef
 
 ---
 
-# XI. Online Softmax with Folded V Scale
+# XI. Online Softmax and V-Aggregation
 
 ## 11.1 Per-position folded weight
 
-For each cached position $t$ in a position group, the unnormalized attention weight is $a_t = \exp(s[h, p, g, t] - m)$ where $m$ is the running max maintained across position groups by the online softmax.
-
-The folded weight is
+For each cached position $t$, the unnormalized attention weight is $a_t = \exp(s[h, p, g, t] - m)$, where $m$ is the running max maintained by the online softmax. The folded weight is
 
 $$w[t] = a_t \cdot V_{\text{scale}}[g, t].$$
 
-## 11.2 Per-group u8 quantization
+## 11.2 V-aggregation identity
 
-For one position group with positions $t \in \mathrm{grp}$,
+Let $\ell[h, p] = \sum_t a_t$ be the softmax denominator. The dequantized attention output is
 
-$$m_w = \max_{t \in \mathrm{grp}} w[t], \qquad w_{u_8}[t] = \mathrm{clamp}(\mathrm{round}(255 \cdot w[t] / m_w), 0, 255).$$
+$$y[h, p, d] = \frac{1}{127 \cdot \ell[h, p]} \sum_t a_t \cdot V_{\text{scale}}[g, t] \cdot V_{i_8}[g, t, d] = \frac{1}{127 \cdot \ell[h, p]} \sum_t w[t] \cdot V_{i_8}[g, t, d].$$
 
-The u8 grid range $[0, 255]$ is used because $w[t] \ge 0$ (the product of a non-negative attention weight and a non-negative V scale).
+The factor $1/127$ is the V dequantization; $1/\ell$ is the softmax normalization. This identity fixes the result. The order of accumulation and the arithmetic used to form the sum are implementation choices that do not change the dequantized output.
 
-The per-group dequantization scalar is $w_{\text{scale}} = m_w / 255$.
+## 11.3 Efficient u8-fold implementation (non-normative)
 
-## 11.3 V-aggregation contribution per group
+The sum of §11.2 may be formed in any arithmetic that realizes the identity; a direct f32 accumulation of $w[t] \cdot V_{i_8}$ uses no intermediate quantization. One efficient alternative quantizes the folded weights of a tile of positions to u8 so the sum becomes a VNNI u8·i8 dot. Over a tile with positions $t \in \mathrm{grp}$:
 
-The contribution of one position group to the V-aggregation accumulator is
+$$m_w = \max_{t \in \mathrm{grp}} w[t], \qquad w_{u_8}[t] = \mathrm{clamp}(\mathrm{round}(255 \cdot w[t] / m_w), 0, 255)$$
 
-$$\Delta y[h, p, d] = \left(\sum_{t \in \mathrm{grp}} w_{u_8}[t] \cdot V_{i_8}[g, t, d]\right) \cdot w_{\text{scale}}.$$
-
-Substituting $w_{u_8}[t] = \mathrm{round}(255 \cdot w[t] / m_w)$ and $w_{\text{scale}} = m_w / 255$:
-
-$$\Delta y[h, p, d] = \sum_{t \in \mathrm{grp}} w[t] \cdot V_{i_8}[g, t, d] + O(\text{rounding of } w_{u_8}).$$
-
-The per-group $m_w$ cancels exactly to within the $w_{u_8}$ rounding. No cross-group bookkeeping is required for $m_w$.
-
-## 11.4 Final normalization
-
-After all position groups for one query position have been accumulated, let $\ell[h, p] = \sum_t a_t$ be the softmax denominator. The dequantized attention output is
-
-$$y[h, p, d] = \frac{1}{127 \cdot \ell[h, p]} \sum_t a_t \cdot V_{\text{scale}}[g, t] \cdot V_{i_8}[g, t, d].$$
-
-The factor $1/127$ is the V dequantization. The factor $1/\ell$ is the softmax normalization. The per-group $m_w$ scalars do not appear because they cancelled within each group during V-aggregation.
-
-## 11.5 Precision budget
-
-The 8-bit u8 grid for $w$ is shared between the softmax probability $a_t$ and the V scale $V_{\text{scale}}[g, t]$ within one position group. For uniform $V_{\text{scale}}$ within a group, the full 256-level grid is available for $a_t$. For $V_{\text{scale}}$ varying by factor $f$ within a group, the effective grid for $a_t$ is reduced to $256/f$.
-
-The position-group structure determines the locality of this tradeoff: small groups (one pos_group of $W$ positions) keep $V_{\text{scale}}$ variation local and admit a tighter $w_{u_8}$ grid for $a_t$.
+(u8 because $w[t] \ge 0$), and the tile contributes $\big(\sum_{t} w_{u_8}[t] \cdot V_{i_8}[g, t, d]\big) \cdot (m_w / 255)$. The per-tile $m_w$ cancels to within the $w_{u_8}$ rounding, so no cross-tile bookkeeping of $m_w$ is required. The 8-bit grid is then shared between the softmax weight $a_t$ and the within-tile $V_{\text{scale}}$ variation: for $V_{\text{scale}}$ varying by factor $f$ across the tile the effective grid for $a_t$ is $256/f$, so smaller tiles keep $V_{\text{scale}}$ variation local and admit a tighter grid.
 
 ---
 
@@ -631,6 +597,18 @@ The pivot $p$ reconstructs $\delta_e$ from $c_e$ exactly. Centering $W \to C$ ca
 The bias $b$ is added after $\sigma$ and is compared directly against the score margin between adjacent selection ranks. Its dtype determines the noise floor of the selection.
 
 If the score margin between ranks $K$ and $K+1$ falls below the bf16 floor on a non-trivial fraction of decisions, $b$ stored as bf16 introduces selection mismatches at that fraction. Storing $b$ as f32 keeps the bias above the bf16 noise floor.
+
+## 13.5 Shift-invariant softmax routers
+
+For routers that select from `softmax(logits)` with no additive bias before top-k, the gauge pivot is not required at runtime. Centering produces
+
+$$c_e = \sum_k x_k C[e, k] = \sum_k x_k W[e, k] - p$$
+
+with the same $p = \sum_k x_k g[k]$ for every expert. Both softmax and top-k are invariant to subtracting the same scalar from every expert logit:
+
+$$\operatorname{softmax}(\delta - p) = \operatorname{softmax}(\delta), \qquad \operatorname{topk}(\delta - p) = \operatorname{topk}(\delta).$$
+
+The `SoftmaxRouterCenter` recipe stores only the centered bf16 weight. It intentionally omits the gauge sidecar because the runtime never needs to reconstruct absolute logits for this router class.
 
 ---
 

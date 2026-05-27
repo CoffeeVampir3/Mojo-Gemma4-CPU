@@ -4,15 +4,14 @@ from std.os import abort
 
 from simd_math.ops import quantize_i8, sqrt
 from butterquant.fwht import fwht_block, fwht_row
-from butterquant.constants import SIMD_F32_WIDTH
+from butterquant.types import WF
 
 
-comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
 comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
 comptime PtrBF16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime SrcPtr[dtype: DType] = UnsafePointer[Scalar[dtype], MutAnyOrigin]
-comptime WIDTH = SIMD_F32_WIDTH
+comptime WIDTH = WF
 
 @always_inline
 def apply_gamma_in_place(work_row: PtrF32, gamma: PtrF32, cols: Int):
@@ -28,8 +27,20 @@ def apply_gamma_in_place(work_row: PtrF32, gamma: PtrF32, cols: Int):
 def gamma_sqrt_abs_in_place(gamma: PtrF32, cols: Int):
     var k = 0
     while k + WIDTH <= cols:
-        var v = (gamma + k).load[width=WIDTH]().__abs__()
+        var v = abs((gamma + k).load[width=WIDTH]())
         (gamma + k).store(sqrt[DType.float32, WIDTH](v))
+        k += WIDTH
+
+
+@always_inline
+def bake_split_gain_in_place(gamma: PtrBF16, cols: Int, eps: Float32 = 1e-12):
+    var floor = SIMD[DType.float32, WIDTH](eps)
+    var zero = SIMD[DType.float32, WIDTH](0)
+    var k = 0
+    while k + WIDTH <= cols:
+        var g = (gamma + k).load[width=WIDTH]().cast[DType.float32]()
+        var s = sqrt[DType.float32, WIDTH](max(abs(g), floor))
+        (gamma + k).store(g.lt(zero).select(-s, s).cast[DType.bfloat16]())
         k += WIDTH
 
 
@@ -38,7 +49,7 @@ def row_absmax(work_row: PtrF32, cols: Int) -> Float32:
     var vmax = SIMD[DType.float32, WIDTH](0)
     var k = 0
     while k + WIDTH <= cols:
-        vmax = max(vmax, (work_row + k).load[width=WIDTH]().__abs__())
+        vmax = max(vmax, abs((work_row + k).load[width=WIDTH]()))
         k += WIDTH
     return vmax.reduce_max()
 
@@ -103,22 +114,6 @@ def quant_rows_per_block[block: Int](
             quantize_inv(work_row + off, qi_row + off, inv, block)
 
 
-def rotate_and_quant_per_row[block: Int](
-    work: PtrF32, qi: PtrI8, scales: PtrF32,
-    rows: Int, cols: Int,
-):
-    fwht_rotate_rows[block](work, rows, cols)
-    quant_rows_per_row(work, qi, scales, rows, cols)
-
-
-def rotate_and_quant_per_block[block: Int](
-    work: PtrF32, qi: PtrI8, scales: PtrF32,
-    rows: Int, cols: Int,
-):
-    fwht_rotate_rows[block](work, rows, cols)
-    quant_rows_per_block[block](work, qi, scales, rows, cols)
-
-
 def dispatch_fwht_block[
     *,
     dispatch: def[block: Int]() capturing [_] -> None,
@@ -167,33 +162,7 @@ def rotate_and_quant[per_block: Bool](
         abort(t"butterquant: unsupported K-axis FWHT block={block}")
 
 
-def colsum_per_row(qi: PtrI8, cs: PtrF32, rows: Int, cols: Int):
-    for r in range(rows):
-        var qi_row = qi + r * cols
-        var acc = SIMD[DType.int32, WIDTH](0)
-        var k = 0
-        while k + WIDTH <= cols:
-            acc += (qi_row + k).load[width=WIDTH]().cast[DType.int32]()
-            k += WIDTH
-        cs[r] = Float32(acc.reduce_add())
-
-
-def colsum_per_block(qi: PtrI8, cs: PtrF32, block: Int, rows: Int, cols: Int):
-    var num_blocks = cols // block
-    for r in range(rows):
-        var qi_row = qi + r * cols
-        var cs_row = cs + r * num_blocks
-        for b in range(num_blocks):
-            var off = b * block
-            var acc = SIMD[DType.int32, WIDTH](0)
-            var k = 0
-            while k + WIDTH <= block:
-                acc += (qi_row + off + k).load[width=WIDTH]().cast[DType.int32]()
-                k += WIDTH
-            cs_row[b] = Float32(acc.reduce_add())
-
-
-def router_center[src_dtype: DType](
+def router_center_impl[src_dtype: DType, emit_gauge: Bool](
     src: SrcPtr[src_dtype], gauge: PtrF32,
     centered_bf16: PtrBF16, gauge_bf16: PtrBF16,
     rows: Int, cols: Int,
@@ -216,7 +185,8 @@ def router_center[src_dtype: DType](
     while k + WIDTH <= cols:
         var g = (gauge + k).load[width=WIDTH]() * inv_rows
         (gauge + k).store(g)
-        (gauge_bf16 + k).store(g.cast[DType.bfloat16]())
+        comptime if emit_gauge:
+            (gauge_bf16 + k).store(g.cast[DType.bfloat16]())
         k += WIDTH
 
     for r in range(rows):
@@ -228,3 +198,21 @@ def router_center[src_dtype: DType](
             var c = v - (gauge + k).load[width=WIDTH]()
             (out + k).store(c.cast[DType.bfloat16]())
             k += WIDTH
+
+
+def router_center[src_dtype: DType](
+    src: SrcPtr[src_dtype], gauge: PtrF32,
+    centered_bf16: PtrBF16, gauge_bf16: PtrBF16,
+    rows: Int, cols: Int,
+):
+    router_center_impl[src_dtype, True](
+        src, gauge, centered_bf16, gauge_bf16, rows, cols)
+
+
+def router_center_softmax[src_dtype: DType](
+    src: SrcPtr[src_dtype], gauge: PtrF32,
+    centered_bf16: PtrBF16,
+    rows: Int, cols: Int,
+):
+    router_center_impl[src_dtype, False](
+        src, gauge, centered_bf16, centered_bf16, rows, cols)

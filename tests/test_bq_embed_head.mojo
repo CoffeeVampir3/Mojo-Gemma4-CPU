@@ -9,13 +9,13 @@ from kernels.helpers import Binding, ArenaBases
 from kernels.rmsnorm import rms_reduce_row
 from kernels.gemv import softcap_value
 from butterquant import (
-    rotate_and_quant_per_block, colsum_per_block,
+    rotate_and_quant,
     ButterquantWeight, ButterquantActivation,
 )
 from butterquant_kernels import (
     dispatch_bq_embed_lookup, dispatch_bq_head_prep, dispatch_bq_head_gemv,
 )
-from quant.recipe import PerBlockQuant, NoGamma, SingleSided, PerBlockCs
+from quant.recipe import PerBlockQuant, NoGamma, SingleSided, NoColsum, RowMajor
 
 
 comptime HIDDEN = 2816
@@ -27,7 +27,7 @@ comptime SQRT_N = sqrt[DType.float32, 1](HIDDEN)
 comptime N_EPS = HIDDEN * 1e-6
 comptime EMBED_SCALE = Float64(
     sqrt[DType.float32, 1](HIDDEN).cast[DType.bfloat16]().cast[DType.float32]())
-comptime QUANT = PerBlockQuant(BLOCK, NoGamma(), SingleSided(), PerBlockCs())
+comptime QUANT = PerBlockQuant(BLOCK, NoGamma(), SingleSided(), NoColsum(), RowMajor())
 
 comptime F32ExtPtr = UnsafePointer[Float32, MutAnyOrigin]
 comptime I8ExtPtr = UnsafePointer[Int8, MutAnyOrigin]
@@ -118,7 +118,6 @@ def main():
     var work = alloc[Float32](VOCAB * HIDDEN).as_any_origin()
     var wi8 = alloc[Int8](VOCAB * HIDDEN).as_any_origin()
     var sw = alloc[Float32](VOCAB * NB).as_any_origin()
-    var cs = alloc[Float32](VOCAB * NB).as_any_origin()
 
     for n in range(VOCAB):
         for k in range(HIDDEN):
@@ -126,8 +125,7 @@ def main():
             w_orig[n * HIDDEN + k] = v
             work[n * HIDDEN + k] = v
 
-    rotate_and_quant_per_block[BLOCK](work, wi8, sw, VOCAB, HIDDEN)
-    colsum_per_block(wi8, cs, BLOCK, VOCAB, HIDDEN)
+    rotate_and_quant[True](BLOCK, work, wi8, sw, VOCAB, HIDDEN)
 
     var bases = ArenaBases[1].uninitialized()
     bases[0] = 0
@@ -137,7 +135,7 @@ def main():
     var bqw = ButterquantWeight[QUANT, VOCAB, HIDDEN, 1](
         Binding[Int8, 1](wi8, bases),
         Binding[Float32, 1](sw, bases),
-        Binding[Float32, 1](cs, bases))
+        Binding[Float32, 1](sw, bases))
 
     # --- lookup: reconstruct rows from the shared int8 head encoding ---
     var tok_buf = List[Int32]()

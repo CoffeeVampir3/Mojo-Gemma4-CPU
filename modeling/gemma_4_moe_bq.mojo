@@ -1,22 +1,40 @@
+from std.collections import InlineArray
 from std.pathlib import Path
 from std.memory import Span, UnsafePointer
 
 from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
+from std.sys.info import simd_width_of
 from simd_math.ops import sqrt
-from kernels.helpers import ArenaBases
-from kernels.moe_router import RouterCandidate, SparseRoute
+from kernels.helpers import ArenaBases, Binding
+from kernels.moe_router import (
+    RouterCandidate, SparseRoute,
+    dispatch_router_sharded, merge_router_candidates, build_expert_schedules,
+)
 from kernels.attention_ops import flash_partial_stride
 from kernels.reductions import dispatch_allreduce_inplace
-from butterquant_kernels import dispatch_bq_embed_lookup
+from kernels.rmsnorm import dispatch_rms_norm, fused_norm_residual_add
+from kernels.elementwise import dispatch_gelu_gate_up, dispatch_scalar_mul
+from butterquant_kernels import (
+    dispatch_bq_embed_lookup, dispatch_bq_norm_quant, dispatch_bq_qkv,
+    dispatch_bq_linear, dispatch_bq_attn_prep,
+    dispatch_bq_sliding_attention, dispatch_bq_full_attention,
+    dispatch_bq_block_quant, dispatch_bq_block_linear,
+    dispatch_bq_phase1_gate_up, dispatch_bq_phase2_down,
+    dispatch_bq_head_prep, dispatch_bq_head_gemv,
+)
+from butterquant import (
+    VnniPackable, PackColsumTask, dispatch_pack_colsum,
+    bake_split_gain_in_place, ButterquantActivation, ButterquantBlockActivation,
+)
 from modeling.temporal_scratch import (
     ScratchBuffer, ScratchIsland, ScratchPhase, ScratchPhaseOrder,
-    TemporalScratchPool, aggregate_scratch_peak,
+    TemporalScratchPool, TemporalLogitsView, aggregate_scratch_peak,
 )
 
 from modeling.model_spec import (
-    BF16, F32,
+    BF16, F32, I8,
     Shape, WeightDesc,
     DistributionDegree,
     Replicated,
@@ -32,11 +50,12 @@ from modeling.modeling_common import (
     Repeated, ArenaLayout,
 )
 from modeling.slot import (
-    Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
+    Slot, SlotGroup, BindContext, stamp_offsets, emit_descs, emit_pack_tasks,
 )
 from quant.recipe import (
-    QuantRecipe, PerRowQuant, PerBlockQuant, RouterCenter,
-    SplitGamma, NoGamma, SingleSided, PerRowCs, PerBlockCs,
+    QuantRecipe, PerRowQuant, PerBlockQuant, SoftmaxRouterCenter,
+    SplitGamma, NoGamma, SingleSided, PerRowCs, PerBlockCs, NoColsum,
+    VnniPacked, RowMajor,
 )
 from quant.quantizer import Quantizer
 from modeling.loader import discover_shards, load_weights_from_descs
@@ -64,7 +83,6 @@ comptime FullAttentionContract[degree: Int, max_seq_len: Int]: Bool = (
 
 comptime DenseMlpContract[degree: Int]: Bool = (
     degree > 0
-    and C.INTERMEDIATE % degree == 0
 )
 
 
@@ -82,8 +100,8 @@ comptime LmHeadContract[degree: Int]: Bool = (
 
 struct Gemma4Shapes[degree: Int]:
     comptime D = DistributionDegree[Self.degree]
-    comptime GateUp      = TensorRowSharded[C.INTERMEDIATE, C.HIDDEN, Self.D]
-    comptime Down        = TensorColumnSharded[C.HIDDEN, C.INTERMEDIATE, Self.D]
+    comptime GateUp      = TensorRowSharded[C.INTERMEDIATE, C.HIDDEN, Self.D, block=C.DOWN_FWHT_BLOCK]
+    comptime Down        = TensorColumnSharded[C.HIDDEN, C.INTERMEDIATE, Self.D, block=C.DOWN_FWHT_BLOCK]
     comptime SlidingQ    = TensorRowSharded[C.Q_DIM_SLIDING, C.HIDDEN, Self.D]
     comptime SlidingKV   = TensorRowSharded[C.KV_DIM_SLIDING, C.HIDDEN, Self.D]
     comptime SlidingO    = TensorColumnSharded[C.HIDDEN, C.Q_DIM_SLIDING, Self.D]
@@ -101,24 +119,28 @@ struct Gemma4Shapes[degree: Int]:
     ]
 
 
-struct Gemma4StateShapes[degree: Int, max_seq_len: Int]:
-    """Distribution choices for per-token state tensors.
+comptime VnniPackContract[degree: Int]: Bool = (
+    VnniPackable[Gemma4Shapes[degree].SlidingQ]
+    and VnniPackable[Gemma4Shapes[degree].SlidingKV]
+    and VnniPackable[Gemma4Shapes[degree].SlidingO]
+    and VnniPackable[Gemma4Shapes[degree].FullQ]
+    and VnniPackable[Gemma4Shapes[degree].FullK]
+    and VnniPackable[Gemma4Shapes[degree].FullO]
+    and VnniPackable[Gemma4Shapes[degree].GateUp]
+    and VnniPackable[Gemma4Shapes[degree].Down]
+    and VnniPackable[Gemma4Shapes[degree].ExpertsGateUp]
+    and VnniPackable[Gemma4Shapes[degree].ExpertsDown]
+)
 
-    `D` shards a tensor across the `degree` ranks (one slice per rank).
-    `Local` keeps the whole tensor on every rank (replicated). The
-    project's NUMA principle says: data should live closest to its
-    most-frequent reader. Both rope tables are read by every attention
-    worker on every token, so both are replicated per rank to keep reads
-    NUMA-local and to let prefill rotate Q identically on every rank
-    without a cross-rank gather. The sliding KV ring is sized at
-    `2 * SLIDING_WINDOW` so a prefill chunk of W tokens can land in one
-    half while the prior chunk stays addressable in the other half.
-    """
+
+struct Gemma4StateShapes[degree: Int, max_seq_len: Int]:
     comptime D     = DistributionDegree[Self.degree]
     comptime Local = DistributionDegree[1]
     comptime SLIDING_CACHE = 2 * C.SLIDING_WINDOW
     comptime SlidingKV   = TensorColumnSharded[Self.SLIDING_CACHE, C.KV_DIM_SLIDING, Self.D]
     comptime FullKV      = ContextRowSharded[Self.max_seq_len, C.KV_DIM_FULL, Self.D]
+    comptime SlidingKVScale = TensorColumnSharded[Self.SLIDING_CACHE, C.NUM_KV_HEADS_SLIDING, Self.D]
+    comptime FullKVScale = ContextRowSharded[Self.max_seq_len, C.NUM_KV_HEADS_FULL, Self.D]
     comptime SlidingRope = ContextRowSharded[Self.max_seq_len, C.ROPE_HALF_SLIDING, Self.Local]
     comptime FullRope    = ContextRowSharded[Self.max_seq_len, C.ROPE_HALF_FULL, Self.Local]
 
@@ -130,17 +152,17 @@ struct Gemma4TailShapes[degree: Int]:
 
 
 comptime SplitGainPerRowCs[fwht: Int, gamma: StaticString]: QuantRecipe = PerRowQuant(
-    fwht, SplitGamma(gamma), SingleSided(), PerRowCs(),
+    fwht, SplitGamma(gamma), SingleSided(), PerRowCs(), VnniPacked(),
 )
 
 
 comptime PlainPerRowBlockCs[fwht: Int]: QuantRecipe = PerRowQuant(
-    fwht, NoGamma(), SingleSided(), PerBlockCs(),
+    fwht, NoGamma(), SingleSided(), PerBlockCs(), VnniPacked(),
 )
 
 
 comptime TiedHeadEmbed[fwht: Int]: QuantRecipe = PerBlockQuant(
-    fwht, NoGamma(), SingleSided(), PerBlockCs(),
+    fwht, NoGamma(), SingleSided(), NoColsum(), RowMajor(),
 )
 
 
@@ -184,15 +206,15 @@ struct BodyRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     var up_proj:         Slot[BF16, Self.S.GateUp,              "mlp.up_proj.weight",
         SplitGainPerRowCs[128, "pre_feedforward_layernorm.weight"]]
     var down_proj:       Slot[BF16, Self.S.Down,                "mlp.down_proj.weight",
-        PlainPerRowBlockCs[64]]
+        PlainPerRowBlockCs[C.DOWN_FWHT_BLOCK]]
     var router_proj:     Slot[BF16, Self.S.RouterProj,          "router.proj.weight",
-        RouterCenter("")]
+        SoftmaxRouterCenter()]
     var router_scale:    Slot[BF16, Shape[C.HIDDEN, 1],         "router.scale"]
     var router_pes:      Slot[BF16, Shape[C.NUM_EXPERTS, 1],    "router.per_expert_scale"]
     var experts_gate_up: Slot[BF16, Self.S.ExpertsGateUp,       "experts.gate_up_proj",
         SplitGainPerRowCs[128, "pre_feedforward_layernorm_2.weight"]]
     var experts_down:    Slot[BF16, Self.S.ExpertsDown,         "experts.down_proj",
-        PlainPerRowBlockCs[64]]
+        PlainPerRowBlockCs[C.DOWN_FWHT_BLOCK]]
     var layer_scalar:    Slot[BF16, Shape[1, 1],                "layer_scalar"]
 
 
@@ -208,14 +230,18 @@ struct FullLayerRefs[degree: Int](Copyable, ImplicitlyCopyable, SlotGroup):
 
 struct SlidingKVSlots[degree: Int, max_seq_len: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4StateShapes[Self.degree, Self.max_seq_len]
-    var k: Slot[BF16, Self.S.SlidingKV]
-    var v: Slot[BF16, Self.S.SlidingKV]
+    var k:       Slot[I8,  Self.S.SlidingKV]
+    var k_scale: Slot[F32, Self.S.SlidingKVScale]
+    var v:       Slot[I8,  Self.S.SlidingKV]
+    var v_scale: Slot[F32, Self.S.SlidingKVScale]
 
 
 struct FullKVSlots[degree: Int, max_seq_len: Int](Copyable, ImplicitlyCopyable, SlotGroup):
     comptime S = Gemma4StateShapes[Self.degree, Self.max_seq_len]
-    var k: Slot[BF16, Self.S.FullKV]
-    var v: Slot[BF16, Self.S.FullKV]
+    var k:       Slot[I8,  Self.S.FullKV]
+    var k_scale: Slot[F32, Self.S.FullKVScale]
+    var v:       Slot[I8,  Self.S.FullKV]
+    var v_scale: Slot[F32, Self.S.FullKVScale]
 
 
 struct RopeSlots[half: Int, max_seq_len: Int, degree: Int = 1](Copyable, ImplicitlyCopyable, SlotGroup):
@@ -269,17 +295,24 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     comptime head_dim = C.HEAD_DIM_SLIDING
     comptime num_kv_heads = Self.kv_rows // Self.head_dim
     comptime num_q_heads = Self.q_rows // Self.head_dim
-    comptime cache_size = 2 * C.SLIDING_WINDOW
     comptime PARTIAL_STRIDE = flash_partial_stride[
         Self.num_q_heads, Self.head_dim,
     ]()
 
     comptime PHASES = ScratchPhaseOrder[
-        "gemv_qkv", "rms_norm_qkv", "rope_cache_write",
-        "flash", "merge_partials", "o_proj",
+        "norm_quant", "gemv_qkv", "rms_norm_qkv", "rope_cache_write",
+        "flash", "merge_partials", "o_proj_prep", "o_proj",
     ]
 
-    var q_band: ScratchPhase["gemv_qkv", "o_proj"]
+    var x_i8_band: ScratchPhase["norm_quant", "gemv_qkv"]
+    var x_i8: ScratchBuffer[
+        Int8, C.SLIDING_WINDOW * C.HIDDEN,
+    ]
+    var x_sa: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW,
+    ]
+
+    var q_band: ScratchPhase["gemv_qkv", "o_proj_prep"]
     var q: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.q_rows,
     ]
@@ -289,9 +322,28 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
         BFloat16, C.SLIDING_WINDOW * Self.kv_rows * 2,
     ]
 
+    var qprep_band: ScratchPhase["rms_norm_qkv", "flash"]
+    var q_i8: ScratchBuffer[
+        Int8, C.SLIDING_WINDOW * Self.q_rows,
+    ]
+    var qi_bias: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW * Self.num_q_heads,
+    ]
+    var f_q: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW * Self.num_q_heads,
+    ]
+
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
         Float32, Self.max_worker_count * Self.PARTIAL_STRIDE,
+    ]
+
+    var o_band: ScratchPhase["o_proj_prep", "o_proj"]
+    var o_i8: ScratchBuffer[
+        Int8, C.SLIDING_WINDOW * Self.q_rows,
+    ]
+    var o_sa: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW * Self.num_q_heads,
     ]
 
 
@@ -305,6 +357,7 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
     comptime local_q_rows = Self.S.FullO.DATA_M
     comptime head_dim = C.HEAD_DIM_FULL
     comptime num_q_heads = Self.q_rows // Self.head_dim
+    comptime local_num_q_heads = Self.local_q_rows // Self.head_dim
     comptime PARTIAL_STRIDE = flash_partial_stride[
         Self.num_q_heads, Self.head_dim,
     ]()
@@ -315,11 +368,19 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
     )
 
     comptime PHASES = ScratchPhaseOrder[
-        "gemv_q", "gemv_kv", "rms_norm_qkv", "rope_cache_write",
-        "flash", "merge_partials", "o_proj",
+        "norm_quant", "gemv_q", "gemv_kv", "rms_norm_qkv", "rope_cache_write",
+        "flash", "merge_partials", "o_proj_prep", "o_proj",
     ]
 
-    var q_band: ScratchPhase["gemv_q", "flash"]
+    var x_i8_band: ScratchPhase["norm_quant", "gemv_kv"]
+    var x_i8: ScratchBuffer[
+        Int8, C.SLIDING_WINDOW * C.HIDDEN,
+    ]
+    var x_sa: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW,
+    ]
+
+    var q_band: ScratchPhase["gemv_q", "rms_norm_qkv"]
     var q: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.q_rows,
     ]
@@ -329,14 +390,33 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
         BFloat16, C.SLIDING_WINDOW * Self.k_rows * 2,
     ]
 
+    var qprep_band: ScratchPhase["rms_norm_qkv", "flash"]
+    var q_i8: ScratchBuffer[
+        Int8, C.SLIDING_WINDOW * Self.q_rows,
+    ]
+    var qi_bias: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW * Self.num_q_heads,
+    ]
+    var f_q: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW * Self.num_q_heads,
+    ]
+
     var partials_band: ScratchPhase["flash", "merge_partials"]
     var partials: ScratchBuffer[
         Float32, Self.PARTIAL_SLOTS * Self.PARTIAL_STRIDE,
     ]
 
-    var q_local_band: ScratchPhase["merge_partials", "o_proj"]
+    var q_local_band: ScratchPhase["merge_partials", "o_proj_prep"]
     var q_local: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.local_q_rows,
+    ]
+
+    var o_band: ScratchPhase["o_proj_prep", "o_proj"]
+    var o_i8: ScratchBuffer[
+        Int8, C.SLIDING_WINDOW * Self.local_q_rows,
+    ]
+    var o_sa: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW * Self.local_num_q_heads,
     ]
 
 
@@ -347,32 +427,41 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     comptime S = Gemma4Shapes[Self.degree]
     comptime intermediate_per_rank = Self.S.GateUp.DATA_N
     comptime experts_per_rank = C.NUM_EXPERTS // Self.degree
-    comptime PHASE1_TILE_J = 64
-    comptime PHASE1_MR = 4
+    comptime nb_down_dense = Self.intermediate_per_rank // C.DOWN_FWHT_BLOCK
+    comptime nb_down_moe = C.MOE_INTERMEDIATE // C.DOWN_FWHT_BLOCK
+    comptime num_routes = C.SLIDING_WINDOW * C.TOP_K
 
     comptime PHASES = ScratchPhaseOrder[
-        "ffn_rms_norm", "gemv_gate", "gemv_up", "gelu_gate_up",
-        "router_sharded", "merge_cands", "moe_rms_norm",
-        "build_schedules", "phase1_gate_up", "phase2_down",
+        "dense_norm_quant", "gemv_gate", "gemv_up", "gelu_gate_up",
+        "down_quant", "router_sharded", "merge_cands", "moe_norm_quant",
+        "build_schedules", "phase1_gate_up", "bucket_quant", "phase2_down",
         "moe_allreduce", "gemv_dense", "allreduce_dense",
         "post_norm_1", "post_norm_2", "post_norm_3",
     ]
 
-    var ffn_gate_band: ScratchPhase["gemv_gate", "gemv_dense"]
+    var dense_x_band: ScratchPhase["dense_norm_quant", "gemv_up"]
+    var dense_x_i8: ScratchBuffer[Int8, C.SLIDING_WINDOW * C.HIDDEN]
+    var dense_x_sa: ScratchBuffer[Float32, C.SLIDING_WINDOW]
+
+    var ffn_gate_band: ScratchPhase["gemv_gate", "down_quant"]
     var ffn_gate: ScratchBuffer[
-        BFloat16,
-        C.SLIDING_WINDOW * Self.intermediate_per_rank,
+        BFloat16, C.SLIDING_WINDOW * Self.intermediate_per_rank,
     ]
 
     var ffn_up_band: ScratchPhase["gemv_up", "gelu_gate_up"]
     var ffn_up: ScratchBuffer[
-        BFloat16,
-        C.SLIDING_WINDOW * Self.intermediate_per_rank,
+        BFloat16, C.SLIDING_WINDOW * Self.intermediate_per_rank,
     ]
 
-    var router_workspace: ScratchPhase[
-        "router_sharded", "router_sharded",
+    var dense_gate_band: ScratchPhase["down_quant", "gemv_dense"]
+    var dense_gate_i8: ScratchBuffer[
+        Int8, C.SLIDING_WINDOW * Self.intermediate_per_rank,
     ]
+    var dense_gate_sa: ScratchBuffer[
+        Float32, C.SLIDING_WINDOW * Self.nb_down_dense,
+    ]
+
+    var router_workspace: ScratchPhase["router_sharded", "router_sharded"]
     var moe_router_scaled: ScratchBuffer[
         Float32, Self.max_worker_count * C.HIDDEN,
     ]
@@ -381,49 +470,35 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     var moe_cands: ScratchBuffer[RouterCandidate, C.SLIDING_WINDOW * C.TOP_K]
 
     var router_products: ScratchPhase["merge_cands", "build_schedules"]
-    var moe_route_idx: ScratchBuffer[
-        Int32, C.SLIDING_WINDOW * C.TOP_K,
-    ]
-    var moe_route_w: ScratchBuffer[
-        Float32, C.SLIDING_WINDOW * C.TOP_K,
-    ]
+    var moe_route_idx: ScratchBuffer[Int32, C.SLIDING_WINDOW * C.TOP_K]
+    var moe_route_w: ScratchBuffer[Float32, C.SLIDING_WINDOW * C.TOP_K]
 
-    var expert_input: ScratchPhase["moe_rms_norm", "phase1_gate_up"]
-    var moe_x_normed: ScratchBuffer[
-        BFloat16, C.SLIDING_WINDOW * C.HIDDEN,
-    ]
+    var expert_input: ScratchPhase["moe_norm_quant", "phase1_gate_up"]
+    var moe_x_i8: ScratchBuffer[Int8, C.SLIDING_WINDOW * C.HIDDEN]
+    var moe_x_sa: ScratchBuffer[Float32, C.SLIDING_WINDOW]
 
-    var schedule_products: ScratchPhase[
-        "build_schedules", "phase2_down",
-    ]
-    var moe_expert_offset: ScratchBuffer[
-        Int32, Self.experts_per_rank + 1,
-    ]
+    var schedule_products: ScratchPhase["build_schedules", "phase2_down"]
+    var moe_expert_offset: ScratchBuffer[Int32, Self.experts_per_rank + 1]
     var moe_routes: ScratchBuffer[SparseRoute, C.SLIDING_WINDOW * C.TOP_K]
 
-    var hidden_bucket: ScratchPhase["phase1_gate_up", "phase2_down"]
+    var hidden_bucket: ScratchPhase["phase1_gate_up", "bucket_quant"]
     var moe_hidden_bucket: ScratchBuffer[
-        BFloat16,
-        C.SLIDING_WINDOW * C.TOP_K * C.MOE_INTERMEDIATE,
+        BFloat16, Self.num_routes * C.MOE_INTERMEDIATE,
     ]
 
-    var phase1_workspace: ScratchPhase[
-        "phase1_gate_up", "phase1_gate_up",
+    var bucket_i8_band: ScratchPhase["bucket_quant", "phase2_down"]
+    var moe_bucket_i8: ScratchBuffer[
+        Int8, Self.num_routes * C.MOE_INTERMEDIATE,
     ]
-    var moe_gate_scratch: ScratchBuffer[
-        Float32,
-        Self.max_worker_count * Self.PHASE1_MR * 2 * Self.PHASE1_TILE_J,
+    var moe_bucket_sa: ScratchBuffer[
+        Float32, Self.num_routes * Self.nb_down_moe,
     ]
 
     var phase2_accum: ScratchPhase["phase2_down", "phase2_down"]
-    var moe_accum: ScratchBuffer[
-        Float32, C.SLIDING_WINDOW * C.HIDDEN,
-    ]
+    var moe_accum: ScratchBuffer[Float32, C.SLIDING_WINDOW * C.HIDDEN]
 
     var dense_band: ScratchPhase["gemv_dense", "post_norm_3"]
-    var ffn_dense_out: ScratchBuffer[
-        BFloat16, C.SLIDING_WINDOW * C.HIDDEN,
-    ]
+    var ffn_dense_out: ScratchBuffer[BFloat16, C.SLIDING_WINDOW * C.HIDDEN]
 
 
 @fieldwise_init
@@ -431,9 +506,14 @@ struct Gemma4HeadScratch[degree: Int](
     ScratchIsland, Copyable, ImplicitlyCopyable
 ):
     comptime PHASES = ScratchPhaseOrder[
-        "final_norm", "gemv_logits", "returned_to_caller",
+        "head_prep", "gemv_logits", "returned_to_caller",
     ]
     comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
+    comptime head_nb = C.HIDDEN // 128
+
+    var head_prep_band: ScratchPhase["head_prep", "gemv_logits"]
+    var head_x_i8: ScratchBuffer[Int8, C.HIDDEN]
+    var head_x_sa: ScratchBuffer[Float32, Self.head_nb]
 
     var logits_band: ScratchPhase["gemv_logits", "returned_to_caller"]
     var logits: ScratchBuffer[
@@ -472,6 +552,7 @@ def build_gemma4_plan[
     comptime assert DenseMlpContract[degree], "dense MLP distribution contract failed"
     comptime assert MoeContract[degree], "MoE distribution contract failed"
     comptime assert LmHeadContract[degree], "LM head distribution contract failed"
+    comptime assert VnniPackContract[degree], "VNNI pack alignment invariant failed: a packed weight's per-rank DATA_N must be a multiple of 32 and DATA_M a multiple of 64"
     comptime assert max_worker_count > 0, "max_worker_count must be positive"
 
     var sl_proto = SlidingLayerRefs[degree]()
@@ -543,27 +624,356 @@ def build_gemma4_plan[
         tail=tail)
 
 
+def dispatch_bq_sliding_attention_qkv[
+    P: BurstThreadPool, //, degree: Int, max_seq_len: Int,
+    max_worker_count: Int = 128,
+](
+    layout: Gemma4Layout[degree, max_seq_len],
+    ctx: BindContext[degree],
+    act: ButterquantActivation[degree],
+    base_pos: Int,
+    seq_len: Int,
+    layer_idx: Int,
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
+    mut pools: List[P],
+):
+    comptime S = Gemma4Shapes[degree]
+    comptime q_rows = S.SlidingQ.DATA_N
+    comptime kv_rows = S.SlidingKV.DATA_N
+    comptime head_dim = C.HEAD_DIM_SLIDING
+    comptime num_q_heads = q_rows // head_dim
+    comptime num_kv_heads = kv_rows // head_dim
+    comptime sqrt_hd = sqrt[DType.float32, 1](head_dim)
+    comptime hd_eps = Float32(head_dim) * Float32(C.RMS_NORM_EPS)
+    comptime rope_half = C.ROPE_HALF_SLIDING
+    comptime cache_size = Gemma4StateShapes[degree, max_seq_len].SLIDING_CACHE
+    comptime Island = Gemma4SlidingScratch[degree, max_worker_count]
+
+    var attn_ctx = ctx.with_layer(
+        layout.sliding.base(ctx.arena_bases[0], layer_idx))
+    var attn = layout.sliding.proto.attn
+
+    var q_outs = scratch.binding[Island, "q"](ctx)
+    var k_outs = scratch.binding[Island, "kv"](ctx)
+    var v_outs = k_outs.shifted(seq_len * kv_rows)
+
+    dispatch_bq_qkv[max_worker_count=max_worker_count](
+        act,
+        attn.q_proj.bq_weight(attn_ctx),
+        attn.k_proj.bq_weight(attn_ctx),
+        attn.v_proj.bq_weight(attn_ctx),
+        q_outs, k_outs, v_outs, seq_len, pools)
+
+    var q_i8 = scratch.binding[Island, "q_i8"](ctx)
+    var qi_bias = scratch.binding[Island, "qi_bias"](ctx)
+    var f_q = scratch.binding[Island, "f_q"](ctx)
+
+    var kv_lb = layout.sliding_kv.base(ctx.arena_bases[0], layer_idx)
+    var k_cache = layout.sliding_kv.proto.k.binding(kv_lb, ctx.arena_bases)
+    var k_scale = layout.sliding_kv.proto.k_scale.binding(kv_lb, ctx.arena_bases)
+    var v_cache = layout.sliding_kv.proto.v.binding(kv_lb, ctx.arena_bases)
+    var v_scale = layout.sliding_kv.proto.v_scale.binding(kv_lb, ctx.arena_bases)
+
+    dispatch_bq_attn_prep[
+        head_dim=head_dim, num_q=num_q_heads, num_kv=num_kv_heads,
+        rope_half=rope_half, pair_stride=head_dim // 2,
+        slot_mask=cache_size - 1, cache_degree=1,
+        sqrt_n=sqrt_hd, n_eps=hd_eps, tp=degree,
+        max_worker_count=max_worker_count,
+    ](q_outs, k_outs, v_outs,
+      attn.q_norm.binding(attn_ctx), attn.k_norm.binding(attn_ctx),
+      q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
+      layout.sliding_rope.cos.state_binding(ctx),
+      layout.sliding_rope.sin.state_binding(ctx),
+      base_pos, seq_len, pools)
+
+    var partials = scratch.binding[Island, "partials"](ctx)
+
+    dispatch_bq_sliding_attention[
+        head_dim=head_dim, num_q=num_q_heads, num_kv=num_kv_heads,
+        gqa_ratio=num_q_heads // num_kv_heads, kv_stride=kv_rows,
+        window=C.SLIDING_WINDOW, cache_size=cache_size,
+        partial_stride=Island.PARTIAL_STRIDE, tp=degree,
+        max_worker_count=max_worker_count,
+    ](q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
+      q_outs, partials, base_pos, seq_len, pools)
+
+    var o_i8 = scratch.binding[Island, "o_i8"](ctx)
+    var o_sa = scratch.binding[Island, "o_sa"](ctx)
+
+    dispatch_bq_block_quant[
+        cols=q_rows, block=head_dim, apply_fwht=False, tp=degree,
+        max_worker_count=max_worker_count,
+    ](q_outs, o_i8, o_sa, seq_len, pools)
+
+    var o_act = ButterquantBlockActivation[degree](o_i8, o_sa)
+    var xs = layout.activations.x_residual.state_binding(ctx)
+
+    dispatch_bq_block_linear[max_worker_count=max_worker_count](
+        o_act, attn.o_proj.bq_weight(attn_ctx), xs, seq_len, pools)
+
+
+def dispatch_bq_full_attention_qkv[
+    P: BurstThreadPool, //, degree: Int, max_seq_len: Int,
+    max_worker_count: Int = 128,
+](
+    layout: Gemma4Layout[degree, max_seq_len],
+    ctx: BindContext[degree],
+    act: ButterquantActivation[degree],
+    base_pos: Int,
+    seq_len: Int,
+    layer_idx: Int,
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
+    mut pools: List[P],
+):
+    comptime S = Gemma4Shapes[degree]
+    comptime q_rows = S.FullQ.DATA_N
+    comptime k_rows = S.FullK.DATA_N
+    comptime local_q_rows = S.FullO.DATA_M
+    comptime head_dim = C.HEAD_DIM_FULL
+    comptime num_q_heads = q_rows // head_dim
+    comptime local_num_q_heads = local_q_rows // head_dim
+    comptime num_kv_heads = k_rows // head_dim
+    comptime sqrt_hd = sqrt[DType.float32, 1](head_dim)
+    comptime hd_eps = Float32(head_dim) * Float32(C.RMS_NORM_EPS)
+    comptime rope_half = C.ROPE_HALF_FULL
+    comptime Island = Gemma4FullScratch[degree, max_worker_count]
+
+    var attn_ctx = ctx.with_layer(
+        layout.full.base(ctx.arena_bases[0], layer_idx))
+    var attn = layout.full.proto.attn
+
+    var q_outs = scratch.binding[Island, "q"](ctx)
+    var k_outs = scratch.binding[Island, "kv"](ctx)
+
+    dispatch_bq_linear[max_worker_count=max_worker_count](
+        act, attn.q_proj.bq_weight(attn_ctx), q_outs, seq_len, pools)
+    dispatch_bq_linear[max_worker_count=max_worker_count](
+        act, attn.k_proj.bq_weight(attn_ctx), k_outs, seq_len, pools)
+
+    var q_i8 = scratch.binding[Island, "q_i8"](ctx)
+    var qi_bias = scratch.binding[Island, "qi_bias"](ctx)
+    var f_q = scratch.binding[Island, "f_q"](ctx)
+
+    var kv_lb = layout.full_kv.base(ctx.arena_bases[0], layer_idx)
+    var k_cache = layout.full_kv.proto.k.binding(kv_lb, ctx.arena_bases)
+    var k_scale = layout.full_kv.proto.k_scale.binding(kv_lb, ctx.arena_bases)
+    var v_cache = layout.full_kv.proto.v.binding(kv_lb, ctx.arena_bases)
+    var v_scale = layout.full_kv.proto.v_scale.binding(kv_lb, ctx.arena_bases)
+
+    dispatch_bq_attn_prep[
+        head_dim=head_dim, num_q=num_q_heads, num_kv=num_kv_heads,
+        rope_half=rope_half, pair_stride=head_dim // 2,
+        slot_mask=-1, cache_degree=degree,
+        sqrt_n=sqrt_hd, n_eps=hd_eps, tp=degree,
+        max_worker_count=max_worker_count,
+    ](q_outs, k_outs, k_outs,
+      attn.q_norm.binding(attn_ctx), attn.k_norm.binding(attn_ctx),
+      q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
+      layout.full_rope.cos.state_binding(ctx),
+      layout.full_rope.sin.state_binding(ctx),
+      base_pos, seq_len, pools)
+
+    var q_local = scratch.binding[Island, "q_local"](ctx)
+    var partials = scratch.binding[Island, "partials"](ctx)
+
+    dispatch_bq_full_attention[
+        head_dim=head_dim, num_q=num_q_heads, num_kv=num_kv_heads,
+        local_num_q=local_num_q_heads,
+        gqa_ratio=num_q_heads // num_kv_heads, kv_stride=k_rows,
+        partial_stride=Island.PARTIAL_STRIDE, tp=degree,
+        max_worker_count=max_worker_count,
+    ](q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
+      q_local, partials, base_pos, seq_len, pools)
+
+    var o_i8 = scratch.binding[Island, "o_i8"](ctx)
+    var o_sa = scratch.binding[Island, "o_sa"](ctx)
+
+    dispatch_bq_block_quant[
+        cols=local_q_rows, block=head_dim, apply_fwht=False, tp=degree,
+        max_worker_count=max_worker_count,
+    ](q_local, o_i8, o_sa, seq_len, pools)
+
+    var o_act = ButterquantBlockActivation[degree](o_i8, o_sa)
+    var xs = layout.activations.x_residual.state_binding(ctx)
+
+    dispatch_bq_block_linear[max_worker_count=max_worker_count](
+        o_act, attn.o_proj.bq_weight(attn_ctx), xs, seq_len, pools)
+
+
+def dispatch_bq_moe[
+    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
+](
+    body: BodyRefs[degree],
+    ctx: BindContext[degree],
+    x_input: Binding[BFloat16, degree],
+    moe_out: Binding[BFloat16, degree],
+    seq_len: Int,
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
+    mut pools: List[P],
+):
+    comptime experts_per_rank = C.NUM_EXPERTS // degree
+    comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
+    comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
+    comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
+
+    var per_expert_scale_ptr = body.router_pes.at(ctx.layer_base)
+    var router_scaled = scratch.binding[Ffn, "moe_router_scaled"](ctx)
+    var cands = scratch.binding[Ffn, "moe_cands"](ctx)
+    var route_idx = scratch.binding[Ffn, "moe_route_idx"](ctx)
+    var route_w = scratch.binding[Ffn, "moe_route_w"](ctx)
+    var expert_offset = scratch.binding[Ffn, "moe_expert_offset"](ctx)
+    var routes = scratch.binding[Ffn, "moe_routes"](ctx)
+    var moe_x_i8 = scratch.binding[Ffn, "moe_x_i8"](ctx)
+    var moe_x_sa = scratch.binding[Ffn, "moe_x_sa"](ctx)
+    var bucket = scratch.binding[Ffn, "moe_hidden_bucket"](ctx)
+    var bucket_i8 = scratch.binding[Ffn, "moe_bucket_i8"](ctx)
+    var bucket_sa = scratch.binding[Ffn, "moe_bucket_sa"](ctx)
+    var moe_accum = scratch.binding[Ffn, "moe_accum"](ctx)
+
+    dispatch_router_sharded[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+        experts_per_rank=experts_per_rank, top_k=C.TOP_K, tp=degree,
+        max_worker_count=max_worker_count,
+    ](x_input, body.router_proj.bq_router(ctx).centered,
+      body.router_scale.binding(ctx), router_scaled, cands, seq_len, pools)
+
+    merge_router_candidates[degree, C.TOP_K](
+        cands, per_expert_scale_ptr, route_idx, route_w, seq_len)
+
+    dispatch_bq_norm_quant[
+        hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
+    ](x_input, body.pre_ffn_norm_2.binding(ctx),
+      moe_x_i8, moe_x_sa, seq_len, pools)
+
+    build_expert_schedules[degree, experts_per_rank, C.TOP_K](
+        route_idx, route_w, expert_offset, routes, seq_len)
+
+    var moe_act = ButterquantActivation[degree](moe_x_i8, moe_x_sa)
+    dispatch_bq_phase1_gate_up[
+        hidden=C.HIDDEN, gate_up=C.MOE_GATE_UP_FUSED,
+        inter=C.MOE_INTERMEDIATE, experts_per_rank=experts_per_rank,
+        max_worker_count=max_worker_count,
+    ](moe_act, expert_offset, routes,
+      body.experts_gate_up.bq_weight(ctx), bucket, pools)
+
+    var num_routes = seq_len * C.TOP_K
+    dispatch_bq_block_quant[
+        cols=C.MOE_INTERMEDIATE, block=C.DOWN_FWHT_BLOCK, apply_fwht=True,
+        tp=degree, max_worker_count=max_worker_count,
+    ](bucket, bucket_i8, bucket_sa, num_routes, pools)
+
+    var bucket_act = ButterquantBlockActivation[degree](bucket_i8, bucket_sa)
+    dispatch_bq_phase2_down[
+        hidden=C.HIDDEN, inter=C.MOE_INTERMEDIATE,
+        experts_per_rank=experts_per_rank,
+        max_worker_count=max_worker_count,
+    ](bucket_act, expert_offset, routes,
+      body.experts_down.bq_weight(ctx), moe_accum, moe_out, seq_len, pools)
+
+    dispatch_allreduce_inplace[
+        BF16, degree, max_worker_count=max_worker_count,
+    ](moe_out, seq_len * C.HIDDEN, pools)
+
+
+def dispatch_bq_ffn[
+    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
+](
+    body: BodyRefs[degree],
+    ctx: BindContext[degree],
+    x_main: Binding[BFloat16, degree],
+    x_residual: Binding[BFloat16, degree],
+    seq_len: Int,
+    mut scratch: Gemma4ScratchPool[degree, max_worker_count],
+    mut pools: List[P],
+):
+    comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
+    comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
+    comptime intermediate_per_rank = Gemma4Shapes[degree].GateUp.DATA_N
+    comptime Ffn = Gemma4FfnMoeScratch[degree, max_worker_count]
+
+    var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_base)
+    var dense_x_i8 = scratch.binding[Ffn, "dense_x_i8"](ctx)
+    var dense_x_sa = scratch.binding[Ffn, "dense_x_sa"](ctx)
+    var gate = scratch.binding[Ffn, "ffn_gate"](ctx)
+    var up = scratch.binding[Ffn, "ffn_up"](ctx)
+    var dense_gate_i8 = scratch.binding[Ffn, "dense_gate_i8"](ctx)
+    var dense_gate_sa = scratch.binding[Ffn, "dense_gate_sa"](ctx)
+    var dense_out = scratch.binding[Ffn, "ffn_dense_out"](ctx)
+
+    dispatch_bq_norm_quant[
+        hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
+    ](x_main, body.pre_ffn_norm.binding(ctx),
+      dense_x_i8, dense_x_sa, seq_len, pools)
+
+    var dense_act = ButterquantActivation[degree](dense_x_i8, dense_x_sa)
+    dispatch_bq_linear[max_worker_count=max_worker_count](
+        dense_act, body.gate_proj.bq_weight(ctx), gate, seq_len, pools)
+    dispatch_bq_linear[max_worker_count=max_worker_count](
+        dense_act, body.up_proj.bq_weight(ctx), up, seq_len, pools)
+
+    dispatch_gelu_gate_up[
+        intermediate=intermediate_per_rank, tp=degree,
+        max_worker_count=max_worker_count,
+    ](gate, up, gate, seq_len, pools)
+
+    dispatch_bq_block_quant[
+        cols=intermediate_per_rank, block=C.DOWN_FWHT_BLOCK, apply_fwht=True,
+        tp=degree, max_worker_count=max_worker_count,
+    ](gate, dense_gate_i8, dense_gate_sa, seq_len, pools)
+
+    dispatch_bq_moe[degree=degree, max_worker_count=max_worker_count](
+        body, ctx, x_main, x_residual, seq_len, scratch, pools)
+
+    var dense_gate_act = ButterquantBlockActivation[degree](
+        dense_gate_i8, dense_gate_sa)
+    dispatch_bq_block_linear[max_worker_count=max_worker_count](
+        dense_gate_act, body.down_proj.bq_weight(ctx), dense_out, seq_len, pools)
+
+    dispatch_allreduce_inplace[
+        BF16, degree, max_worker_count=max_worker_count,
+    ](dense_out, seq_len * C.HIDDEN, pools)
+
+    dispatch_rms_norm[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
+    ](dense_out, dense_out, body.post_ffn_norm_1.binding(ctx), seq_len, pools)
+
+    fused_norm_residual_add[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
+    ](x_residual, dense_out, dense_out,
+      body.post_ffn_norm_2.binding(ctx), seq_len, pools)
+
+    fused_norm_residual_add[
+        hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
+        max_worker_count=max_worker_count,
+    ](dense_out, x_main, x_main,
+      body.post_ffn_norm.binding(ctx), seq_len, pools)
+
+    var ls_value = layer_scalar_ptr[0].cast[DType.float32]()
+    dispatch_scalar_mul[
+        hidden=C.HIDDEN, tp=degree, max_worker_count=max_worker_count,
+    ](x_main, x_main, ls_value, seq_len, pools)
+
+
 struct Gemma4[
     degree: Int, max_seq_len: Int = 8192,
     max_worker_count: Int = 128,
     Pool: BurstThreadPool = BurstPool[],
 ](Movable):
-    """BQ variant of the Gemma 4 model. The runtime forward path lives
-    in `gemma_4_moe.mojo`; this file only exists to drive the quantizer
-    (recipes on every weight slot) and to load and inspect the resulting
-    int8 checkpoint until ButterQuant kernels arrive."""
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
     var layout: Gemma4Layout[Self.degree, Self.max_seq_len]
     var scratch: Gemma4ScratchPool[Self.degree, Self.max_worker_count]
     var arena_bases: ArenaBases[Self.degree]
-    var descs: List[WeightDesc]
 
     def __init__(out self,
         var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
         var pools: List[Self.Pool],
         layout: Gemma4Layout[Self.degree, Self.max_seq_len],
-        var descs: List[WeightDesc],
     ):
         self.arena_bases = ArenaBases[Self.degree].uninitialized()
         for r in range(Self.degree):
@@ -571,107 +981,209 @@ struct Gemma4[
         self.layout = layout.bind(self.arena_bases[0])
         self.arenas = arenas^
         self.pools = pools^
-        self.descs = descs^
         self.scratch = Gemma4ScratchPool[
             Self.degree, Self.max_worker_count,
-        ](
+    ](
             self.layout.arena.scratch_base())
 
-    def dump_tensors(self):
-        """One line per loaded tensor: full name, dtype, global/data shape,
-        per-rank arena offset, plus the first four values from rank 0. The
-        line count is high (one per WeightDesc, including every sidecar)
-        but is the cheapest way to verify the int8 / scale / colsum /
-        gauge layout end-to-end without a runtime kernel."""
-        var n = len(self.descs)
-        print(t"--- {n} loaded tensors ---")
-        for i in range(n):
-            ref d = self.descs[i]
-            var addr = self.arena_bases[0] + d.arena_offset
-            var name = d.name
-            var dt = d.dtype
-            var gr = d.global_rows
-            var gc = d.global_cols
-            var dr = d.data_rows
-            var dc = d.data_cols
-            var off = d.arena_offset
-            var tr = d.target_rank
-            print(
-                t"{name} :: {dt} global=[{gr},{gc}] data=[{dr},{dc}] "
-                t"target={tr} arena_off={off}"
-            )
-            var count = dr * dc
-            if count > 4: count = 4
-            if dt == DType.int8:
-                var p = UnsafePointer[Int8, MutAnyOrigin](
-                    unsafe_from_address=addr)
-                for k in range(count):
-                    var v = Int(p[k])
-                    print(t"    [{k}] = {v}")
-            elif dt == DType.float32:
-                var p = UnsafePointer[Float32, MutAnyOrigin](
-                    unsafe_from_address=addr)
-                for k in range(count):
-                    var v = p[k]
-                    print(t"    [{k}] = {v}")
-            elif dt == DType.bfloat16:
-                var p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                    unsafe_from_address=addr)
-                for k in range(count):
-                    var v = p[k].cast[DType.float32]()
-                    print(t"    [{k}] = {v}")
+    def init_state(mut self):
+        var tasks = List[PackColsumTask]()
+        for i in range(C.NUM_LAYERS):
+            var entry = LAYER_SCHEDULE[i]
+            if entry.kind == LayerKind.FULL:
+                _ = emit_pack_tasks[FullLayerRefs[Self.degree]](
+                    self.layout.full.off
+                    + entry.local_idx * self.layout.full.stride,
+                    tasks)
+            else:
+                _ = emit_pack_tasks[SlidingLayerRefs[Self.degree]](
+                    self.layout.sliding.off
+                    + entry.local_idx * self.layout.sliding.stride,
+                    tasks)
+        _ = emit_pack_tasks[TailRefs[Self.degree]](self.layout.tail.off, tasks)
+        var nodes = InlineArray[Int, Self.degree](uninitialized=True)
+        for r in range(Self.degree):
+            nodes[r] = self.arenas[r].node
+        dispatch_pack_colsum[
+            Self.degree, max_worker_count=Self.max_worker_count,
+        ](self.pools, self.arena_bases, nodes, tasks)
+
+    def model_init(mut self):
+        ref layout = self.layout
+        comptime width = simd_width_of[DType.float32]()
+        comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
+
+        @parameter
+        def bake_router_scale(p: UnsafePointer[BFloat16, MutAnyOrigin]):
+            for j in range(0, C.HIDDEN, width):
+                var lane = p + j
+                var v = lane.load[width=width]().cast[DType.float32]()
+                lane.store((v * inv_sqrt_hidden).cast[DType.bfloat16]())
+
+        for rank in range(Self.degree):
+            var base = self.arena_bases[rank]
+            for i in range(C.NUM_LAYERS):
+                var entry = LAYER_SCHEDULE[i]
+                if entry.kind == LayerKind.FULL:
+                    var lb = layout.full.base(base, entry.local_idx)
+                    ref fbody = layout.full.proto.body
+                    bake_split_gain_in_place(fbody.input_norm.at(lb), C.HIDDEN)
+                    bake_split_gain_in_place(fbody.pre_ffn_norm.at(lb), C.HIDDEN)
+                    bake_split_gain_in_place(fbody.pre_ffn_norm_2.at(lb), C.HIDDEN)
+                    bake_router_scale(fbody.router_scale.at(lb))
+                else:
+                    var lb = layout.sliding.base(base, entry.local_idx)
+                    ref sbody = layout.sliding.proto.body
+                    bake_split_gain_in_place(sbody.input_norm.at(lb), C.HIDDEN)
+                    bake_split_gain_in_place(sbody.pre_ffn_norm.at(lb), C.HIDDEN)
+                    bake_split_gain_in_place(sbody.pre_ffn_norm_2.at(lb), C.HIDDEN)
+                    bake_router_scale(sbody.router_scale.at(lb))
+
+        from kernels.rope import (
+            init_rope_table, init_rope_table_partial_strided,
+        )
+        for rank in range(Self.degree):
+            var base = self.arena_bases[rank]
+            var sl_cos = layout.sliding_rope.cos.at(base)
+            var sl_sin = layout.sliding_rope.sin.at(base)
+            init_rope_table[C.ROPE_HALF_SLIDING, Self.max_seq_len](
+                sl_cos, sl_sin, 10000.0)
+            var fl_cos = layout.full_rope.cos.at(base)
+            var fl_sin = layout.full_rope.sin.at(base)
+            init_rope_table_partial_strided[
+                C.ROPE_HALF_FULL, Self.max_seq_len,
+            ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, 0, 1)
 
     def forward[
         tok_origin: ImmutOrigin, //,
     ](
         mut self,
         token_ids: Span[Int32, tok_origin],
-        base_pos: Int,
-    ):
-        """Runs the bq model up to and including token embedding: resolves the
-        int8 embedding through the bq_weight bridge, dispatches the butterquant
-        embed-lookup into the per-token activation state, replicates across
-        ranks, and logs the embedded hidden values. The remaining layers are
-        not yet implemented."""
+        base_pos: Int = 0,
+    ) -> TemporalLogitsView[C.VOCAB_SIZE, Self.degree]:
         ref layout = self.layout
         comptime shard_rows = Gemma4TailShapes[Self.degree].Embed.DATA_N
         comptime embed_scale = Float64(sqrt[DType.float32, 1](C.HIDDEN)
             .cast[DType.bfloat16]().cast[DType.float32]())
+        comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
+        comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
+        comptime SS = Gemma4SlidingScratch[Self.degree, Self.max_worker_count]
+        comptime FS = Gemma4FullScratch[Self.degree, Self.max_worker_count]
+        comptime HS = Gemma4HeadScratch[Self.degree]
 
         var total_len = len(token_ids)
         debug_assert(total_len > 0, "forward called with empty token_ids")
-        var chunk_len = total_len if total_len < C.SLIDING_WINDOW else C.SLIDING_WINDOW
+        debug_assert(
+            base_pos + total_len <= Self.max_seq_len,
+            "forward exceeds max_seq_len")
 
         var ctx = BindContext[Self.degree](
             arena_bases=self.arena_bases, layer_base=0)
-        var tail_ctx = ctx.with_layer(
-            layout.tail.base(self.arena_bases[0], 0))
+        var tail_ctx = ctx.with_layer(layout.tail.base(self.arena_bases[0], 0))
 
         var x_main_ranks = layout.activations.x_main.state_binding(ctx)
+        var xs = layout.activations.x_residual.state_binding(ctx)
+        var logits = self.scratch.binding[HS, "logits"](ctx)
 
-        var chunk = Span[Int32, tok_origin](
-            ptr=token_ids.unsafe_ptr(), length=chunk_len)
+        var consumed = 0
+        var pos = base_pos
+        while consumed < total_len:
+            var remaining = total_len - consumed
+            var chunk_len = remaining if remaining < C.SLIDING_WINDOW else C.SLIDING_WINDOW
+            var is_last = (consumed + chunk_len == total_len)
 
-        dispatch_bq_embed_lookup[
-            scale=embed_scale, shard_rows=shard_rows,
-            max_worker_count=Self.max_worker_count,
-        ](chunk,
-          layout.tail.proto.embed.bq_weight(tail_ctx),
-          x_main_ranks, chunk_len, self.pools)
-        dispatch_allreduce_inplace[
-            BF16, Self.degree, max_worker_count=Self.max_worker_count,
-        ](x_main_ranks, chunk_len * C.HIDDEN, self.pools)
+            var chunk = Span[Int32, tok_origin](
+                ptr=token_ids.unsafe_ptr() + consumed, length=chunk_len)
 
-        var x0 = x_main_ranks[0]
-        var h0 = x0[0].cast[DType.float32]()
-        var h1 = x0[1].cast[DType.float32]()
-        var h2 = x0[2].cast[DType.float32]()
-        var h3 = x0[3].cast[DType.float32]()
-        var tid0 = Int(token_ids[0])
-        print(
-            t"bq forward: embedded {chunk_len} tokens; "
-            t"token0(id={tid0}) hidden[0..3] = {h0}, {h1}, {h2}, {h3}"
-        )
+            dispatch_bq_embed_lookup[
+                scale=embed_scale, shard_rows=shard_rows,
+                max_worker_count=Self.max_worker_count,
+            ](chunk, layout.tail.proto.embed.bq_weight(tail_ctx),
+              x_main_ranks, chunk_len, self.pools)
+            dispatch_allreduce_inplace[
+                BF16, Self.degree, max_worker_count=Self.max_worker_count,
+            ](x_main_ranks, chunk_len * C.HIDDEN, self.pools)
+
+            for i in range(C.NUM_LAYERS):
+                var entry = LAYER_SCHEDULE[i]
+                var body: BodyRefs[Self.degree]
+                var layer_ctx: BindContext[Self.degree]
+                if entry.kind == LayerKind.FULL:
+                    layer_ctx = ctx.with_layer(
+                        layout.full.base(self.arena_bases[0], entry.local_idx))
+                    body = layout.full.proto.body
+                    var fx_i8 = self.scratch.binding[FS, "x_i8"](ctx)
+                    var fx_sa = self.scratch.binding[FS, "x_sa"](ctx)
+                    dispatch_bq_norm_quant[
+                        hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps,
+                        tp=Self.degree, max_worker_count=Self.max_worker_count,
+                    ](x_main_ranks, body.input_norm.binding(layer_ctx),
+                      fx_i8, fx_sa, chunk_len, self.pools)
+                    var full_act = ButterquantActivation[Self.degree](
+                        fx_i8, fx_sa)
+                    dispatch_bq_full_attention_qkv[
+                        degree=Self.degree, max_seq_len=Self.max_seq_len,
+                        max_worker_count=Self.max_worker_count,
+                    ](layout, ctx, full_act, pos, chunk_len, entry.local_idx,
+                      self.scratch, self.pools)
+                else:
+                    layer_ctx = ctx.with_layer(
+                        layout.sliding.base(
+                            self.arena_bases[0], entry.local_idx))
+                    body = layout.sliding.proto.body
+                    var sx_i8 = self.scratch.binding[SS, "x_i8"](ctx)
+                    var sx_sa = self.scratch.binding[SS, "x_sa"](ctx)
+                    dispatch_bq_norm_quant[
+                        hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps,
+                        tp=Self.degree, max_worker_count=Self.max_worker_count,
+                    ](x_main_ranks, body.input_norm.binding(layer_ctx),
+                      sx_i8, sx_sa, chunk_len, self.pools)
+                    var sl_act = ButterquantActivation[Self.degree](
+                        sx_i8, sx_sa)
+                    dispatch_bq_sliding_attention_qkv[
+                        degree=Self.degree, max_seq_len=Self.max_seq_len,
+                        max_worker_count=Self.max_worker_count,
+                    ](layout, ctx, sl_act, pos, chunk_len, entry.local_idx,
+                      self.scratch, self.pools)
+
+                dispatch_allreduce_inplace[
+                    BF16, Self.degree, max_worker_count=Self.max_worker_count,
+                ](xs, chunk_len * C.HIDDEN, self.pools)
+
+                fused_norm_residual_add[
+                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
+                    max_worker_count=Self.max_worker_count,
+                ](xs, x_main_ranks, x_main_ranks,
+                  body.post_attn_norm.binding(layer_ctx), chunk_len, self.pools)
+
+                dispatch_bq_ffn[
+                    degree=Self.degree, max_worker_count=Self.max_worker_count,
+                ](body, layer_ctx, x_main_ranks, xs, chunk_len,
+                  self.scratch, self.pools)
+
+            if is_last:
+                var x_last = x_main_ranks.shifted((chunk_len - 1) * C.HIDDEN)
+                var head_x_i8 = self.scratch.binding[HS, "head_x_i8"](ctx)
+                var head_x_sa = self.scratch.binding[HS, "head_x_sa"](ctx)
+                var head_act = ButterquantActivation[Self.degree](
+                    head_x_i8, head_x_sa)
+
+                dispatch_bq_head_prep[
+                    hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps,
+                ](x_last, layout.tail.proto.final_norm.binding(tail_ctx),
+                  head_act)
+
+                dispatch_bq_head_gemv[
+                    cap=C.LOGIT_SOFTCAP,
+                    max_worker_count=Self.max_worker_count,
+                ](head_act, layout.tail.proto.embed.bq_weight(tail_ctx),
+                  logits, self.pools)
+
+            consumed += chunk_len
+            pos += chunk_len
+
+        return TemporalLogitsView[C.VOCAB_SIZE, Self.degree](
+            logits.ptr, self.arena_bases)
 
     @staticmethod
     def load(
@@ -721,7 +1233,9 @@ struct Gemma4[
         for rank in range(Self.degree):
             _ = arenas[rank].prefault(layout.arena.distributed_bytes, layout.arena.state_bytes)
 
-        var model = Self(arenas^, pools^, layout, descs^)
+        var model = Self(arenas^, pools^, layout)
+        model.init_state()
+        model.model_init()
         return model^
 
     @staticmethod
@@ -729,10 +1243,6 @@ struct Gemma4[
         source_dir: Path, output_path: Path,
         topo: NumaTopology, var pools: List[Self.Pool],
     ) -> Bool:
-        """Quantize the source checkpoint to `output_path`. Slots are
-        dispatched as one job per pool, so caller-controlled topology
-        (typically via `with_topological_rank_dispatch`) determines how
-        much parallelism is applied."""
         var q = Quantizer(source_dir, output_path)
         if not q:
             return False

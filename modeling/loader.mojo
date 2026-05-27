@@ -116,27 +116,35 @@ def emit_reads(
         ))
     elif desc.data_rows != desc.global_rows:
         var row_start = rank * desc.data_rows
-        var data_bytes = desc.data_rows * desc.global_cols * desc.element_bytes
-        var file_off = file_data_start + row_start * desc.global_cols * desc.element_bytes
-        ops.append(ReadOp(
-            file_idx=file_idx, offset=file_off, length=data_bytes,
-            dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=dest),
-            id=len(ops),
-        ))
+        var real_rows = desc.global_rows - row_start
+        if real_rows > desc.data_rows:
+            real_rows = desc.data_rows
+        if real_rows > 0:
+            var data_bytes = real_rows * desc.global_cols * desc.element_bytes
+            var file_off = file_data_start + row_start * desc.global_cols * desc.element_bytes
+            ops.append(ReadOp(
+                file_idx=file_idx, offset=file_off, length=data_bytes,
+                dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=dest),
+                id=len(ops),
+            ))
     else:
         var file_cols = desc.data_cols
         var stride_cols = desc.local_cols
         var col_start = rank * file_cols
-        var file_row_bytes = file_cols * desc.element_bytes
-        var stride_bytes = stride_cols * desc.element_bytes
-        for r in range(desc.data_rows):
-            var src = file_data_start + (r * desc.global_cols + col_start) * desc.element_bytes
-            var dst = dest + r * stride_bytes
-            ops.append(ReadOp(
-                file_idx=file_idx, offset=src, length=file_row_bytes,
-                dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=dst),
-                id=len(ops),
-            ))
+        var real_cols = desc.global_cols - col_start
+        if real_cols > file_cols:
+            real_cols = file_cols
+        if real_cols > 0:
+            var real_row_bytes = real_cols * desc.element_bytes
+            var stride_bytes = stride_cols * desc.element_bytes
+            for r in range(desc.data_rows):
+                var src = file_data_start + (r * desc.global_cols + col_start) * desc.element_bytes
+                var dst = dest + r * stride_bytes
+                ops.append(ReadOp(
+                    file_idx=file_idx, offset=src, length=real_row_bytes,
+                    dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=dst),
+                    id=len(ops),
+                ))
 
 
 @fieldwise_init

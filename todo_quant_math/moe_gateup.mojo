@@ -7,7 +7,7 @@ from simd_math.matrixops import pick_port_unroll
 from .fwht import fwht_block
 from .i8_quantize import absmax_quantize_i8
 from .types import F32Ptr, I8Ptr
-from .vnni_dot import act_broadcast_vnni, dot_vnni_broadcasted
+from .vnni_dot import act_broadcast_vnni, dot_broadcasted
 from .vnni_layout import (
     VNNI_BLK, VNNI_K_STEP, VNNI_N_STEP, VNNI_TILE_N, compute_n_block,
 )
@@ -60,16 +60,16 @@ def fused_w1w3_gemv_row[N: Int, K: Int](
 
                     comptime for p in range(passes):
                         var off = t0 + p * bytes_per_pass
-                        w1_acc[p] = dot_vnni_broadcasted[width](
+                        w1_acc[p] = dot_broadcasted[width](
                             w1_acc[p], act_bytes, w1_packed + off)
-                        w3_acc[p] = dot_vnni_broadcasted[width](
+                        w3_acc[p] = dot_broadcasted[width](
                             w3_acc[p], act_bytes, w3_packed + off)
 
                     comptime for p in range(passes):
                         var off = t1 + p * bytes_per_pass
-                        w1_acc[passes + p] = dot_vnni_broadcasted[width](
+                        w1_acc[passes + p] = dot_broadcasted[width](
                             w1_acc[passes + p], act_bytes, w1_packed + off)
-                        w3_acc[passes + p] = dot_vnni_broadcasted[width](
+                        w3_acc[passes + p] = dot_broadcasted[width](
                             w3_acc[passes + p], act_bytes, w3_packed + off)
 
                 packed_off += 2 * tile_ks_bytes
@@ -110,22 +110,22 @@ def fused_gateup_quant_row[
     n_count: Int,
 ):
     """SwiGLU-style gate/up chunk: GEMV, act_fn(gate)*up, optional FWHT, i8."""
+    comptime assert fwht_blk >= VNNI_N_STEP,
+        "fused_gateup_quant_row: fwht_blk must cover at least one VNNI N-step"
     comptime width = simd_width_of[DType.float32]()
-    comptime chunk_size = fwht_blk if fwht_blk >= VNNI_N_STEP else VNNI_N_STEP
-    comptime sub_blocks = chunk_size // fwht_blk
-    comptime PU = pick_port_unroll[width, chunk_size]()
+    comptime PU = pick_port_unroll[width, fwht_blk]()
     comptime STRIDE = PU * width
 
     var local_n = 0
     while local_n < n_count:
         var n_pos = n_off + local_n
 
-        var gate_buf = InlineArray[Float32, chunk_size](fill=Float32(0))
+        var gate_buf = InlineArray[Float32, fwht_blk](fill=Float32(0))
         var gate = UnsafePointer(to=gate_buf).bitcast[Float32]()
-        var up_buf = InlineArray[Float32, chunk_size](fill=Float32(0))
+        var up_buf = InlineArray[Float32, fwht_blk](fill=Float32(0))
         var up = UnsafePointer(to=up_buf).bitcast[Float32]()
 
-        fused_w1w3_gemv_row[chunk_size, K](
+        fused_w1w3_gemv_row[fwht_blk, K](
             act_i8,
             gate_packed + n_pos * K,
             up_packed + n_pos * K,
@@ -138,7 +138,7 @@ def fused_gateup_quant_row[
             up,
         )
 
-        for i in range(chunk_size // STRIDE):
+        for i in range(fwht_blk // STRIDE):
             comptime for p in range(PU):
                 comptime off = p * width
                 var idx = i * STRIDE + off
@@ -146,13 +146,9 @@ def fused_gateup_quant_row[
                 var u = (up + idx).load[width=width]()
                 (gate + idx).store(act_fn[width](g) * u)
 
-        comptime for sb in range(sub_blocks):
-            comptime sb_off = sb * fwht_blk
-            comptime if fwht:
-                fwht_block[fwht_blk](gate + sb_off)
-            blk_row[(local_n + sb_off) // fwht_blk] = (
-                absmax_quantize_i8[fwht_blk](
-                    gate + sb_off, qi_row + local_n + sb_off)
-            )
+        comptime if fwht:
+            fwht_block[fwht_blk](gate)
+        blk_row[local_n // fwht_blk] = absmax_quantize_i8[fwht_blk](
+            gate, qi_row + local_n)
 
-        local_n += chunk_size
+        local_n += fwht_blk

@@ -7,11 +7,15 @@ from modeling.model_spec import (
     DISTRIBUTED, align_up,
 )
 from modeling.utilities import FieldwiseDefault
-from quant.recipe import QuantRecipe, Passthrough
+from quant.recipe import QuantRecipe, Passthrough, RouterCenter, SoftmaxRouterCenter
 from quant.manifest import (
     quant_manifest, manifest_arena_bytes, member_rel_off, has_role, QuantRole,
 )
-from butterquant.weight import ButterquantWeight, ButterquantRouter
+from butterquant.weight import (
+    ButterquantWeight, ButterquantRouter,
+    quant_vnni_packed, quant_colsum_per_block, quant_k_block,
+)
+from butterquant.pack import PackColsumTask
 
 
 trait SlotLike:
@@ -137,26 +141,36 @@ struct Slot[
     ) -> ButterquantRouter[
         Self.QUANT, Self.SHAPE.DATA_N, Self.SHAPE.DATA_M, degree,
     ]:
-        """Bind the centered bf16 weight + gauge + optional bias of a
-        RouterCenter slot. The bias binding points at the weight base when the
-        recipe declares none; `bias_checked` gates access at comptime."""
-        comptime assert has_role[
-            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.GAUGE,
-        ](), "Slot.bq_router requires a router-centered slot with a gauge sidecar."
-        comptime GAUGE_OFF = member_rel_off[
-            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.GAUGE]()
-        comptime BIAS_OFF = member_rel_off[
-            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.BIAS]()
+        """Bind a router-centered slot. The centered bf16 weight is always
+        present; the gauge (§13.2 pivot) and bias are bound only when the recipe
+        stores them, so a §13.5 SoftmaxRouterCenter slot binds neither."""
+        comptime assert (
+            Self.QUANT.isa[RouterCenter]() or Self.QUANT.isa[SoftmaxRouterCenter]()
+        ), "Slot.bq_router requires a router-centered slot."
         var base = ctx.layer_base + self.offset
-        var centered = UnsafePointer[BFloat16, MutAnyOrigin](
-            unsafe_from_address=base)
-        var gauge = UnsafePointer[BFloat16, MutAnyOrigin](
-            unsafe_from_address=base + GAUGE_OFF)
-        var bias = UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=base + BIAS_OFF)
+        var centered = ctx.bind(UnsafePointer[BFloat16, MutAnyOrigin](
+            unsafe_from_address=base))
+        var gauge = Optional[Binding[BFloat16, degree]](None)
+        var bias = Optional[Binding[Float32, degree]](None)
+        comptime if has_role[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.GAUGE,
+        ]():
+            comptime GAUGE_OFF = member_rel_off[
+                Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.GAUGE]()
+            gauge = Optional[Binding[BFloat16, degree]](
+                ctx.bind(UnsafePointer[BFloat16, MutAnyOrigin](
+                    unsafe_from_address=base + GAUGE_OFF)))
+        comptime if has_role[
+            Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.BIAS,
+        ]():
+            comptime BIAS_OFF = member_rel_off[
+                Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.BIAS]()
+            bias = Optional[Binding[Float32, degree]](
+                ctx.bind(UnsafePointer[Float32, MutAnyOrigin](
+                    unsafe_from_address=base + BIAS_OFF)))
         return ButterquantRouter[
             Self.QUANT, Self.SHAPE.DATA_N, Self.SHAPE.DATA_M, degree,
-        ](ctx.bind(centered), ctx.bind(gauge), ctx.bind(bias))
+        ](centered, gauge, bias)
 
 
 @always_inline
@@ -178,20 +192,23 @@ def emit_quant_descs[
     """Emit one WeightDesc per physical tensor in this slot's encoding, driven
     by the shared manifest: the weight at slot_arena_off, then sidecars packed
     tightly after at their manifest rel_offs. Member shapes carry the loader's
-    row-shard / col-shard / replicated parameters directly."""
+    row-shard / col-shard / replicated parameters directly. The colsum member is
+    reserved in the arena but computed at model init during the VNNI pack, so it
+    is never read from the checkpoint and emits no loader desc."""
     var full = prefix + String(name)
     comptime MANIFEST = quant_manifest[encoding, shape, quant]()
     comptime for i in range(MANIFEST.count):
         comptime MEMBER = MANIFEST.members[i]
-        ops.append(WeightDesc(
-            name=full + String(MEMBER.suffix),
-            arena_offset=slot_arena_off + MEMBER.rel_off,
-            dtype=MEMBER.dtype, element_bytes=MEMBER.element_bytes,
-            global_rows=MEMBER.global_rows, global_cols=MEMBER.global_cols,
-            local_cols=MEMBER.local_cols,
-            data_rows=MEMBER.data_rows, data_cols=MEMBER.data_cols,
-            target_rank=target_rank,
-        ))
+        comptime if MEMBER.role != QuantRole.COLSUM:
+            ops.append(WeightDesc(
+                name=full + String(MEMBER.suffix),
+                arena_offset=slot_arena_off + MEMBER.rel_off,
+                dtype=MEMBER.dtype, element_bytes=MEMBER.element_bytes,
+                global_rows=MEMBER.global_rows, global_cols=MEMBER.global_cols,
+                local_cols=MEMBER.local_cols,
+                data_rows=MEMBER.data_rows, data_cols=MEMBER.data_cols,
+                target_rank=target_rank,
+            ))
 
 
 def stamp_offsets[T: AnyType](mut t: T, off_in: Int = 0) -> Int:
@@ -239,4 +256,40 @@ def emit_descs[T: AnyType](
             ]())
         comptime if conforms_to(FT, SlotGroup):
             off = emit_descs[FT](prefix, region_base, ops, off)
+    return off
+
+
+def emit_pack_tasks[T: AnyType](
+    region_base: Int,
+    mut tasks: List[PackColsumTask],
+    off_in: Int = 0,
+) -> Int:
+    """Walk T comptime, emitting one VNNI pack task per VnniPacked weight slot
+    (row-major / passthrough / router slots declare no pack and are skipped) at
+    region_base + within-region offset. Offset accumulation matches emit_descs so
+    weight/colsum offsets land on the same arena bytes the loader wrote. Returns
+    total bytes consumed."""
+    var off = off_in
+    comptime for i in range(reflect[T].field_count()):
+        comptime FT = reflect[T].field_types()[i]
+        comptime if conforms_to(FT, SlotLike):
+            comptime if quant_vnni_packed[FT.QUANT]():
+                comptime per_block = quant_colsum_per_block[FT.QUANT]()
+                comptime block_cols = (
+                    quant_k_block[FT.QUANT]() if per_block else FT.SHAPE.DATA_M)
+                comptime cs_off = member_rel_off[
+                    FT.ENCODING, FT.SHAPE, FT.QUANT, QuantRole.COLSUM]()
+                tasks.append(PackColsumTask(
+                    weight_off=region_base + off,
+                    colsum_off=region_base + off + cs_off,
+                    rows=FT.SHAPE.DATA_N,
+                    cols=FT.SHAPE.DATA_M,
+                    block_cols=block_cols,
+                    colsum_row_major=not per_block,
+                ))
+            off = align_up(off + slot_arena_bytes[
+                FT.ENCODING, FT.SHAPE, FT.QUANT,
+            ]())
+        comptime if conforms_to(FT, SlotGroup):
+            off = emit_pack_tasks[FT](region_base, tasks, off)
     return off
