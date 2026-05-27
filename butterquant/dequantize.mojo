@@ -1,3 +1,4 @@
+from butterquant.convert import store_bf16
 from butterquant.types import BF16Ptr, F32Ptr, I8Ptr, WF
 
 
@@ -27,7 +28,7 @@ def scale_cast_row[hidden: Int, scale: Float64](work: F32Ptr, dst: BF16Ptr):
     var f = SIMD[DType.float32, WF](Float32(scale))
     var k = 0
     while k + WF <= hidden:
-        (dst + k).store(((work + k).load[width=WF]() * f).cast[DType.bfloat16]())
+        store_bf16[WF]((work + k).load[width=WF]() * f, dst + k)
         k += WF
 
 

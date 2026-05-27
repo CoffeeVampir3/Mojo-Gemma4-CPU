@@ -2,9 +2,33 @@ from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
+from butterquant.convert import store_out
 from butterquant.dot_products import act_broadcast_vnni, dot_loaded
 from butterquant.types import F32Ptr, I8Ptr
 from butterquant.vnni import VNNI_BLK, VNNI_K_STEP, VNNI_N_STEP, VNNI_TILE_N
+
+
+# Largest M-panel PR (<= MR) whose live vector footprint stays in registers.
+# Steady-state liveness, with acc_count = VNNI_N_STEP // width accumulators/row:
+#   per-row:   PR*acc_count accumulators + PR broadcasts            = PR*(acc_count + 1)
+#   per-block: + PR*acc_count f32 facc held across the block loop   = PR*(2*acc_count + 1)
+# plus ~passes transient weight regs (w0/w1 double-buffer) and a scratch.
+# The x86 register file is pinned to the width on both targets: width=8 -> 16 ymm,
+# width=16 -> 32 zmm. Solve PR*per_pr + reserve <= regs for the largest PR.
+@always_inline
+def reg_capped_panel[MR: Int, per_block: Bool]() -> Int:
+    comptime width = simd_width_of[DType.int32]()
+    comptime acc_count = VNNI_N_STEP // width
+    comptime regs = 2 * width
+    comptime per_pr = (2 * acc_count if per_block else acc_count) + 1
+    comptime reserve = VNNI_TILE_N // width + 1
+    comptime fits = (regs - reserve) // per_pr
+    comptime if fits < 1:
+        return 1
+    elif fits < MR:
+        return fits
+    else:
+        return MR
 
 
 @always_inline
@@ -112,7 +136,7 @@ def gemm_i8_per_row_panel[N: Int, K: Int, PR: Int, Out: DType](
                 iacc[r * acc_count + a].cast[DType.float32]()
                 - Float32(128) * cs)
             var res = corrected * ad * (wsc + n_base).load[width=width]()
-            (dst + (m_panel + r) * N + n_base).store(res.cast[Out]())
+            store_out[Out, width](res, dst + (m_panel + r) * N + n_base)
 
 
 def gemm_i8_per_row[N: Int, K: Int, MR: Int, Out: DType](
@@ -126,13 +150,14 @@ def gemm_i8_per_row[N: Int, K: Int, MR: Int, Out: DType](
     start_tile: Int,
     end_tile: Int,
 ):
+    comptime PR = reg_capped_panel[MR, False]()
     var m_panel = 0
-    while m_panel + MR <= m:
+    while m_panel + PR <= m:
         for t in range(start_tile, end_tile):
-            gemm_i8_per_row_panel[N, K, MR, Out](
+            gemm_i8_per_row_panel[N, K, PR, Out](
                 act, m_panel, act_scale, wpacked, wsc, colsum, dst,
                 t * VNNI_N_STEP)
-        m_panel += MR
+        m_panel += PR
     while m_panel < m:
         for t in range(start_tile, end_tile):
             gemm_i8_per_row_panel[N, K, 1, Out](
@@ -183,7 +208,7 @@ def gemm_i8_per_block_panel[N: Int, K: Int, block: Int, PR: Int, Out: DType](
         comptime for a in range(acc_count):
             var n_base = ns + a * width
             var res = facc[r * acc_count + a] * (wsc + n_base).load[width=width]()
-            (dst + (m_panel + r) * N + n_base).store(res.cast[Out]())
+            store_out[Out, width](res, dst + (m_panel + r) * N + n_base)
 
 
 def gemm_i8_per_block[N: Int, K: Int, block: Int, MR: Int, Out: DType](
@@ -197,13 +222,14 @@ def gemm_i8_per_block[N: Int, K: Int, block: Int, MR: Int, Out: DType](
     start_tile: Int,
     end_tile: Int,
 ):
+    comptime PR = reg_capped_panel[MR, True]()
     var m_panel = 0
-    while m_panel + MR <= m:
+    while m_panel + PR <= m:
         for t in range(start_tile, end_tile):
-            gemm_i8_per_block_panel[N, K, block, MR, Out](
+            gemm_i8_per_block_panel[N, K, block, PR, Out](
                 act, m_panel, act_scale, wpacked, wsc, colsum, dst,
                 t * VNNI_N_STEP)
-        m_panel += MR
+        m_panel += PR
     while m_panel < m:
         for t in range(start_tile, end_tile):
             gemm_i8_per_block_panel[N, K, block, 1, Out](

@@ -5,6 +5,7 @@ from kernels.helpers import (
 from kernels.dispatch_heuristics import GEMV_INLINE_ROWS
 from kernels.gemv import softcap_value
 
+from butterquant.convert import store_bf16
 from butterquant.dot_products import head_logit_row
 from butterquant.runtime import prepare_head_activation
 from butterquant.types import F32Ptr, I8Ptr
@@ -48,7 +49,7 @@ struct BqHeadGemvKernel[
                 self.scales + row * nb,
                 Self.cols)
             var capped = softcap_value[Self.cap](SIMD[DType.float32, 1](raw))
-            (self.output + row)[] = capped.cast[DType.bfloat16]()
+            store_bf16[1](capped, self.output + row)
 
     @always_inline
     def install_range(mut self, start: Int, end: Int):

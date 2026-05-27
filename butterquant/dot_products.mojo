@@ -47,14 +47,16 @@ def vnni_shifted_dot[block: Int, emit_rhs_sum: Bool](
     comptime assert block % bytes == 0, (
         "VNNI dot block must be a multiple of four i32 SIMD vectors")
     var acc = SIMD[DType.int32, WI](0)
-    var rhs_sum = Int32(0)
+    var sum_acc = SIMD[DType.int32, WI](0)
+    var ones = SIMD[DType.uint8, bytes](1)
     for k in range(0, block, bytes):
         var av = (a + k).bitcast[UInt8]().load[width=bytes]() ^ SIMD[
             DType.uint8, bytes](0x80)
         var bv = (b + k).load[width=bytes]()
         acc = vpdpbusd[WI](acc, av, bv)
         comptime if emit_rhs_sum:
-            rhs_sum += bv.cast[DType.int32]().reduce_add()
+            sum_acc = vpdpbusd[WI](sum_acc, ones, bv)
+    var rhs_sum = sum_acc.reduce_add() if emit_rhs_sum else Int32(0)
     return (acc, rhs_sum)
 
 

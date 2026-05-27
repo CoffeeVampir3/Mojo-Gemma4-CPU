@@ -3,6 +3,7 @@ from std.math import max
 from std.os import abort
 
 from simd_math.ops import quantize_i8, sqrt
+from butterquant.convert import store_bf16
 from butterquant.fwht import fwht_block, fwht_row
 from butterquant.types import WF
 
@@ -40,7 +41,7 @@ def bake_split_gain_in_place(gamma: PtrBF16, cols: Int, eps: Float32 = 1e-12):
     while k + WIDTH <= cols:
         var g = (gamma + k).load[width=WIDTH]().cast[DType.float32]()
         var s = sqrt[DType.float32, WIDTH](max(abs(g), floor))
-        (gamma + k).store(g.lt(zero).select(-s, s).cast[DType.bfloat16]())
+        store_bf16[WIDTH](g.lt(zero).select(-s, s), gamma + k)
         k += WIDTH
 
 
@@ -191,7 +192,7 @@ def router_center_impl[src_dtype: DType, emit_gauge: Bool](
         var g = (gauge + k).load[width=WIDTH]() * inv_rows
         (gauge + k).store(g)
         comptime if emit_gauge:
-            (gauge_bf16 + k).store(g.cast[DType.bfloat16]())
+            store_bf16[WIDTH](g, gauge_bf16 + k)
         k += WIDTH
 
     for r in range(rows):
@@ -201,7 +202,7 @@ def router_center_impl[src_dtype: DType, emit_gauge: Bool](
         while k + WIDTH <= cols:
             var v = (row + k).load[width=WIDTH]().cast[DType.float32]()
             var c = v - (gauge + k).load[width=WIDTH]()
-            (out + k).store(c.cast[DType.bfloat16]())
+            store_bf16[WIDTH](c, out + k)
             k += WIDTH
 
 

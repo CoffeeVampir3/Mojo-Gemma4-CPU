@@ -9,6 +9,7 @@ from kernels.helpers import (
 )
 from kernels.moe_router import SparseRoute, SparseRoutePtr
 
+from butterquant.convert import store_bf16
 from butterquant.gemm import accumulate_n_step, accumulate_n_step_gathered
 from butterquant.vnni import VNNI_N_STEP
 from butterquant.types import F32Ptr, I8Ptr
@@ -68,7 +69,7 @@ def emit_bq_gate_up_panel[
             var uv = (uacc[r * acc_count + a].cast[DType.float32]()
                 - Float32(128) * ucs) * ad * (wsc + nu).load[width=width]()
             var res = gelu_tanh_f32[width](gv) * uv
-            (bucket_row + a * width).store(res.cast[DType.bfloat16]())
+            store_bf16[width](res, bucket_row + a * width)
 
 
 @fieldwise_init
@@ -274,8 +275,7 @@ struct BqPhase2DownKernel[
             var drow = self.moe_partial + tok * Self.hidden
             var c = col_lo
             while c < col_hi:
-                (drow + c).store(
-                    (arow + c).load[width=width]().cast[DType.bfloat16]())
+                store_bf16[width]((arow + c).load[width=width](), drow + c)
                 c += width
 
     @always_inline

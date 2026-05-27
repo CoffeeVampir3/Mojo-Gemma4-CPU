@@ -17,6 +17,7 @@ from kernels.logsum_merge import (
 from kernels.flash_attention_prefill import dispatch_merge_flash_prefill_partials
 from kernels.dispatch_heuristics import ROPE_INLINE_TOKENS
 
+from butterquant.convert import store_bf16
 from butterquant.dot_products import vnni_shifted_dot
 from butterquant.head_prep import prep_head_qk_i8, prep_head_v_i8
 from butterquant.types import I8Ptr
@@ -200,8 +201,7 @@ struct BqFlashPrefillSlidingKernel[
                     var inv_l = SIMD[DType.float32, W](Float32(1.0) / l[h])
                     for j in range(0, Self.head_dim, W):
                         var v = (acc_ptrs[h] + j).load[width=W]() * inv_l
-                        (out_tok + h * Self.head_dim + j).store(
-                            v.cast[DType.bfloat16]())
+                        store_bf16[W](v, out_tok + h * Self.head_dim + j)
                 else:
                     for j in range(0, Self.head_dim, W):
                         (out_tok + h * Self.head_dim + j).store(
