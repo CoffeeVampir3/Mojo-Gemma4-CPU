@@ -22,7 +22,7 @@ from kernels.attention_dispatch_kernels import (
 )
 from kernels.moe_router import (
     RouterCandidate, SparseRoute,
-    dispatch_router_sharded, merge_router_candidates, build_expert_schedules,
+    dispatch_router_expert, merge_router_candidates_expert, build_expert_schedules,
 )
 from kernels.moe_experts import (
     dispatch_phase1_gate_up, dispatch_phase2_down,
@@ -363,7 +363,11 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     ]
 
     var router_cands: ScratchPhase["router_sharded", "merge_cands"]
-    var moe_cands: ScratchBuffer[RouterCandidate, C.SLIDING_WINDOW * C.TOP_K]
+    var moe_cands: ScratchBuffer[
+        RouterCandidate,
+        min(Self.max_worker_count, Self.experts_per_rank)
+        * C.SLIDING_WINDOW * C.TOP_K,
+    ]
 
     var router_products: ScratchPhase["merge_cands", "build_schedules"]
     var moe_route_idx: ScratchBuffer[
@@ -755,7 +759,7 @@ def dispatch_moe[
     var moe_accum = scratch.binding[Ffn, "moe_accum"](ctx)
     var gate_scratch = scratch.binding[Ffn, "moe_gate_scratch"](ctx)
 
-    dispatch_router_sharded[
+    var nws = dispatch_router_expert[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
         experts_per_rank=experts_per_rank,
         top_k=C.TOP_K, tp=degree,
@@ -765,8 +769,8 @@ def dispatch_moe[
       body.router_scale.binding(ctx),
       router_scaled, cands, seq_len, pools, prof)
 
-    merge_router_candidates[degree, C.TOP_K](
-        cands, per_expert_scale_ptr, route_idx, route_w, seq_len)
+    merge_router_candidates_expert[degree, C.TOP_K](
+        cands, nws, seq_len, per_expert_scale_ptr, route_idx, route_w)
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,

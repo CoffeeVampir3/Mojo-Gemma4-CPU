@@ -6,10 +6,10 @@ from simd_math import fast_exp_softmax_biased
 from simd_math.ops import sqrt
 from .helpers import (
     WorkerRangePartitionedKernel, Binding,
-    fanout_dispatch, saturate_workers,
+    fanout_dispatch_per_rank, recommended_workers,
     BF16Ptr, F32Ptr, W,
 )
-from .dispatch_heuristics import ROUTER_INLINE_TOKENS
+from .dispatch_heuristics import ROUTER_DISPATCH_BW_PRODUCT, ROUTER_MAX_WORKERS
 from .rmsnorm import rms_reduce_row
 from .dot_products import dot_to_scalar
 from .profiling import Profiler
@@ -46,129 +46,6 @@ def insert_candidate[top_k: Int](
                 j -= 1
             cands[k] = RouterCandidate(expert, logit)
             return
-
-
-@fieldwise_init
-struct RouterShardedKernel[
-    hidden: Int, sqrt_n: Float32, n_eps: Float32,
-    experts_per_rank: Int, top_k: Int,
-](WorkerRangePartitionedKernel):
-    var x: BF16Ptr
-    var router_proj: BF16Ptr
-    var router_scale: BF16Ptr
-    var scaled_scratch: F32Ptr
-    var cands_out: RouterCandidatePtr
-    var expert_base: Int
-    var worker_id: Int
-    var start: Int
-    var end: Int
-
-    def execute(mut self):
-        comptime sentinel = Float32(-1.0e30)
-
-        var scratch = self.scaled_scratch + self.worker_id * Self.hidden
-        for tok in range(self.start, self.end):
-            var x_row = self.x + tok * Self.hidden
-
-            var sum_sq = rms_reduce_row[Self.hidden](x_row)
-            var inv_rms = Self.sqrt_n / sqrt[DType.float32, 1](
-                sum_sq + Self.n_eps)
-            var inv_vec = SIMD[DType.float32, W](inv_rms)
-            for j in range(0, Self.hidden, W):
-                var xv = (x_row + j).load[width=W]().cast[DType.float32]()
-                var sv = (self.router_scale + j).load[width=W]().cast[DType.float32]()
-                (scratch + j).store(xv * sv * inv_vec)
-
-            var cands = InlineArray[RouterCandidate, Self.top_k](
-                fill=RouterCandidate(Int32(0), sentinel))
-            for e in range(Self.experts_per_rank):
-                var row = self.router_proj + e * Self.hidden
-                var logit = dot_to_scalar[Self.hidden](scratch, row)
-                insert_candidate[Self.top_k](
-                    Int32(self.expert_base + e), logit, cands)
-
-            var dst = self.cands_out + tok * Self.top_k
-            comptime for k in range(Self.top_k):
-                dst[k] = cands[k]
-
-    @always_inline
-    def install_worker_range(
-        mut self, worker_id: Int, start: Int, end: Int,
-    ):
-        self.worker_id = worker_id
-        self.start = start
-        self.end = end
-
-
-def dispatch_router_sharded[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
-    hidden: Int, sqrt_n: Float32, n_eps: Float32,
-    experts_per_rank: Int, top_k: Int, tp: Int,
-    max_worker_count: Int = 128,
-](
-    x: Binding[BFloat16, tp],
-    router_proj: Binding[BFloat16, tp],
-    router_scale: Binding[BFloat16, tp],
-    scaled_scratch: Binding[Float32, tp],
-    cands_out: Binding[RouterCandidate, tp],
-    seq_len: Int,
-    mut pools: List[P],
-    mut prof: Profiler[Profile, N],
-):
-    comptime K = RouterShardedKernel[
-        hidden, sqrt_n, n_eps, experts_per_rank, top_k,
-    ]
-
-    @parameter
-    def make(r: Int) -> K:
-        return K(x[r], router_proj[r], router_scale[r],
-                 scaled_scratch[r], cands_out[r],
-                 r * experts_per_rank, 0, 0, 0)
-
-    fanout_dispatch[
-        tp, make,
-        max_worker_count=max_worker_count,
-        worker_policy=saturate_workers,
-        label="router_sharded",
-    ](pools, prof, seq_len, seq_len * hidden * 2,
-      inline_threshold_bytes=ROUTER_INLINE_TOKENS * hidden * 2)
-
-
-def merge_router_candidates[tp: Int, top_k: Int](
-    cands_per_rank: Binding[RouterCandidate, tp],
-    per_expert_scale: BF16Ptr,
-    route_idx_per_rank: Binding[Int32, tp],
-    route_w_per_rank: Binding[Float32, tp],
-    seq_len: Int,
-):
-    comptime sentinel = Float32(-1.0e30)
-    for tok in range(seq_len):
-        var merged = InlineArray[RouterCandidate, top_k](
-            fill=RouterCandidate(Int32(0), sentinel))
-        for r in range(tp):
-            var src = cands_per_rank[r] + tok * top_k
-            for k in range(top_k):
-                var c = src[k]
-                insert_candidate[top_k](c.expert, c.logit, merged)
-
-        var max_logit = merged[0].logit
-        var sum_v = Float32(0)
-        var exp_values = InlineArray[Float32, top_k](uninitialized=True)
-        comptime for k in range(top_k):
-            var ev = fast_exp_softmax_biased[1](
-                SIMD[DType.float32, 1](merged[k].logit - max_logit))[0]
-            exp_values[k] = ev
-            sum_v += ev
-        var inv_sum = Float32(1.0) / sum_v
-
-        for r in range(tp):
-            var idx_dst = route_idx_per_rank[r] + tok * top_k
-            var w_dst = route_w_per_rank[r] + tok * top_k
-            comptime for k in range(top_k):
-                var expert = merged[k].expert
-                var scale = (per_expert_scale + Int(expert))[].cast[DType.float32]()
-                idx_dst[k] = expert
-                w_dst[k] = exp_values[k] * inv_sum * scale
 
 
 def build_expert_schedules[tp: Int, experts_per_rank: Int, top_k: Int](
@@ -211,3 +88,142 @@ def build_expert_schedules[tp: Int, experts_per_rank: Int, top_k: Int](
                     var pos = Int(write_offsets[local])
                     routes_r[pos] = SparseRoute(Int32(tok), w_r[slot])
                     write_offsets[local] = Int32(pos + 1)
+
+
+@fieldwise_init
+struct RouterExpertKernel[
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
+    experts_per_rank: Int, top_k: Int,
+](WorkerRangePartitionedKernel):
+    var x: BF16Ptr
+    var router_proj: BF16Ptr
+    var router_scale: BF16Ptr
+    var scaled_scratch: F32Ptr
+    var cands_out: RouterCandidatePtr
+    var expert_base: Int
+    var seq_len: Int
+    var worker_id: Int
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        comptime sentinel = Float32(-1.0e30)
+        var scratch = self.scaled_scratch + self.worker_id * Self.hidden
+        for tok in range(self.seq_len):
+            var x_row = self.x + tok * Self.hidden
+
+            var sum_sq = rms_reduce_row[Self.hidden](x_row)
+            var inv_rms = Self.sqrt_n / sqrt[DType.float32, 1](
+                sum_sq + Self.n_eps)
+            var inv_vec = SIMD[DType.float32, W](inv_rms)
+            for j in range(0, Self.hidden, W):
+                var xv = (x_row + j).load[width=W]().cast[DType.float32]()
+                var sv = (self.router_scale + j).load[width=W]().cast[
+                    DType.float32]()
+                (scratch + j).store(xv * sv * inv_vec)
+
+            var cands = InlineArray[RouterCandidate, Self.top_k](
+                fill=RouterCandidate(Int32(0), sentinel))
+            for e in range(self.start, self.end):
+                var row = self.router_proj + e * Self.hidden
+                var logit = dot_to_scalar[Self.hidden](scratch, row)
+                insert_candidate[Self.top_k](
+                    Int32(self.expert_base + e), logit, cands)
+
+            var dst = self.cands_out + (
+                self.worker_id * self.seq_len + tok) * Self.top_k
+            comptime for k in range(Self.top_k):
+                dst[k] = cands[k]
+
+    @always_inline
+    def install_worker_range(mut self, worker_id: Int, start: Int, end: Int):
+        self.worker_id = worker_id
+        self.start = start
+        self.end = end
+
+
+@always_inline
+def router_workers(data_bytes: Int, capacity: Int) -> Int:
+    return recommended_workers[ROUTER_DISPATCH_BW_PRODUCT](
+        data_bytes, min(capacity, ROUTER_MAX_WORKERS))
+
+
+def dispatch_router_expert[
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
+    hidden: Int, sqrt_n: Float32, n_eps: Float32,
+    experts_per_rank: Int, top_k: Int, tp: Int,
+    max_worker_count: Int = 128,
+](
+    x: Binding[BFloat16, tp],
+    router_proj: Binding[BFloat16, tp],
+    router_scale: Binding[BFloat16, tp],
+    scaled_scratch: Binding[Float32, tp],
+    cands_out: Binding[RouterCandidate, tp],
+    seq_len: Int,
+    mut pools: List[P],
+    mut prof: Profiler[Profile, N],
+) -> InlineArray[Int, tp]:
+    comptime K = RouterExpertKernel[
+        hidden, sqrt_n, n_eps, experts_per_rank, top_k,
+    ]
+
+    @parameter
+    def make(r: Int) -> K:
+        return K(x[r], router_proj[r], router_scale[r],
+                 scaled_scratch[r], cands_out[r],
+                 r * experts_per_rank, seq_len, 0, 0, 0)
+
+    @parameter
+    def total_for(r: Int) -> Int:
+        return experts_per_rank
+
+    @parameter
+    def data_bytes_for(r: Int) -> Int:
+        return experts_per_rank * hidden * 2
+
+    return fanout_dispatch_per_rank[
+        tp, make, total_for, data_bytes_for,
+        max_worker_count=max_worker_count,
+        worker_policy=router_workers,
+        label="router_expert",
+    ](pools, prof)
+
+
+def merge_router_candidates_expert[tp: Int, top_k: Int](
+    cands_per_rank: Binding[RouterCandidate, tp],
+    nws: InlineArray[Int, tp],
+    seq_len: Int,
+    per_expert_scale: BF16Ptr,
+    route_idx_per_rank: Binding[Int32, tp],
+    route_w_per_rank: Binding[Float32, tp],
+):
+    comptime sentinel = Float32(-1.0e30)
+    for tok in range(seq_len):
+        var merged = InlineArray[RouterCandidate, top_k](
+            fill=RouterCandidate(Int32(0), sentinel))
+        for r in range(tp):
+            for w in range(nws[r]):
+                var src = cands_per_rank[r] + (w * seq_len + tok) * top_k
+                for k in range(top_k):
+                    var c = src[k]
+                    insert_candidate[top_k](c.expert, c.logit, merged)
+
+        var max_logit = merged[0].logit
+        var sum_v = Float32(0)
+        var exp_values = InlineArray[Float32, top_k](uninitialized=True)
+        comptime for k in range(top_k):
+            var ev = fast_exp_softmax_biased[1](
+                SIMD[DType.float32, 1](merged[k].logit - max_logit))[0]
+            exp_values[k] = ev
+            sum_v += ev
+        var inv_sum = Float32(1.0) / sum_v
+
+        for r in range(tp):
+            var idx_dst = route_idx_per_rank[r] + tok * top_k
+            var w_dst = route_w_per_rank[r] + tok * top_k
+            comptime for k in range(top_k):
+                var expert = merged[k].expert
+                var scale = (per_expert_scale + Int(expert))[].cast[
+                    DType.float32]()
+                idx_dst[k] = expert
+                w_dst[k] = exp_values[k] * inv_sum * scale

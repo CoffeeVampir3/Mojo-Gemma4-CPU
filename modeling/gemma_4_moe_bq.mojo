@@ -12,7 +12,7 @@ from kernels.helpers import ArenaBases, Binding
 from kernels.profiling import Profiler
 from kernels.moe_router import (
     RouterCandidate, SparseRoute,
-    dispatch_router_sharded, merge_router_candidates, build_expert_schedules,
+    dispatch_router_expert, merge_router_candidates_expert, build_expert_schedules,
 )
 from kernels.attention_ops import flash_partial_stride
 from kernels.reductions import dispatch_allreduce_inplace
@@ -469,7 +469,11 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     ]
 
     var router_cands: ScratchPhase["router_sharded", "merge_cands"]
-    var moe_cands: ScratchBuffer[RouterCandidate, C.SLIDING_WINDOW * C.TOP_K]
+    var moe_cands: ScratchBuffer[
+        RouterCandidate,
+        min(Self.max_worker_count, Self.experts_per_rank)
+        * C.SLIDING_WINDOW * C.TOP_K,
+    ]
 
     var router_products: ScratchPhase["merge_cands", "build_schedules"]
     var moe_route_idx: ScratchBuffer[Int32, C.SLIDING_WINDOW * C.TOP_K]
@@ -836,15 +840,15 @@ def dispatch_bq_moe[
     var bucket_sa = scratch.binding[Ffn, "moe_bucket_sa"](ctx)
     var moe_accum = scratch.binding[Ffn, "moe_accum"](ctx)
 
-    dispatch_router_sharded[
+    var nws = dispatch_router_expert[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
         experts_per_rank=experts_per_rank, top_k=C.TOP_K, tp=degree,
         max_worker_count=max_worker_count,
     ](x_input, body.router_proj.bq_router(ctx).centered,
       body.router_scale.binding(ctx), router_scaled, cands, seq_len, pools, prof)
 
-    merge_router_candidates[degree, C.TOP_K](
-        cands, per_expert_scale_ptr, route_idx, route_w, seq_len)
+    merge_router_candidates_expert[degree, C.TOP_K](
+        cands, nws, seq_len, per_expert_scale_ptr, route_idx, route_w)
 
     dispatch_bq_norm_quant[
         hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,

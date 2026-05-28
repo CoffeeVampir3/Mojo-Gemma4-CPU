@@ -156,12 +156,15 @@ def worker_range(
 
 
 @always_inline
-def recommended_workers(data_bytes: Int, capacity: Int) -> Int:
+def recommended_workers[
+    bw_product: Int = DISPATCH_BW_PRODUCT,
+    amortized_bytes: Int = PARALLEL_AMORTIZED_BYTES,
+](data_bytes: Int, capacity: Int) -> Int:
     if capacity <= 1:
         return capacity
-    if data_bytes >= PARALLEL_AMORTIZED_BYTES:
+    if data_bytes >= amortized_bytes:
         return capacity
-    var target = data_bytes // DISPATCH_BW_PRODUCT
+    var target = data_bytes // bw_product
     var n = 1
     while (n + 1) * (n + 1) <= target and n < capacity:
         n += 1
@@ -239,7 +242,7 @@ def fanout_dispatch[
     max_worker_count: Int = 128,
     worker_policy: def(
         data_bytes: Int, capacity: Int,
-    ) thin -> Int = recommended_workers,
+    ) thin -> Int = recommended_workers[DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES],
     label: StaticString = "?",
 ](
     mut pools: List[P],
@@ -277,7 +280,7 @@ def fanout_dispatch_per_rank[
     max_worker_count: Int = 128,
     worker_policy: def(
         data_bytes: Int, capacity: Int,
-    ) thin -> Int = recommended_workers,
+    ) thin -> Int = recommended_workers[DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES],
     label: StaticString = "?",
 ](
     mut pools: List[P],
