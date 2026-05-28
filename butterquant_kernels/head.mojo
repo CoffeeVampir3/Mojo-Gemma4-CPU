@@ -23,10 +23,12 @@ def dispatch_bq_head_prep[
     src: Binding[BFloat16, tp],
     gamma: Binding[BFloat16, tp],
     dst: ButterquantActivation[tp],
+    row_workspace: Binding[Float32, tp],
 ):
     for r in range(tp):
         prepare_head_activation[hidden, block, sqrt_n, n_eps](
-            src[r], gamma[r], dst.data[r], dst.scale[r])
+            src[r], gamma[r], dst.data[r], dst.scale[r],
+            row_workspace[r])
 
 
 @fieldwise_init

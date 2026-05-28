@@ -1,6 +1,7 @@
 from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
-    Chain, RangePartitionedKernel, Binding, fanout_dispatch,
+    Chain, RangePartitionedKernel, WorkerRangePartitionedKernel,
+    Binding, fanout_dispatch,
     saturate_workers, BF16Ptr,
 )
 from kernels.dispatch_heuristics import NORM_INLINE_TOKENS, GEMV_INLINE_ROWS
@@ -22,24 +23,32 @@ from quant.recipe import QuantRecipe
 @fieldwise_init
 struct BqNormQuantKernel[
     hidden: Int, block: Int, sqrt_n: Float32, n_eps: Float32,
-](RangePartitionedKernel):
+](WorkerRangePartitionedKernel):
     var src: BF16Ptr
     var gamma: BF16Ptr
     var x_i8: I8Ptr
     var x_sa: F32Ptr
+    var row_workspace: F32Ptr
+    var worker_id: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
+        var row_workspace = (
+            self.row_workspace + self.worker_id * Self.hidden)
         for tok in range(self.start, self.end):
             prepare_norm_activation_per_row[
                 Self.hidden, Self.block, Self.sqrt_n, Self.n_eps,
             ](
                 self.src + tok * Self.hidden, self.gamma,
-                self.x_i8 + tok * Self.hidden, self.x_sa + tok)
+                self.x_i8 + tok * Self.hidden, self.x_sa + tok,
+                row_workspace)
 
     @always_inline
-    def install_range(mut self, start: Int, end: Int):
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
+        self.worker_id = worker_id
         self.start = start
         self.end = end
 
@@ -53,6 +62,7 @@ def dispatch_bq_norm_quant[
     gamma: Binding[BFloat16, tp],
     x_i8: Binding[Int8, tp],
     x_sa: Binding[Float32, tp],
+    row_workspace: Binding[Float32, tp],
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
@@ -61,7 +71,9 @@ def dispatch_bq_norm_quant[
 
     @parameter
     def make(r: Int) -> Kern:
-        return Kern(src[r], gamma[r], x_i8[r], x_sa[r], 0, 0)
+        return Kern(
+            src[r], gamma[r], x_i8[r], x_sa[r], row_workspace[r],
+            0, 0, 0)
 
     fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_norm_quant"](
         pools, prof, seq_len, seq_len * hidden * 6,
@@ -127,23 +139,30 @@ def dispatch_bq_linear[
 
 @fieldwise_init
 struct BqBlockQuantKernel[cols: Int, block: Int, apply_fwht: Bool](
-    RangePartitionedKernel
+    WorkerRangePartitionedKernel
 ):
     var src: BF16Ptr
     var x_i8: I8Ptr
     var x_sa: F32Ptr
+    var row_workspace: F32Ptr
+    var worker_id: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
         comptime nb = Self.cols // Self.block
+        var row_workspace = (
+            self.row_workspace + self.worker_id * Self.cols)
         for tok in range(self.start, self.end):
             prepare_block_activation[Self.cols, Self.block, Self.apply_fwht](
                 self.src + tok * Self.cols, self.x_i8 + tok * Self.cols,
-                self.x_sa + tok * nb)
+                self.x_sa + tok * nb, row_workspace)
 
     @always_inline
-    def install_range(mut self, start: Int, end: Int):
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
+        self.worker_id = worker_id
         self.start = start
         self.end = end
 
@@ -156,6 +175,7 @@ def dispatch_bq_block_quant[
     src: Binding[BFloat16, tp],
     x_i8: Binding[Int8, tp],
     x_sa: Binding[Float32, tp],
+    row_workspace: Binding[Float32, tp],
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
@@ -164,7 +184,8 @@ def dispatch_bq_block_quant[
 
     @parameter
     def make(r: Int) -> Kern:
-        return Kern(src[r], x_i8[r], x_sa[r], 0, 0)
+        return Kern(
+            src[r], x_i8[r], x_sa[r], row_workspace[r], 0, 0, 0)
 
     fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_block_quant"](
         pools, prof, seq_len, seq_len * cols * 6,

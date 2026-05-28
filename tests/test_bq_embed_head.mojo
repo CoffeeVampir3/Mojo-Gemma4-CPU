@@ -6,6 +6,7 @@ from simd_math.ops import sqrt
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 from kernels.helpers import Binding, ArenaBases
+from kernels.profiling import Profiler
 from kernels.rmsnorm import rms_reduce_row
 from kernels.gemv import softcap_value
 from butterquant import (
@@ -115,7 +116,7 @@ def argmax(a: F32ExtPtr, n: Int) -> Int:
 
 def main():
     var w_orig = alloc[Float32](VOCAB * HIDDEN).as_any_origin()
-    var work = alloc[Float32](VOCAB * HIDDEN).as_any_origin()
+    var quant_rows = alloc[Float32](VOCAB * HIDDEN).as_any_origin()
     var wi8 = alloc[Int8](VOCAB * HIDDEN).as_any_origin()
     var sw = alloc[Float32](VOCAB * NB).as_any_origin()
 
@@ -123,14 +124,15 @@ def main():
         for k in range(HIDDEN):
             var v = rnd(n * 3 + 1, k) * Float32(0.08)
             w_orig[n * HIDDEN + k] = v
-            work[n * HIDDEN + k] = v
+            quant_rows[n * HIDDEN + k] = v
 
-    rotate_and_quant[True](BLOCK, work, wi8, sw, VOCAB, HIDDEN)
+    rotate_and_quant[True](BLOCK, quant_rows, wi8, sw, VOCAB, HIDDEN)
 
     var bases = ArenaBases[1].uninitialized()
     bases[0] = 0
     var pools = List[TestPool](capacity=1)
     pools.append(TestPool(4, 0))
+    var prof = Profiler[False]()
 
     var bqw = ButterquantWeight[QUANT, VOCAB, HIDDEN, 1](
         Binding[Int8, 1](wi8, bases),
@@ -146,11 +148,14 @@ def main():
     var n_tok = len(tok_buf)
 
     var dst = alloc[BFloat16](n_tok * HIDDEN).as_any_origin()
+    var embed_row_workspace = alloc[Float32](
+        pools[0].get_capacity() * HIDDEN).as_any_origin()
     dispatch_bq_embed_lookup[scale=EMBED_SCALE, shard_rows=VOCAB](
         Span[Int32, origin_of(tok_buf)](ptr=tok_buf.unsafe_ptr(), length=n_tok),
         bqw,
         Binding[BFloat16, 1](dst, bases),
-        n_tok, pools)
+        Binding[Float32, 1](embed_row_workspace, bases),
+        n_tok, pools, prof)
 
     var row_ref = alloc[Float32](HIDDEN).as_any_origin()
     var row_got = alloc[Float32](HIDDEN).as_any_origin()
@@ -187,6 +192,7 @@ def main():
 
     var x_i8 = alloc[Int8](HIDDEN).as_any_origin()
     var sa = alloc[Float32](NB).as_any_origin()
+    var head_row_workspace = alloc[Float32](HIDDEN).as_any_origin()
     var bq_act = ButterquantActivation[1](
         Binding[Int8, 1](x_i8, bases),
         Binding[Float32, 1](sa, bases))
@@ -195,11 +201,12 @@ def main():
     ](
         Binding[BFloat16, 1](h, bases),
         Binding[BFloat16, 1](gamma, bases),
-        bq_act)
+        bq_act,
+        Binding[Float32, 1](head_row_workspace, bases))
 
     var logits_bf16 = alloc[BFloat16](VOCAB).as_any_origin()
     dispatch_bq_head_gemv[cap=CAP](
-        bq_act, bqw, Binding[BFloat16, 1](logits_bf16, bases), pools)
+        bq_act, bqw, Binding[BFloat16, 1](logits_bf16, bases), pools, prof)
 
     var logit_bq = alloc[Float32](VOCAB).as_any_origin()
     for n in range(VOCAB):

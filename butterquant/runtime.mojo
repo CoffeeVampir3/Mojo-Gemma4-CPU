@@ -1,6 +1,3 @@
-from std.collections import InlineArray
-from std.memory import UnsafePointer
-
 from simd_math.ops import sqrt
 from kernels.rmsnorm import rms_reduce_row
 
@@ -16,13 +13,12 @@ def prepare_norm_activation[
     per_block: Bool, hidden: Int, block: Int, sqrt_n: Float32, n_eps: Float32,
 ](
     src: BF16Ptr, gamma: BF16Ptr, x_i8: I8Ptr, sa: F32Ptr,
+    row_workspace: F32Ptr,
 ):
     comptime assert hidden % WF == 0, (
         "hidden must be a multiple of the f32 SIMD width")
     comptime assert hidden % block == 0, (
         "hidden must be block-aligned")
-    var work = InlineArray[Float32, hidden](uninitialized=True)
-    var wp = UnsafePointer(to=work[0]).as_any_origin()
 
     var sum_sq = rms_reduce_row[hidden](src)
     var inv_rms = sqrt_n / sqrt[DType.float32, 1](sum_sq + n_eps)
@@ -31,15 +27,14 @@ def prepare_norm_activation[
     while k + WF <= hidden:
         var x = (src + k).load[width=WF]().cast[DType.float32]()
         var g = (gamma + k).load[width=WF]().cast[DType.float32]()
-        (wp + k).store(x * fr * g)
+        (row_workspace + k).store(x * fr * g)
         k += WF
 
-    fwht_row[block](wp, hidden)
+    fwht_row[block](row_workspace, hidden)
     comptime if per_block:
-        quantize_activation_per_block[block](wp, x_i8, sa, hidden)
+        quantize_activation_per_block[block](row_workspace, x_i8, sa, hidden)
     else:
-        quantize_activation_per_row(wp, x_i8, sa, hidden)
-    _ = work
+        quantize_activation_per_row(row_workspace, x_i8, sa, hidden)
 
 
 @always_inline
@@ -47,9 +42,10 @@ def prepare_head_activation[
     hidden: Int, block: Int, sqrt_n: Float32, n_eps: Float32,
 ](
     src: BF16Ptr, gamma: BF16Ptr, x_i8: I8Ptr, sa: F32Ptr,
+    row_workspace: F32Ptr,
 ):
     prepare_norm_activation[True, hidden, block, sqrt_n, n_eps](
-        src, gamma, x_i8, sa)
+        src, gamma, x_i8, sa, row_workspace)
 
 
 @always_inline
@@ -57,29 +53,28 @@ def prepare_norm_activation_per_row[
     hidden: Int, block: Int, sqrt_n: Float32, n_eps: Float32,
 ](
     src: BF16Ptr, gamma: BF16Ptr, x_i8: I8Ptr, sa: F32Ptr,
+    row_workspace: F32Ptr,
 ):
     prepare_norm_activation[False, hidden, block, sqrt_n, n_eps](
-        src, gamma, x_i8, sa)
+        src, gamma, x_i8, sa, row_workspace)
 
 
 @always_inline
 def prepare_block_activation[
     cols: Int, block: Int, apply_fwht: Bool,
 ](
-    src: BF16Ptr, x_i8: I8Ptr, sa: F32Ptr,
+    src: BF16Ptr, x_i8: I8Ptr, sa: F32Ptr, row_workspace: F32Ptr,
 ):
     comptime assert cols % WF == 0, (
         "cols must be a multiple of the f32 SIMD width")
     comptime assert cols % block == 0, "cols must be block-aligned"
-    var work = InlineArray[Float32, cols](uninitialized=True)
-    var wp = UnsafePointer(to=work[0]).as_any_origin()
 
     var k = 0
     while k + WF <= cols:
-        (wp + k).store((src + k).load[width=WF]().cast[DType.float32]())
+        (row_workspace + k).store(
+            (src + k).load[width=WF]().cast[DType.float32]())
         k += WF
 
     comptime if apply_fwht:
-        fwht_row[block](wp, cols)
-    quantize_activation_per_block[block](wp, x_i8, sa, cols)
-    _ = work
+        fwht_row[block](row_workspace, cols)
+    quantize_activation_per_block[block](row_workspace, x_i8, sa, cols)

@@ -1,9 +1,8 @@
-from std.collections import InlineArray
-from std.memory import Span, UnsafePointer
+from std.memory import Span
 
 from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
-    RangePartitionedKernel, Binding, fanout_dispatch, BF16Ptr,
+    WorkerRangePartitionedKernel, Binding, fanout_dispatch, BF16Ptr,
 )
 from kernels.dispatch_heuristics import EMBED_INLINE_TOKENS
 from kernels.profiling import Profiler
@@ -23,19 +22,20 @@ from quant.recipe import QuantRecipe
 struct BqEmbedLookupKernel[
     tok_origin: ImmutOrigin,
     hidden: Int, block: Int, scale: Float64, shard_rows: Int,
-](RangePartitionedKernel):
+](WorkerRangePartitionedKernel):
     var token_ids: Span[Int32, Self.tok_origin]
     var weight: I8Ptr
     var scales: F32Ptr
     var dst: BF16Ptr
+    var row_workspace: F32Ptr
     var rank: Int
+    var worker_id: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
         comptime nb = Self.hidden // Self.block
-        var work = InlineArray[Float32, Self.hidden](uninitialized=True)
-        var wp = UnsafePointer(to=work[0]).as_any_origin()
+        var row_workspace = self.row_workspace + self.worker_id * Self.hidden
         for tok in range(self.start, self.end):
             var tid = Int(self.token_ids[tok])
             var owner = tid // Self.shard_rows
@@ -45,15 +45,18 @@ struct BqEmbedLookupKernel[
                 dequant_weight_row_per_block[Self.block](
                     self.weight + local_row * Self.hidden,
                     self.scales + local_row * nb,
-                    wp, Self.hidden)
-                fwht_row[Self.block](wp, Self.hidden)
-                scale_cast_row[Self.hidden, Self.scale](wp, dst_row)
+                    row_workspace, Self.hidden)
+                fwht_row[Self.block](row_workspace, Self.hidden)
+                scale_cast_row[Self.hidden, Self.scale](
+                    row_workspace, dst_row)
             else:
                 zero_row[Self.hidden](dst_row)
-        _ = work
 
     @always_inline
-    def install_range(mut self, start: Int, end: Int):
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
+        self.worker_id = worker_id
         self.start = start
         self.end = end
 
@@ -68,6 +71,7 @@ def dispatch_bq_embed_lookup[
     token_ids: Span[Int32, tok_origin],
     weight: ButterquantWeight[quant, n, m, tp],
     dst: Binding[BFloat16, tp],
+    row_workspace: Binding[Float32, tp],
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
@@ -79,7 +83,11 @@ def dispatch_bq_embed_lookup[
 
     @parameter
     def make(r: Int) -> K:
-        return K(token_ids, weight.data[r], weight.scale[r], dst[r], r, 0, 0)
+        return K(
+            token_ids, weight.data[r], weight.scale[r], dst[r],
+            row_workspace[r],
+            r, 0, 0, 0,
+        )
 
     fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_embed_lookup"](
         pools, prof, seq_len, seq_len * m * 6,
