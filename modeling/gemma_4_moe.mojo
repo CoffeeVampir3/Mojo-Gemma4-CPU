@@ -260,21 +260,20 @@ struct Gemma4SlidingScratch[degree: Int, max_worker_count: Int = 128](
     ]()
 
     comptime PHASES = ScratchPhaseOrder[
-        "gemv_qkv", "rms_norm_qkv", "rope_cache_write",
-        "flash", "merge_partials", "o_proj",
+        "qkv", "attention", "o_proj",
     ]
 
-    var q_band: ScratchPhase["gemv_qkv", "o_proj"]
+    var q_band: ScratchPhase["qkv", "o_proj"]
     var q: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.q_rows,
     ]
 
-    var kv_band: ScratchPhase["gemv_qkv", "rope_cache_write"]
+    var kv_band: ScratchPhase["qkv", "attention"]
     var kv: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.kv_rows * 2,
     ]
 
-    var partials_band: ScratchPhase["flash", "merge_partials"]
+    var partials_band: ScratchPhase["attention", "attention"]
     var partials: ScratchBuffer[
         Float32, Self.max_worker_count * Self.PARTIAL_STRIDE,
     ]
@@ -300,26 +299,25 @@ struct Gemma4FullScratch[degree: Int, max_worker_count: Int = 128](
     )
 
     comptime PHASES = ScratchPhaseOrder[
-        "gemv_q", "gemv_kv", "rms_norm_qkv", "rope_cache_write",
-        "flash", "merge_partials", "o_proj",
+        "prep", "flash", "merge",
     ]
 
-    var q_band: ScratchPhase["gemv_q", "flash"]
+    var q_band: ScratchPhase["prep", "flash"]
     var q: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.q_rows,
     ]
 
-    var kv_band: ScratchPhase["gemv_kv", "rope_cache_write"]
+    var kv_band: ScratchPhase["prep", "prep"]
     var kv: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.k_rows * 2,
     ]
 
-    var partials_band: ScratchPhase["flash", "merge_partials"]
+    var partials_band: ScratchPhase["flash", "merge"]
     var partials: ScratchBuffer[
         Float32, Self.PARTIAL_SLOTS * Self.PARTIAL_STRIDE,
     ]
 
-    var q_local_band: ScratchPhase["merge_partials", "o_proj"]
+    var q_local_band: ScratchPhase["merge", "merge"]
     var q_local: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * Self.local_q_rows,
     ]
@@ -336,40 +334,37 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
     comptime PHASE1_MR = 4
 
     comptime PHASES = ScratchPhaseOrder[
-        "ffn_rms_norm", "gemv_gate", "gemv_up", "gelu_gate_up",
-        "router_sharded", "merge_cands", "moe_rms_norm",
-        "build_schedules", "phase1_gate_up", "phase2_down",
-        "moe_allreduce", "gemv_dense", "allreduce_dense",
-        "post_norm_1", "post_norm_2", "post_norm_3",
+        "dense_gate_up", "router_select", "moe_setup",
+        "phase1", "phase2", "dense_down_post",
     ]
 
-    var ffn_gate_band: ScratchPhase["gemv_gate", "gemv_dense"]
+    var ffn_gate_band: ScratchPhase["dense_gate_up", "dense_down_post"]
     var ffn_gate: ScratchBuffer[
         BFloat16,
         C.SLIDING_WINDOW * Self.intermediate_per_rank,
     ]
 
-    var ffn_up_band: ScratchPhase["gemv_up", "gelu_gate_up"]
+    var ffn_up_band: ScratchPhase["dense_gate_up", "dense_gate_up"]
     var ffn_up: ScratchBuffer[
         BFloat16,
         C.SLIDING_WINDOW * Self.intermediate_per_rank,
     ]
 
     var router_workspace: ScratchPhase[
-        "router_sharded", "router_sharded",
+        "router_select", "router_select",
     ]
     var moe_router_scaled: ScratchBuffer[
         Float32, Self.max_worker_count * C.HIDDEN,
     ]
 
-    var router_cands: ScratchPhase["router_sharded", "merge_cands"]
+    var router_cands: ScratchPhase["router_select", "router_select"]
     var moe_cands: ScratchBuffer[
         RouterCandidate,
         min(Self.max_worker_count, Self.experts_per_rank)
         * C.SLIDING_WINDOW * C.TOP_K,
     ]
 
-    var router_products: ScratchPhase["merge_cands", "build_schedules"]
+    var router_products: ScratchPhase["router_select", "moe_setup"]
     var moe_route_idx: ScratchBuffer[
         Int32, C.SLIDING_WINDOW * C.TOP_K,
     ]
@@ -377,39 +372,39 @@ struct Gemma4FfnMoeScratch[degree: Int, max_worker_count: Int = 128](
         Float32, C.SLIDING_WINDOW * C.TOP_K,
     ]
 
-    var expert_input: ScratchPhase["moe_rms_norm", "phase1_gate_up"]
+    var expert_input: ScratchPhase["moe_setup", "phase1"]
     var moe_x_normed: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * C.HIDDEN,
     ]
 
     var schedule_products: ScratchPhase[
-        "build_schedules", "phase2_down",
+        "moe_setup", "phase2",
     ]
     var moe_expert_offset: ScratchBuffer[
         Int32, Self.experts_per_rank + 1,
     ]
     var moe_routes: ScratchBuffer[SparseRoute, C.SLIDING_WINDOW * C.TOP_K]
 
-    var hidden_bucket: ScratchPhase["phase1_gate_up", "phase2_down"]
+    var hidden_bucket: ScratchPhase["phase1", "phase2"]
     var moe_hidden_bucket: ScratchBuffer[
         BFloat16,
         C.SLIDING_WINDOW * C.TOP_K * C.MOE_INTERMEDIATE,
     ]
 
     var phase1_workspace: ScratchPhase[
-        "phase1_gate_up", "phase1_gate_up",
+        "phase1", "phase1",
     ]
     var moe_gate_scratch: ScratchBuffer[
         Float32,
         Self.max_worker_count * Self.PHASE1_MR * 2 * Self.PHASE1_TILE_J,
     ]
 
-    var phase2_accum: ScratchPhase["phase2_down", "phase2_down"]
+    var phase2_accum: ScratchPhase["phase2", "phase2"]
     var moe_accum: ScratchBuffer[
         Float32, C.SLIDING_WINDOW * C.HIDDEN,
     ]
 
-    var dense_band: ScratchPhase["gemv_dense", "post_norm_3"]
+    var dense_band: ScratchPhase["dense_down_post", "dense_down_post"]
     var ffn_dense_out: ScratchBuffer[
         BFloat16, C.SLIDING_WINDOW * C.HIDDEN,
     ]
@@ -420,11 +415,11 @@ struct Gemma4HeadScratch[degree: Int](
     ScratchIsland, Copyable, ImplicitlyCopyable
 ):
     comptime PHASES = ScratchPhaseOrder[
-        "final_norm", "gemv_logits", "returned_to_caller",
+        "logits",
     ]
     comptime vocab_per_rank = C.VOCAB_SIZE // Self.degree
 
-    var logits_band: ScratchPhase["gemv_logits", "returned_to_caller"]
+    var logits_band: ScratchPhase["logits", "logits"]
     var logits: ScratchBuffer[
         BFloat16, Self.vocab_per_rank,
     ]
