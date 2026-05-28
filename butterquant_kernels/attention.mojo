@@ -16,6 +16,7 @@ from kernels.logsum_merge import (
 )
 from kernels.flash_attention_prefill import dispatch_merge_flash_prefill_partials
 from kernels.dispatch_heuristics import ROPE_INLINE_TOKENS
+from kernels.profiling import Profiler
 
 from butterquant.convert import store_bf16
 from butterquant.dot_products import vnni_shifted_dot
@@ -282,7 +283,7 @@ struct BqFlashPrefillFullKernel[
 
 
 def dispatch_bq_sliding_attention[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int, cache_size: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
@@ -299,6 +300,7 @@ def dispatch_bq_sliding_attention[
     base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
@@ -329,12 +331,13 @@ def dispatch_bq_sliding_attention[
         var nws = fanout_dispatch_per_rank[
             tp, make_decode, total_for, bytes_for,
             max_worker_count=max_worker_count,
-        ](pools)
+            label="sliding_attention.decode",
+        ](pools, prof)
 
         dispatch_merge_flash_partials[
             head_dim, num_q, partial_stride, tp=tp,
             max_worker_count=max_worker_count,
-        ](output, partials, nws, pools)
+        ](output, partials, nws, pools, prof)
     else:
         comptime PrefillK = BqFlashPrefillSlidingKernel[
             head_dim, num_q, num_kv, gqa_ratio, kv_stride, window, cache_size,
@@ -350,11 +353,12 @@ def dispatch_bq_sliding_attention[
         var per_q_kv = window if seq_len > window else seq_len
         fanout_dispatch[
             tp, make_prefill, max_worker_count=max_worker_count,
-        ](pools, seq_len, seq_len * per_q_kv * kv_stride)
+            label="sliding_attention.prefill",
+        ](pools, prof, seq_len, seq_len * per_q_kv * kv_stride)
 
 
 def dispatch_bq_full_attention[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, num_kv: Int, local_num_q: Int, gqa_ratio: Int,
     kv_stride: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
@@ -371,6 +375,7 @@ def dispatch_bq_full_attention[
     base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
@@ -400,13 +405,14 @@ def dispatch_bq_full_attention[
         var nws = fanout_dispatch_per_rank[
             tp, make_decode, total_for, bytes_for,
             max_worker_count=max_worker_count,
-        ](pools)
+            label="full_attention.decode",
+        ](pools, prof)
 
         dispatch_merge_context_flash_partials[
             head_dim=head_dim, num_q=num_q,
             local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
             max_worker_count=max_worker_count,
-        ](q_local_output, partials, nws, pools)
+        ](q_local_output, partials, nws, pools, prof)
     else:
         comptime PrefillK = BqFlashPrefillFullKernel[
             head_dim, num_q, num_kv, gqa_ratio, kv_stride, tp, partial_stride,
@@ -421,13 +427,14 @@ def dispatch_bq_full_attention[
         var avg_local_kv = (base_pos + seq_len // 2) // tp + 1
         fanout_dispatch[
             tp, make_prefill, max_worker_count=max_worker_count,
-        ](pools, seq_len, seq_len * avg_local_kv * kv_stride)
+            label="full_attention.prefill",
+        ](pools, prof, seq_len, seq_len * avg_local_kv * kv_stride)
 
         dispatch_merge_flash_prefill_partials[
             head_dim=head_dim, num_q=num_q,
             local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
             max_worker_count=max_worker_count,
-        ](q_local_output, partials, seq_len, pools)
+        ](q_local_output, partials, seq_len, pools, prof)
 
 
 @fieldwise_init
@@ -500,7 +507,7 @@ struct BqAttnPrepKernel[
 
 
 def dispatch_bq_attn_prep[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, num_kv: Int, rope_half: Int, pair_stride: Int,
     slot_mask: Int, cache_degree: Int, sqrt_n: Float32, n_eps: Float32, tp: Int,
     max_worker_count: Int = 128,
@@ -521,6 +528,7 @@ def dispatch_bq_attn_prep[
     sin_table: Binding[Float32, tp],
     base_pos: Int, seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = BqAttnPrepKernel[
         head_dim, num_q, num_kv, rope_half, pair_stride,
@@ -535,6 +543,6 @@ def dispatch_bq_attn_prep[
                  cos_table[r], sin_table[r],
                  base_pos, r % cache_degree, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * row_bytes,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_attn_prep"](
+        pools, prof, seq_len, seq_len * row_bytes,
         inline_threshold_bytes=ROPE_INLINE_TOKENS * row_bytes)

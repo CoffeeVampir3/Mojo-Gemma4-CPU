@@ -12,6 +12,7 @@ from .helpers import (
 from .dispatch_heuristics import ROUTER_INLINE_TOKENS
 from .rmsnorm import rms_reduce_row
 from .dot_products import dot_to_scalar
+from .profiling import Profiler
 
 
 @fieldwise_init
@@ -100,7 +101,7 @@ struct RouterShardedKernel[
 
 
 def dispatch_router_sharded[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
     experts_per_rank: Int, top_k: Int, tp: Int,
     max_worker_count: Int = 128,
@@ -112,6 +113,7 @@ def dispatch_router_sharded[
     cands_out: Binding[RouterCandidate, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = RouterShardedKernel[
         hidden, sqrt_n, n_eps, experts_per_rank, top_k,
@@ -127,7 +129,8 @@ def dispatch_router_sharded[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, seq_len, seq_len * hidden * 2,
+        label="router_sharded",
+    ](pools, prof, seq_len, seq_len * hidden * 2,
       inline_threshold_bytes=ROUTER_INLINE_TOKENS * hidden * 2)
 
 

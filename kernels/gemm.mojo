@@ -9,6 +9,7 @@ from .helpers import (
 )
 from .dispatch_heuristics import GEMV_INLINE_ROWS
 from .dot_products import bf16_panel_dot_to_scalars
+from .profiling import Profiler
 
 
 @always_inline
@@ -81,7 +82,7 @@ struct GemmKernel[rows: Int, cols: Int, MR: Int = 4](
 
 
 def dispatch_gemm[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     rows: Int, cols: Int, tp: Int, MR: Int = 4,
     max_worker_count: Int = 128,
 ](
@@ -90,6 +91,7 @@ def dispatch_gemm[
     output: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
@@ -99,8 +101,8 @@ def dispatch_gemm[
     def make(r: Int) -> K:
         return K(x[r], weight[r], output[r], seq_len, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, rows,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="gemm"](
+        pools, prof, rows,
         seq_len * cols * 2 + rows * cols * 2,
         inline_threshold_bytes=GEMV_INLINE_ROWS * cols * 2)
 
@@ -130,7 +132,7 @@ struct ScaledGemmKernel[
 
 
 def dispatch_gemm_chained_qkv[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     q_rows: Int, kv_rows: Int, cols: Int, tp: Int, MR: Int = 4,
     max_worker_count: Int = 128,
 ](
@@ -143,6 +145,7 @@ def dispatch_gemm_chained_qkv[
     v_out: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
@@ -167,4 +170,5 @@ def dispatch_gemm_chained_qkv[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, total_rows, seq_len * cols * 2 + total_rows * cols * 2)
+        label="gemm_chained_qkv",
+    ](pools, prof, total_rows, seq_len * cols * 2 + total_rows * cols * 2)

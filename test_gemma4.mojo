@@ -98,7 +98,7 @@ def load_and_run[
     read token_ids: List[Int],
 ):
     var t0 = perf_counter_ns()
-    var model_opt = Gemma4[degree=degree, Pool=P].load(
+    var model_opt = Gemma4[degree=degree, profile=True, Pool=P].load(
         Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         return
@@ -126,6 +126,8 @@ def load_and_run[
             logits = model.forward(Span(tok_buf), 0)
             prefill_ms = elapsed_ms_since(t1)
             pos = prompt_len
+            model.profiler.report("prefill")
+            model.profiler.reset()
             decode_start = perf_counter_ns()
         else:
             step_buf[0] = Int32(next_id)
@@ -138,6 +140,8 @@ def load_and_run[
 
         if next_id == EOS_TOKEN_ID:
             break
+
+    model.profiler.report("decode")
 
     var prefill_tps = tokens_per_second(prompt_len, prefill_ms)
     print(t"prompt  | {prompt_len} tokens | {prefill_ms} ms | {prefill_tps} t/s")

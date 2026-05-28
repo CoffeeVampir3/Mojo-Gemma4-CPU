@@ -9,6 +9,7 @@ from .helpers import (
 )
 from .dispatch_heuristics import NORM_INLINE_TOKENS
 from .dot_products import dot_to_scalar
+from .profiling import Profiler
 
 
 @always_inline
@@ -114,7 +115,7 @@ struct NormResidualAddTokenKernel[
 
 
 def dispatch_rms_norm[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
     tp: Int, scaled: Bool = True, max_worker_count: Int = 128,
 ](
@@ -123,6 +124,7 @@ def dispatch_rms_norm[
     weight: Binding[BFloat16, tp],
     count: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = RmsNormTokenKernel[hidden, sqrt_n, n_eps, scaled]
 
@@ -130,8 +132,8 @@ def dispatch_rms_norm[
     def make(r: Int) -> K:
         return K(src[r], dst[r], weight[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, count, count * hidden * 2,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="rms_norm"](
+        pools, prof, count, count * hidden * 2,
         inline_threshold_bytes=NORM_INLINE_TOKENS * hidden * 2)
 
 
@@ -162,7 +164,7 @@ struct ScaledNormKernel[
 
 
 def dispatch_rms_norm_qkv_heads[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, sqrt_n: Float32, n_eps: Float32,
     num_q: Int, num_kv: Int, tp: Int, max_worker_count: Int = 128,
 ](
@@ -176,6 +178,7 @@ def dispatch_rms_norm_qkv_heads[
     k_weight: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
@@ -201,12 +204,13 @@ def dispatch_rms_norm_qkv_heads[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, total, total * head_dim * 2,
+        label="rms_norm_qkv_heads",
+    ](pools, prof, total, total * head_dim * 2,
       inline_threshold_bytes=NORM_INLINE_TOKENS * head_dim * 2)
 
 
 def fused_norm_residual_add[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
     tp: Int, max_worker_count: Int = 128,
 ](
@@ -216,6 +220,7 @@ def fused_norm_residual_add[
     weight: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = NormResidualAddTokenKernel[hidden, sqrt_n, n_eps]
 
@@ -223,6 +228,6 @@ def fused_norm_residual_add[
     def make(r: Int) -> K:
         return K(src[r], residual[r], dst[r], weight[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * hidden * 4,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="norm_residual_add"](
+        pools, prof, seq_len, seq_len * hidden * 4,
         inline_threshold_bytes=NORM_INLINE_TOKENS * hidden * 4)

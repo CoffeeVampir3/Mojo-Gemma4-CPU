@@ -1,6 +1,7 @@
 from std.collections import InlineArray
 from std.pathlib import Path
 from std.memory import Span, UnsafePointer
+from std.time import perf_counter_ns
 
 from numa import NumaArena, NumaTopology
 from threading import BurstPool
@@ -8,6 +9,7 @@ from threading.threading_traits import BurstThreadPool
 from std.sys.info import simd_width_of
 from simd_math.ops import sqrt
 from kernels.helpers import ArenaBases, Binding
+from kernels.profiling import Profiler
 from kernels.moe_router import (
     RouterCandidate, SparseRoute,
     dispatch_router_sharded, merge_router_candidates, build_expert_schedules,
@@ -625,7 +627,7 @@ def build_gemma4_plan[
 
 
 def dispatch_bq_sliding_attention_qkv[
-    P: BurstThreadPool, //, degree: Int, max_seq_len: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, //, degree: Int, max_seq_len: Int,
     max_worker_count: Int = 128,
 ](
     layout: Gemma4Layout[degree, max_seq_len],
@@ -636,6 +638,7 @@ def dispatch_bq_sliding_attention_qkv[
     layer_idx: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime S = Gemma4Shapes[degree]
     comptime q_rows = S.SlidingQ.DATA_N
@@ -662,7 +665,7 @@ def dispatch_bq_sliding_attention_qkv[
         attn.q_proj.bq_weight(attn_ctx),
         attn.k_proj.bq_weight(attn_ctx),
         attn.v_proj.bq_weight(attn_ctx),
-        q_outs, k_outs, v_outs, seq_len, pools)
+        q_outs, k_outs, v_outs, seq_len, pools, prof)
 
     var q_i8 = scratch.binding[Island, "q_i8"](ctx)
     var qi_bias = scratch.binding[Island, "qi_bias"](ctx)
@@ -685,7 +688,7 @@ def dispatch_bq_sliding_attention_qkv[
       q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
       layout.sliding_rope.cos.state_binding(ctx),
       layout.sliding_rope.sin.state_binding(ctx),
-      base_pos, seq_len, pools)
+      base_pos, seq_len, pools, prof)
 
     var partials = scratch.binding[Island, "partials"](ctx)
 
@@ -696,7 +699,7 @@ def dispatch_bq_sliding_attention_qkv[
         partial_stride=Island.PARTIAL_STRIDE, tp=degree,
         max_worker_count=max_worker_count,
     ](q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
-      q_outs, partials, base_pos, seq_len, pools)
+      q_outs, partials, base_pos, seq_len, pools, prof)
 
     var o_i8 = scratch.binding[Island, "o_i8"](ctx)
     var o_sa = scratch.binding[Island, "o_sa"](ctx)
@@ -704,17 +707,17 @@ def dispatch_bq_sliding_attention_qkv[
     dispatch_bq_block_quant[
         cols=q_rows, block=head_dim, apply_fwht=False, tp=degree,
         max_worker_count=max_worker_count,
-    ](q_outs, o_i8, o_sa, seq_len, pools)
+    ](q_outs, o_i8, o_sa, seq_len, pools, prof)
 
     var o_act = ButterquantBlockActivation[degree](o_i8, o_sa)
     var xs = layout.activations.x_residual.state_binding(ctx)
 
     dispatch_bq_block_linear[max_worker_count=max_worker_count](
-        o_act, attn.o_proj.bq_weight(attn_ctx), xs, seq_len, pools)
+        o_act, attn.o_proj.bq_weight(attn_ctx), xs, seq_len, pools, prof)
 
 
 def dispatch_bq_full_attention_qkv[
-    P: BurstThreadPool, //, degree: Int, max_seq_len: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, //, degree: Int, max_seq_len: Int,
     max_worker_count: Int = 128,
 ](
     layout: Gemma4Layout[degree, max_seq_len],
@@ -725,6 +728,7 @@ def dispatch_bq_full_attention_qkv[
     layer_idx: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime S = Gemma4Shapes[degree]
     comptime q_rows = S.FullQ.DATA_N
@@ -747,9 +751,9 @@ def dispatch_bq_full_attention_qkv[
     var k_outs = scratch.binding[Island, "kv"](ctx)
 
     dispatch_bq_linear[max_worker_count=max_worker_count](
-        act, attn.q_proj.bq_weight(attn_ctx), q_outs, seq_len, pools)
+        act, attn.q_proj.bq_weight(attn_ctx), q_outs, seq_len, pools, prof)
     dispatch_bq_linear[max_worker_count=max_worker_count](
-        act, attn.k_proj.bq_weight(attn_ctx), k_outs, seq_len, pools)
+        act, attn.k_proj.bq_weight(attn_ctx), k_outs, seq_len, pools, prof)
 
     var q_i8 = scratch.binding[Island, "q_i8"](ctx)
     var qi_bias = scratch.binding[Island, "qi_bias"](ctx)
@@ -772,7 +776,7 @@ def dispatch_bq_full_attention_qkv[
       q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
       layout.full_rope.cos.state_binding(ctx),
       layout.full_rope.sin.state_binding(ctx),
-      base_pos, seq_len, pools)
+      base_pos, seq_len, pools, prof)
 
     var q_local = scratch.binding[Island, "q_local"](ctx)
     var partials = scratch.binding[Island, "partials"](ctx)
@@ -784,7 +788,7 @@ def dispatch_bq_full_attention_qkv[
         partial_stride=Island.PARTIAL_STRIDE, tp=degree,
         max_worker_count=max_worker_count,
     ](q_i8, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
-      q_local, partials, base_pos, seq_len, pools)
+      q_local, partials, base_pos, seq_len, pools, prof)
 
     var o_i8 = scratch.binding[Island, "o_i8"](ctx)
     var o_sa = scratch.binding[Island, "o_sa"](ctx)
@@ -792,17 +796,17 @@ def dispatch_bq_full_attention_qkv[
     dispatch_bq_block_quant[
         cols=local_q_rows, block=head_dim, apply_fwht=False, tp=degree,
         max_worker_count=max_worker_count,
-    ](q_local, o_i8, o_sa, seq_len, pools)
+    ](q_local, o_i8, o_sa, seq_len, pools, prof)
 
     var o_act = ButterquantBlockActivation[degree](o_i8, o_sa)
     var xs = layout.activations.x_residual.state_binding(ctx)
 
     dispatch_bq_block_linear[max_worker_count=max_worker_count](
-        o_act, attn.o_proj.bq_weight(attn_ctx), xs, seq_len, pools)
+        o_act, attn.o_proj.bq_weight(attn_ctx), xs, seq_len, pools, prof)
 
 
 def dispatch_bq_moe[
-    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
+    P: BurstThreadPool, Profile: Bool, N: Int, //, degree: Int, max_worker_count: Int = 128,
 ](
     body: BodyRefs[degree],
     ctx: BindContext[degree],
@@ -811,6 +815,7 @@ def dispatch_bq_moe[
     seq_len: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime experts_per_rank = C.NUM_EXPERTS // degree
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
@@ -836,7 +841,7 @@ def dispatch_bq_moe[
         experts_per_rank=experts_per_rank, top_k=C.TOP_K, tp=degree,
         max_worker_count=max_worker_count,
     ](x_input, body.router_proj.bq_router(ctx).centered,
-      body.router_scale.binding(ctx), router_scaled, cands, seq_len, pools)
+      body.router_scale.binding(ctx), router_scaled, cands, seq_len, pools, prof)
 
     merge_router_candidates[degree, C.TOP_K](
         cands, per_expert_scale_ptr, route_idx, route_w, seq_len)
@@ -845,7 +850,7 @@ def dispatch_bq_moe[
         hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
         max_worker_count=max_worker_count,
     ](x_input, body.pre_ffn_norm_2.binding(ctx),
-      moe_x_i8, moe_x_sa, seq_len, pools)
+      moe_x_i8, moe_x_sa, seq_len, pools, prof)
 
     build_expert_schedules[degree, experts_per_rank, C.TOP_K](
         route_idx, route_w, expert_offset, routes, seq_len)
@@ -856,13 +861,13 @@ def dispatch_bq_moe[
         inter=C.MOE_INTERMEDIATE, experts_per_rank=experts_per_rank,
         max_worker_count=max_worker_count,
     ](moe_act, expert_offset, routes,
-      body.experts_gate_up.bq_weight(ctx), bucket, pools)
+      body.experts_gate_up.bq_weight(ctx), bucket, pools, prof)
 
     var num_routes = seq_len * C.TOP_K
     dispatch_bq_block_quant[
         cols=C.MOE_INTERMEDIATE, block=C.DOWN_FWHT_BLOCK, apply_fwht=True,
         tp=degree, max_worker_count=max_worker_count,
-    ](bucket, bucket_i8, bucket_sa, num_routes, pools)
+    ](bucket, bucket_i8, bucket_sa, num_routes, pools, prof)
 
     var bucket_act = ButterquantBlockActivation[degree](bucket_i8, bucket_sa)
     dispatch_bq_phase2_down[
@@ -870,15 +875,15 @@ def dispatch_bq_moe[
         experts_per_rank=experts_per_rank,
         max_worker_count=max_worker_count,
     ](bucket_act, expert_offset, routes,
-      body.experts_down.bq_weight(ctx), moe_accum, moe_out, seq_len, pools)
+      body.experts_down.bq_weight(ctx), moe_accum, moe_out, seq_len, pools, prof)
 
     dispatch_allreduce_inplace[
         BF16, degree, max_worker_count=max_worker_count,
-    ](moe_out, seq_len * C.HIDDEN, pools)
+    ](moe_out, seq_len * C.HIDDEN, pools, prof)
 
 
 def dispatch_bq_ffn[
-    P: BurstThreadPool, //, degree: Int, max_worker_count: Int = 128,
+    P: BurstThreadPool, Profile: Bool, N: Int, //, degree: Int, max_worker_count: Int = 128,
 ](
     body: BodyRefs[degree],
     ctx: BindContext[degree],
@@ -887,6 +892,7 @@ def dispatch_bq_ffn[
     seq_len: Int,
     mut scratch: Gemma4ScratchPool[degree, max_worker_count],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
@@ -906,69 +912,71 @@ def dispatch_bq_ffn[
         hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
         max_worker_count=max_worker_count,
     ](x_main, body.pre_ffn_norm.binding(ctx),
-      dense_x_i8, dense_x_sa, seq_len, pools)
+      dense_x_i8, dense_x_sa, seq_len, pools, prof)
 
     var dense_act = ButterquantActivation[degree](dense_x_i8, dense_x_sa)
     dispatch_bq_linear[max_worker_count=max_worker_count](
-        dense_act, body.gate_proj.bq_weight(ctx), gate, seq_len, pools)
+        dense_act, body.gate_proj.bq_weight(ctx), gate, seq_len, pools, prof)
     dispatch_bq_linear[max_worker_count=max_worker_count](
-        dense_act, body.up_proj.bq_weight(ctx), up, seq_len, pools)
+        dense_act, body.up_proj.bq_weight(ctx), up, seq_len, pools, prof)
 
     dispatch_gelu_gate_up[
         intermediate=intermediate_per_rank, tp=degree,
         max_worker_count=max_worker_count,
-    ](gate, up, gate, seq_len, pools)
+    ](gate, up, gate, seq_len, pools, prof)
 
     dispatch_bq_block_quant[
         cols=intermediate_per_rank, block=C.DOWN_FWHT_BLOCK, apply_fwht=True,
         tp=degree, max_worker_count=max_worker_count,
-    ](gate, dense_gate_i8, dense_gate_sa, seq_len, pools)
+    ](gate, dense_gate_i8, dense_gate_sa, seq_len, pools, prof)
 
     dispatch_bq_moe[degree=degree, max_worker_count=max_worker_count](
-        body, ctx, x_main, x_residual, seq_len, scratch, pools)
+        body, ctx, x_main, x_residual, seq_len, scratch, pools, prof)
 
     var dense_gate_act = ButterquantBlockActivation[degree](
         dense_gate_i8, dense_gate_sa)
     dispatch_bq_block_linear[max_worker_count=max_worker_count](
-        dense_gate_act, body.down_proj.bq_weight(ctx), dense_out, seq_len, pools)
+        dense_gate_act, body.down_proj.bq_weight(ctx), dense_out, seq_len, pools, prof)
 
     dispatch_allreduce_inplace[
         BF16, degree, max_worker_count=max_worker_count,
-    ](dense_out, seq_len * C.HIDDEN, pools)
+    ](dense_out, seq_len * C.HIDDEN, pools, prof)
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
         max_worker_count=max_worker_count,
-    ](dense_out, dense_out, body.post_ffn_norm_1.binding(ctx), seq_len, pools)
+    ](dense_out, dense_out, body.post_ffn_norm_1.binding(ctx), seq_len, pools, prof)
 
     fused_norm_residual_add[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
         max_worker_count=max_worker_count,
     ](x_residual, dense_out, dense_out,
-      body.post_ffn_norm_2.binding(ctx), seq_len, pools)
+      body.post_ffn_norm_2.binding(ctx), seq_len, pools, prof)
 
     fused_norm_residual_add[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=degree,
         max_worker_count=max_worker_count,
     ](dense_out, x_main, x_main,
-      body.post_ffn_norm.binding(ctx), seq_len, pools)
+      body.post_ffn_norm.binding(ctx), seq_len, pools, prof)
 
     var ls_value = layer_scalar_ptr[0].cast[DType.float32]()
     dispatch_scalar_mul[
         hidden=C.HIDDEN, tp=degree, max_worker_count=max_worker_count,
-    ](x_main, x_main, ls_value, seq_len, pools)
+    ](x_main, x_main, ls_value, seq_len, pools, prof)
 
 
 struct Gemma4[
     degree: Int, max_seq_len: Int = 8192,
     max_worker_count: Int = 128,
     Pool: BurstThreadPool = BurstPool[],
+    profile: Bool = False, profile_slots: Int = 64,
 ](Movable):
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
     var layout: Gemma4Layout[Self.degree, Self.max_seq_len]
     var scratch: Gemma4ScratchPool[Self.degree, Self.max_worker_count]
     var arena_bases: ArenaBases[Self.degree]
+    var profiler: Profiler[Self.profile, Self.profile_slots]
 
     def __init__(out self,
         var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
@@ -985,6 +993,7 @@ struct Gemma4[
             Self.degree, Self.max_worker_count,
     ](
             self.layout.arena.scratch_base())
+        self.profiler = Profiler[Self.profile, Self.profile_slots]()
 
     def init_state(mut self):
         var tasks = List[PackColsumTask]()
@@ -1004,9 +1013,10 @@ struct Gemma4[
         var nodes = InlineArray[Int, Self.degree](uninitialized=True)
         for r in range(Self.degree):
             nodes[r] = self.arenas[r].node
+        var noprof = Profiler[False]()  # one-time setup, not part of forward profiling
         dispatch_pack_colsum[
             Self.degree, max_worker_count=Self.max_worker_count,
-        ](self.pools, self.arena_bases, nodes, tasks)
+        ](self.pools, noprof, self.arena_bases, nodes, tasks)
 
     def model_init(mut self):
         ref layout = self.layout
@@ -1071,6 +1081,7 @@ struct Gemma4[
         comptime FS = Gemma4FullScratch[Self.degree, Self.max_worker_count]
         comptime HS = Gemma4HeadScratch[Self.degree]
 
+        var wall_t0 = perf_counter_ns()
         var total_len = len(token_ids)
         debug_assert(total_len > 0, "forward called with empty token_ids")
         debug_assert(
@@ -1099,10 +1110,10 @@ struct Gemma4[
                 scale=embed_scale, shard_rows=shard_rows,
                 max_worker_count=Self.max_worker_count,
             ](chunk, layout.tail.proto.embed.bq_weight(tail_ctx),
-              x_main_ranks, chunk_len, self.pools)
+              x_main_ranks, chunk_len, self.pools, self.profiler)
             dispatch_allreduce_inplace[
                 BF16, Self.degree, max_worker_count=Self.max_worker_count,
-            ](x_main_ranks, chunk_len * C.HIDDEN, self.pools)
+            ](x_main_ranks, chunk_len * C.HIDDEN, self.pools, self.profiler)
 
             for i in range(C.NUM_LAYERS):
                 var entry = LAYER_SCHEDULE[i]
@@ -1118,14 +1129,14 @@ struct Gemma4[
                         hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps,
                         tp=Self.degree, max_worker_count=Self.max_worker_count,
                     ](x_main_ranks, body.input_norm.binding(layer_ctx),
-                      fx_i8, fx_sa, chunk_len, self.pools)
+                      fx_i8, fx_sa, chunk_len, self.pools, self.profiler)
                     var full_act = ButterquantActivation[Self.degree](
                         fx_i8, fx_sa)
                     dispatch_bq_full_attention_qkv[
                         degree=Self.degree, max_seq_len=Self.max_seq_len,
                         max_worker_count=Self.max_worker_count,
                     ](layout, ctx, full_act, pos, chunk_len, entry.local_idx,
-                      self.scratch, self.pools)
+                      self.scratch, self.pools, self.profiler)
                 else:
                     layer_ctx = ctx.with_layer(
                         layout.sliding.base(
@@ -1137,29 +1148,29 @@ struct Gemma4[
                         hidden=C.HIDDEN, block=128, sqrt_n=sqrt_n, n_eps=n_eps,
                         tp=Self.degree, max_worker_count=Self.max_worker_count,
                     ](x_main_ranks, body.input_norm.binding(layer_ctx),
-                      sx_i8, sx_sa, chunk_len, self.pools)
+                      sx_i8, sx_sa, chunk_len, self.pools, self.profiler)
                     var sl_act = ButterquantActivation[Self.degree](
                         sx_i8, sx_sa)
                     dispatch_bq_sliding_attention_qkv[
                         degree=Self.degree, max_seq_len=Self.max_seq_len,
                         max_worker_count=Self.max_worker_count,
                     ](layout, ctx, sl_act, pos, chunk_len, entry.local_idx,
-                      self.scratch, self.pools)
+                      self.scratch, self.pools, self.profiler)
 
                 dispatch_allreduce_inplace[
                     BF16, Self.degree, max_worker_count=Self.max_worker_count,
-                ](xs, chunk_len * C.HIDDEN, self.pools)
+                ](xs, chunk_len * C.HIDDEN, self.pools, self.profiler)
 
                 fused_norm_residual_add[
                     hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps, tp=Self.degree,
                     max_worker_count=Self.max_worker_count,
                 ](xs, x_main_ranks, x_main_ranks,
-                  body.post_attn_norm.binding(layer_ctx), chunk_len, self.pools)
+                  body.post_attn_norm.binding(layer_ctx), chunk_len, self.pools, self.profiler)
 
                 dispatch_bq_ffn[
                     degree=Self.degree, max_worker_count=Self.max_worker_count,
                 ](body, layer_ctx, x_main_ranks, xs, chunk_len,
-                  self.scratch, self.pools)
+                  self.scratch, self.pools, self.profiler)
 
             if is_last:
                 var x_last = x_main_ranks.shifted((chunk_len - 1) * C.HIDDEN)
@@ -1177,11 +1188,12 @@ struct Gemma4[
                     cap=C.LOGIT_SOFTCAP,
                     max_worker_count=Self.max_worker_count,
                 ](head_act, layout.tail.proto.embed.bq_weight(tail_ctx),
-                  logits, self.pools)
+                  logits, self.pools, self.profiler)
 
             consumed += chunk_len
             pos += chunk_len
 
+        self.profiler.add_wall(Int(perf_counter_ns() - wall_t0))
         return TemporalLogitsView[C.VOCAB_SIZE, Self.degree](
             logits.ptr, self.arena_bases)
 

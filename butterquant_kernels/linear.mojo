@@ -4,6 +4,7 @@ from kernels.helpers import (
     saturate_workers, BF16Ptr,
 )
 from kernels.dispatch_heuristics import NORM_INLINE_TOKENS, GEMV_INLINE_ROWS
+from kernels.profiling import Profiler
 
 from butterquant.runtime import (
     prepare_norm_activation_per_row, prepare_block_activation,
@@ -44,7 +45,7 @@ struct BqNormQuantKernel[
 
 
 def dispatch_bq_norm_quant[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     hidden: Int, block: Int, sqrt_n: Float32, n_eps: Float32, tp: Int,
     max_worker_count: Int = 128,
 ](
@@ -54,6 +55,7 @@ def dispatch_bq_norm_quant[
     x_sa: Binding[Float32, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime Kern = BqNormQuantKernel[hidden, block, sqrt_n, n_eps]
 
@@ -61,8 +63,8 @@ def dispatch_bq_norm_quant[
     def make(r: Int) -> Kern:
         return Kern(src[r], gamma[r], x_i8[r], x_sa[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * hidden * 6,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_norm_quant"](
+        pools, prof, seq_len, seq_len * hidden * 6,
         inline_threshold_bytes=NORM_INLINE_TOKENS * hidden * 6)
 
 
@@ -94,7 +96,8 @@ struct BqLinearKernel[
 
 
 def dispatch_bq_linear[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int, //,
+    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    Profile: Bool, N: Int, //,
     MR: Int = 4, max_worker_count: Int = 128,
 ](
     act: ButterquantActivation[tp],
@@ -102,6 +105,7 @@ def dispatch_bq_linear[
     output: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_vnni_packed[quant](), "bq linear consumes a VNNI-packed weight"
     comptime assert quant_has_colsum[quant](), "bq linear requires a colsum sidecar"
@@ -116,8 +120,8 @@ def dispatch_bq_linear[
         return Kern(act.data[r], act.scale[r], weight.data[r], weight.scale[r],
                     cs[r], output[r], seq_len, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, num_tiles, seq_len * m + n * m,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_linear"](
+        pools, prof, num_tiles, seq_len * m + n * m,
         inline_threshold_bytes=GEMV_INLINE_ROWS * m)
 
 
@@ -145,7 +149,7 @@ struct BqBlockQuantKernel[cols: Int, block: Int, apply_fwht: Bool](
 
 
 def dispatch_bq_block_quant[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     cols: Int, block: Int, apply_fwht: Bool, tp: Int,
     max_worker_count: Int = 128,
 ](
@@ -154,6 +158,7 @@ def dispatch_bq_block_quant[
     x_sa: Binding[Float32, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime Kern = BqBlockQuantKernel[cols, block, apply_fwht]
 
@@ -161,8 +166,8 @@ def dispatch_bq_block_quant[
     def make(r: Int) -> Kern:
         return Kern(src[r], x_i8[r], x_sa[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * cols * 6,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_block_quant"](
+        pools, prof, seq_len, seq_len * cols * 6,
         inline_threshold_bytes=NORM_INLINE_TOKENS * cols * 6)
 
 
@@ -192,7 +197,8 @@ struct BqBlockLinearKernel[N: Int, K: Int, block: Int, MR: Int](
 
 
 def dispatch_bq_block_linear[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int, //,
+    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    Profile: Bool, N: Int, //,
     MR: Int = 4, max_worker_count: Int = 128,
 ](
     act: ButterquantBlockActivation[tp],
@@ -200,6 +206,7 @@ def dispatch_bq_block_linear[
     output: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_vnni_packed[quant](), "bq block linear consumes a VNNI-packed weight"
     comptime assert quant_colsum_per_block[quant](), "bq block linear requires a per-block colsum sidecar"
@@ -214,13 +221,14 @@ def dispatch_bq_block_linear[
         return Kern(act.data[r], act.scale[r], weight.data[r], weight.scale[r],
                     cs[r], output[r], seq_len, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, num_tiles, seq_len * m + n * m,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_block_linear"](
+        pools, prof, num_tiles, seq_len * m + n * m,
         inline_threshold_bytes=GEMV_INLINE_ROWS * m)
 
 
 def dispatch_bq_qkv[
-    P: BurstThreadPool, quant: QuantRecipe, qn: Int, kvn: Int, m: Int, tp: Int, //,
+    P: BurstThreadPool, quant: QuantRecipe, qn: Int, kvn: Int, m: Int, tp: Int,
+    Profile: Bool, N: Int, //,
     MR: Int = 4, max_worker_count: Int = 128,
 ](
     act: ButterquantActivation[tp],
@@ -232,6 +240,7 @@ def dispatch_bq_qkv[
     v_out: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_vnni_packed[quant](), "bq qkv consumes VNNI-packed weights"
     comptime assert quant_has_colsum[quant](), "bq qkv requires colsum sidecars"
@@ -267,4 +276,5 @@ def dispatch_bq_qkv[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, total_tiles, seq_len * m + (qn + kvn + kvn) * m)
+        label="bq_qkv",
+    ](pools, prof, total_tiles, seq_len * m + (qn + kvn + kvn) * m)

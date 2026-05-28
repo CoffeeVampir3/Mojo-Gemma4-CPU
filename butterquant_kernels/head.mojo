@@ -4,6 +4,7 @@ from kernels.helpers import (
 )
 from kernels.dispatch_heuristics import GEMV_INLINE_ROWS
 from kernels.gemv import softcap_value
+from kernels.profiling import Profiler
 
 from butterquant.convert import store_bf16
 from butterquant.dot_products import head_logit_row
@@ -58,7 +59,8 @@ struct BqHeadGemvKernel[
 
 
 def dispatch_bq_head_gemv[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int, //,
+    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    Profile: Bool, N: Int, //,
     cap: Float64,
     max_worker_count: Int = 128,
 ](
@@ -66,6 +68,7 @@ def dispatch_bq_head_gemv[
     weight: ButterquantWeight[quant, n, m, tp],
     output: Binding[BFloat16, tp],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_per_block[quant](), "head GEMV consumes a per-block weight scale"
     comptime K = BqHeadGemvKernel[n, m, quant_k_block[quant](), cap]
@@ -75,6 +78,6 @@ def dispatch_bq_head_gemv[
         return K(act.data[r], act.scale[r], weight.data[r], weight.scale[r],
                  output[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, n, n * m,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_head_gemv"](
+        pools, prof, n, n * m,
         inline_threshold_bytes=GEMV_INLINE_ROWS * m)

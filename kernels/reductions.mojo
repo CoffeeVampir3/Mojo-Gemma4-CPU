@@ -9,6 +9,7 @@ from .helpers import (
     RangePartitionedKernel, RankBuffers, DispatchBuffer, Binding,
     join_all, tile_dispatch, recommended_workers,
 )
+from .profiling import Profiler, DispatchSpan
 
 
 comptime DEFAULT_INLINE_BYTES = 16384
@@ -120,13 +121,15 @@ def gather_chunks[E: Encoding, tp: Int, src_origin: ImmutOrigin](
 
 
 def dispatch_allreduce[
-    P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin, //,
+    P: BurstThreadPool, src_origin: ImmutOrigin, dst_origin: MutOrigin,
+    Profile: Bool, N: Int, //,
     E: Encoding, tp: Int, Accum: DType = DType.float32,
     max_worker_count: Int = 128,
 ](
     src: RankBuffers[E.DTYPE, tp, src_origin],
     output: RankBuffers[E.DTYPE, tp, dst_origin],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
     inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
 ):
     if src.count <= 0:
@@ -143,13 +146,16 @@ def dispatch_allreduce[
     comptime cfg_ro = ImmutOrigin(origin_of(cfg))
 
     if src.count * E.ELEMENT_BYTES <= inline_max_bytes or tp <= 1:
+        var inline_span = DispatchSpan[Profile]()
         reduce_store_range[E, tp, src_origin, Accum](config, 0, 0, src.count)
         for r in range(1, tp):
             if config[].dst[r] != config[].dst[0]:
                 memcpy(dest=config[].dst[r], src=config[].dst[0], count=src.count)
+        inline_span.finish_inline(prof, "allreduce")
         return
 
     var data_bytes = src.count * E.ELEMENT_BYTES
+    var reduce_span = DispatchSpan[Profile]()
     var reduce_buf = DispatchBuffer[
         ReduceStoreKernel[E, tp, src_origin, cfg_ro, Accum],
         max_worker_count,
@@ -164,8 +170,11 @@ def dispatch_allreduce[
         _ = tile_dispatch(reduce_buf,
             ReduceStoreKernel[E, tp, src_origin, cfg_ro, Accum](config, r, 0, 0),
             pools[r], rank_count, rank_start, nw)
+    reduce_span.issued()
     join_all[tp](pools)
+    reduce_span.finish[tp](prof, pools, "allreduce.reduce")
 
+    var gather_span = DispatchSpan[Profile]()
     var gather_buf = DispatchBuffer[
         GatherKernel[E, tp, src_origin, cfg_ro], max_worker_count,
     ]()
@@ -175,17 +184,20 @@ def dispatch_allreduce[
         _ = tile_dispatch(gather_buf,
             GatherKernel[E, tp, src_origin, cfg_ro](config, r, 0, 0),
             pools[r], src.count, num_workers=nw)
+    gather_span.issued()
     join_all[tp](pools)
+    gather_span.finish[tp](prof, pools, "allreduce.gather")
 
 
 @always_inline
 def dispatch_allreduce_inplace[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     E: Encoding, tp: Int, Accum: DType = DType.float32,
     max_worker_count: Int = 128,
 ](
     buf: Binding[Scalar[E.DTYPE], tp], count: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
     inline_max_bytes: Int = DEFAULT_INLINE_BYTES,
 ):
     """In-place allreduce: each rank's `buf` is both source and destination."""
@@ -196,4 +208,4 @@ def dispatch_allreduce_inplace[
         src.ptrs[r] = buf[r].as_immutable()
         dst.ptrs[r] = buf[r]
     dispatch_allreduce[E, tp, Accum, max_worker_count=max_worker_count](
-        src, dst, pools, inline_max_bytes=inline_max_bytes)
+        src, dst, pools, prof, inline_max_bytes=inline_max_bytes)

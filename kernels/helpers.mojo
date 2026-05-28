@@ -7,6 +7,7 @@ from threading.threading_traits import BurstKernel, BurstThreadPool
 from .dispatch_heuristics import (
     DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES,
 )
+from .profiling import Profiler, DispatchSpan
 
 
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
@@ -232,37 +233,43 @@ def saturate_workers(data_bytes: Int, capacity: Int) -> Int:
 
 
 def fanout_dispatch[
-    K: OutputPartitionedKernel, P: BurstThreadPool, //,
+    K: OutputPartitionedKernel, P: BurstThreadPool, Profile: Bool, N: Int, //,
     tp: Int,
     proto_for: def(Int) capturing [_] -> K,
     max_worker_count: Int = 128,
     worker_policy: def(
         data_bytes: Int, capacity: Int,
     ) thin -> Int = recommended_workers,
+    label: StaticString = "?",
 ](
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
     total: Int,
     data_bytes: Int,
     inline_threshold_bytes: Int = -1,
 ):
     if total <= 0:
         return
+    var span = DispatchSpan[Profile]()
     if inline_threshold_bytes >= 0 and data_bytes <= inline_threshold_bytes:
         for r in range(tp):
             var k = proto_for(r)
             k.set_partition(0, 0, total)
             k.execute()
+        span.finish_inline(prof, label)
         return
     var buf = DispatchBuffer[K, max_worker_count]()
     for r in range(tp):
         var cap = min(max_worker_count, pools[r].get_capacity())
         _ = tile_dispatch(buf, proto_for(r), pools[r], total,
             num_workers=worker_policy(data_bytes, cap))
+    span.issued()
     join_all[tp](pools)
+    span.finish[tp](prof, pools, label)
 
 
 def fanout_dispatch_per_rank[
-    K: OutputPartitionedKernel, P: BurstThreadPool, //,
+    K: OutputPartitionedKernel, P: BurstThreadPool, Profile: Bool, N: Int, //,
     tp: Int,
     proto_for: def(Int) capturing [_] -> K,
     total_for: def(Int) capturing [_] -> Int,
@@ -271,10 +278,13 @@ def fanout_dispatch_per_rank[
     worker_policy: def(
         data_bytes: Int, capacity: Int,
     ) thin -> Int = recommended_workers,
+    label: StaticString = "?",
 ](
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ) -> InlineArray[Int, tp]:
     var nws = InlineArray[Int, tp](fill=0)
+    var span = DispatchSpan[Profile]()
     var buf = DispatchBuffer[K, max_worker_count]()
     for r in range(tp):
         var total = total_for(r)
@@ -284,5 +294,7 @@ def fanout_dispatch_per_rank[
         var nw = worker_policy(data_bytes_for(r), cap)
         nws[r] = tile_dispatch(
             buf, proto_for(r), pools[r], total, num_workers=nw)
+    span.issued()
     join_all[tp](pools)
+    span.finish[tp](prof, pools, label)
     return nws

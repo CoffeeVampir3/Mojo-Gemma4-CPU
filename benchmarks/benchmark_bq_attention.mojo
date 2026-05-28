@@ -12,6 +12,7 @@ from kernels.helpers import Binding, ArenaBases, fanout_dispatch_per_rank
 from kernels.logsum_merge import (
     dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
 )
+from kernels.profiling import Profiler
 from butterquant_kernels import BqFlashAttentionKernel
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -119,15 +120,16 @@ def dispatch_bq_sliding_attention[P: BurstThreadPool, //, tp: Int](
     def bytes_for(r: Int) -> Int:
         return valid_len * SLIDING_KV_STRIDE * 2
 
+    var prof = Profiler[False]()
     var nws = fanout_dispatch_per_rank[
         tp, make_decode, total_for, bytes_for,
         max_worker_count=MAX_WORKERS,
-    ](pools)
+    ](pools, prof)
 
     dispatch_merge_flash_partials[
         head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
         partial_stride=pstride, tp=tp, max_worker_count=MAX_WORKERS,
-    ](output, partials, nws, pools)
+    ](output, partials, nws, pools, prof)
 
 
 def dispatch_bq_full_attention[P: BurstThreadPool, //, tp: Int](
@@ -170,16 +172,17 @@ def dispatch_bq_full_attention[P: BurstThreadPool, //, tp: Int](
     def bytes_for(r: Int) -> Int:
         return valid_lens[r] * FULL_KV_STRIDE * 2
 
+    var prof = Profiler[False]()
     var nws = fanout_dispatch_per_rank[
         tp, make_decode, total_for, bytes_for,
         max_worker_count=MAX_WORKERS,
-    ](pools)
+    ](pools, prof)
 
     dispatch_merge_context_flash_partials[
         head_dim=FULL_HEAD_DIM, num_q=FULL_GLOBAL_NUM_Q,
         local_num_q=local_num_q,
         partial_stride=pstride, tp=tp, max_worker_count=MAX_WORKERS,
-    ](output, partials, nws, pools)
+    ](output, partials, nws, pools, prof)
 
 
 def fill_i8(ptr: I8Ptr, count: Int, phase: Int):

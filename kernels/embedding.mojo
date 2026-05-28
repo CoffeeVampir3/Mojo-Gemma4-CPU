@@ -8,6 +8,7 @@ from .helpers import (
     BF16Ptr, W,
 )
 from .dispatch_heuristics import EMBED_INLINE_TOKENS
+from .profiling import Profiler
 
 
 @always_inline
@@ -62,7 +63,7 @@ struct EmbedLookupKernel[
 
 
 def dispatch_embed_lookup[
-    P: BurstThreadPool, tok_origin: ImmutOrigin, //,
+    P: BurstThreadPool, tok_origin: ImmutOrigin, Profile: Bool, N: Int, //,
     hidden: Int, scale: Float64, shard_rows: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
@@ -71,6 +72,7 @@ def dispatch_embed_lookup[
     dst: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     """Unowned tokens write zero; caller follows with allreduce to replicate."""
     comptime K = EmbedLookupKernel[tok_origin, hidden, scale, shard_rows]
@@ -79,6 +81,6 @@ def dispatch_embed_lookup[
     def make(r: Int) -> K:
         return K(token_ids, embed[r], dst[r], r, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * hidden * 6,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="embed_lookup"](
+        pools, prof, seq_len, seq_len * hidden * 6,
         inline_threshold_bytes=EMBED_INLINE_TOKENS * hidden * 6)

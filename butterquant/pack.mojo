@@ -7,6 +7,7 @@ from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
     ArenaBases, WorkerRangePartitionedKernel, fanout_dispatch, saturate_workers,
 )
+from kernels.profiling import Profiler
 from modeling.model_spec import ShapeLike
 
 from butterquant.vnni import (
@@ -63,10 +64,11 @@ struct PackColsumKernel[tasks_origin: ImmutOrigin](WorkerRangePartitionedKernel)
 
 
 def dispatch_pack_colsum[
-    P: BurstThreadPool, //, tp: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, //, tp: Int,
     max_worker_count: Int = 128,
 ](
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
     arena_bases: ArenaBases[tp],
     nodes: InlineArray[Int, tp],
     tasks: List[PackColsumTask],
@@ -97,6 +99,7 @@ def dispatch_pack_colsum[
         tp, proto_for,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, num_tasks, num_tasks * L2_TARGET)
+        label="pack_colsum",
+    ](pools, prof, num_tasks, num_tasks * L2_TARGET)
 
     _ = scratch^

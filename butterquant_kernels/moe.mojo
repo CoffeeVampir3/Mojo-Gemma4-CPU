@@ -8,6 +8,7 @@ from kernels.helpers import (
     BF16Ptr, I32Ptr,
 )
 from kernels.moe_router import SparseRoute, SparseRoutePtr
+from kernels.profiling import Profiler
 
 from butterquant.convert import store_bf16
 from butterquant.gemm import accumulate_n_step, accumulate_n_step_gathered
@@ -121,7 +122,8 @@ struct BqPhase1GateUpKernel[
 
 
 def dispatch_bq_phase1_gate_up[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int, //,
+    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    Profile: Bool, N: Int, //,
     hidden: Int, gate_up: Int, inter: Int, experts_per_rank: Int,
     MR: Int = 4, max_worker_count: Int = 128,
 ](
@@ -131,6 +133,7 @@ def dispatch_bq_phase1_gate_up[
     experts_gate_up: ButterquantWeight[quant, n, m, tp],
     hidden_bucket: Binding[BFloat16, tp],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_vnni_packed[quant](), "bq phase1 consumes VNNI-packed experts"
     comptime assert quant_has_colsum[quant](), "bq phase1 requires a colsum sidecar"
@@ -151,7 +154,8 @@ def dispatch_bq_phase1_gate_up[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, total_units, total_units * hidden * 2)
+        label="bq_phase1_gate_up",
+    ](pools, prof, total_units, total_units * hidden * 2)
 
 
 @always_inline
@@ -285,7 +289,8 @@ struct BqPhase2DownKernel[
 
 
 def dispatch_bq_phase2_down[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int, //,
+    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    Profile: Bool, N: Int, //,
     hidden: Int, inter: Int, experts_per_rank: Int,
     MR: Int = 4, max_worker_count: Int = 128,
 ](
@@ -297,6 +302,7 @@ def dispatch_bq_phase2_down[
     moe_partial: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_vnni_packed[quant](), "bq phase2 consumes VNNI-packed experts"
     comptime assert quant_colsum_per_block[quant](), "bq phase2 requires a per-block colsum"
@@ -319,4 +325,5 @@ def dispatch_bq_phase2_down[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, n_tiles, seq_len * hidden * 2 + n * m)
+        label="bq_phase2_down",
+    ](pools, prof, n_tiles, seq_len * hidden * 2 + n * m)

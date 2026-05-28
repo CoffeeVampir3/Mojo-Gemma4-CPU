@@ -10,6 +10,7 @@ from .helpers import (
 from .dispatch_heuristics import (
     GELU_GATE_UP_INLINE_TOKENS, SCALAR_MUL_INLINE_TOKENS,
 )
+from .profiling import Profiler
 
 
 @always_inline
@@ -46,7 +47,7 @@ struct GeluGateUpTokenKernel[intermediate: Int](RangePartitionedKernel):
 
 
 def dispatch_gelu_gate_up[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     intermediate: Int, tp: Int, max_worker_count: Int = 128,
 ](
     gate: Binding[BFloat16, tp],
@@ -54,6 +55,7 @@ def dispatch_gelu_gate_up[
     dst: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = GeluGateUpTokenKernel[intermediate]
 
@@ -61,8 +63,8 @@ def dispatch_gelu_gate_up[
     def make(r: Int) -> K:
         return K(gate[r], up[r], dst[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * intermediate * 6,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="gelu_gate_up"](
+        pools, prof, seq_len, seq_len * intermediate * 6,
         inline_threshold_bytes=GELU_GATE_UP_INLINE_TOKENS * intermediate * 6)
 
 
@@ -99,7 +101,7 @@ struct ScalarMulTokenKernel[hidden: Int](RangePartitionedKernel):
 
 
 def dispatch_scalar_mul[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     hidden: Int, tp: Int, max_worker_count: Int = 128,
 ](
     src: Binding[BFloat16, tp],
@@ -107,6 +109,7 @@ def dispatch_scalar_mul[
     scalar: Float32,
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = ScalarMulTokenKernel[hidden]
 
@@ -114,6 +117,6 @@ def dispatch_scalar_mul[
     def make(r: Int) -> K:
         return K(src[r], dst[r], scalar, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * hidden * 4,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="scalar_mul"](
+        pools, prof, seq_len, seq_len * hidden * 4,
         inline_threshold_bytes=SCALAR_MUL_INLINE_TOKENS * hidden * 4)

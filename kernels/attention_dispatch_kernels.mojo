@@ -13,6 +13,7 @@ from .flash_attention_prefill import (
 from .logsum_merge import (
     dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
 )
+from .profiling import Profiler
 
 
 @always_inline
@@ -23,7 +24,7 @@ def sliding_valid_len(pos: Int, window: Int) -> Int:
 
 
 def dispatch_sliding_attention[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     kv_stride: Int, window: Int, cache_size: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
@@ -36,6 +37,7 @@ def dispatch_sliding_attention[
     base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
@@ -65,12 +67,13 @@ def dispatch_sliding_attention[
         var nws = fanout_dispatch_per_rank[
             tp, make_decode, total_for, bytes_for,
             max_worker_count=max_worker_count,
-        ](pools)
+            label="sliding_attn.flash",
+        ](pools, prof)
 
         dispatch_merge_flash_partials[
             head_dim, num_q, partial_stride, tp=tp,
             max_worker_count=max_worker_count,
-        ](output, partials, nws, pools)
+        ](output, partials, nws, pools, prof)
     else:
         comptime PrefillK = FlashPrefillSlidingKernel[
             head_dim, num_q, gqa_ratio, kv_stride, window, cache_size,
@@ -87,11 +90,12 @@ def dispatch_sliding_attention[
 
         fanout_dispatch[
             tp, make_prefill, max_worker_count=max_worker_count,
-        ](pools, seq_len, data_bytes)
+            label="sliding_attn.prefill",
+        ](pools, prof, seq_len, data_bytes)
 
 
 def dispatch_full_attention[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, local_num_q: Int, gqa_ratio: Int,
     kv_stride: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
@@ -104,6 +108,7 @@ def dispatch_full_attention[
     base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     """`q_local_output` is the per-rank merged attention output, feeding the
     column-sharded o_proj."""
@@ -134,13 +139,14 @@ def dispatch_full_attention[
         var nws = fanout_dispatch_per_rank[
             tp, make_decode, total_for, bytes_for,
             max_worker_count=max_worker_count,
-        ](pools)
+            label="full_attn.flash",
+        ](pools, prof)
 
         dispatch_merge_context_flash_partials[
             head_dim=head_dim, num_q=num_q,
             local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
             max_worker_count=max_worker_count,
-        ](q_local_output, partials, nws, pools)
+        ](q_local_output, partials, nws, pools, prof)
     else:
         comptime PrefillK = FlashPrefillFullKernel[
             head_dim, num_q, gqa_ratio, kv_stride, tp, partial_stride,
@@ -156,10 +162,11 @@ def dispatch_full_attention[
 
         fanout_dispatch[
             tp, make_prefill, max_worker_count=max_worker_count,
-        ](pools, seq_len, data_bytes)
+            label="full_attn.prefill",
+        ](pools, prof, seq_len, data_bytes)
 
         dispatch_merge_flash_prefill_partials[
             head_dim=head_dim, num_q=num_q,
             local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
             max_worker_count=max_worker_count,
-        ](q_local_output, partials, seq_len, pools)
+        ](q_local_output, partials, seq_len, pools, prof)

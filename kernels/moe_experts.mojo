@@ -9,6 +9,7 @@ from .helpers import (
 )
 from .dot_products import bf16_panel_dot_to_scalars
 from .moe_router import SparseRoute, SparseRoutePtr
+from .profiling import Profiler
 
 
 @always_inline
@@ -152,7 +153,7 @@ struct Phase1GateUpKernel[
 
 
 def dispatch_phase1_gate_up[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     hidden: Int, gate_up_fused: Int, intermediate: Int,
     experts_per_rank: Int, tp: Int,
     tile_j: Int = 64, MR: Int = 4, max_worker_count: Int = 128,
@@ -164,6 +165,7 @@ def dispatch_phase1_gate_up[
     gate_scratch: Binding[Float32, tp],
     hidden_bucket: Binding[BFloat16, tp],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = Phase1GateUpKernel[
         hidden, gate_up_fused, intermediate, experts_per_rank, tile_j, MR,
@@ -181,7 +183,8 @@ def dispatch_phase1_gate_up[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, total_units, total_units * hidden * 2)
+        label="phase1_gate_up",
+    ](pools, prof, total_units, total_units * hidden * 2)
 
 
 @always_inline
@@ -306,7 +309,7 @@ struct Phase2DownKernel[
 
 
 def dispatch_phase2_down[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     hidden: Int, intermediate: Int, experts_per_rank: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
@@ -318,6 +321,7 @@ def dispatch_phase2_down[
     moe_partial: Binding[BFloat16, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = Phase2DownKernel[hidden, intermediate, experts_per_rank]
     comptime hidden_strides = hidden // W
@@ -332,4 +336,5 @@ def dispatch_phase2_down[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
-    ](pools, hidden_strides, seq_len * hidden * 2)
+        label="phase2_down",
+    ](pools, prof, hidden_strides, seq_len * hidden * 2)

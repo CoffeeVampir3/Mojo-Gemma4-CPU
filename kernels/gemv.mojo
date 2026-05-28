@@ -7,6 +7,7 @@ from .helpers import (
 )
 from .dispatch_heuristics import GEMV_INLINE_ROWS
 from .dot_products import dot_to_scalar
+from .profiling import Profiler
 
 
 @always_inline
@@ -54,7 +55,7 @@ struct GemvSoftcapKernel[
 
 
 def dispatch_gemv_softcap[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     rows: Int, cols: Int, tp: Int, cap: Float64,
     max_worker_count: Int = 128,
 ](
@@ -62,6 +63,7 @@ def dispatch_gemv_softcap[
     weight: Binding[BFloat16, tp],
     output: Binding[BFloat16, tp],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = GemvSoftcapKernel[rows, cols, cap]
 
@@ -69,6 +71,6 @@ def dispatch_gemv_softcap[
     def make(r: Int) -> K:
         return K(x[r], weight[r], output[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, rows, rows * cols * 2,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="gemv_softcap"](
+        pools, prof, rows, rows * cols * 2,
         inline_threshold_bytes=GEMV_INLINE_ROWS * cols * 2)

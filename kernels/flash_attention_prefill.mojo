@@ -12,6 +12,7 @@ from .attention_ops import (
     zero_accumulators,
 )
 from .logsum_merge import MergeSegment, write_finalized_head
+from .profiling import Profiler
 
 
 @fieldwise_init
@@ -195,7 +196,7 @@ struct PrefillMergeKernel[
 
 
 def dispatch_merge_flash_prefill_partials[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, local_num_q: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
@@ -203,6 +204,7 @@ def dispatch_merge_flash_prefill_partials[
     partials: Binding[Float32, tp],
     seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
@@ -221,5 +223,7 @@ def dispatch_merge_flash_prefill_partials[
     var total_units = seq_len * local_num_q
     var data_bytes = total_units * tp * (head_dim + 2) * 4
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, total_units, data_bytes)
+    fanout_dispatch[
+        tp, make, max_worker_count=max_worker_count,
+        label="merge_flash_prefill_partials",
+    ](pools, prof, total_units, data_bytes)
