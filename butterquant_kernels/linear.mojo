@@ -2,7 +2,7 @@ from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
     Chain, RangePartitionedKernel, WorkerRangePartitionedKernel,
     Binding, fanout_dispatch,
-    saturate_workers, BF16Ptr,
+    matmul_workers, BF16Ptr,
 )
 from kernels.dispatch_heuristics import NORM_INLINE_TOKENS, GEMV_INLINE_ROWS
 from kernels.profiling import Profiler
@@ -132,9 +132,11 @@ def dispatch_bq_linear[
         return Kern(act.data[r], act.scale[r], weight.data[r], weight.scale[r],
                     cs[r], output[r], seq_len, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_linear"](
-        pools, prof, num_tiles, seq_len * m + n * m,
-        inline_threshold_bytes=GEMV_INLINE_ROWS * m)
+    fanout_dispatch[
+        tp, make, max_worker_count=max_worker_count,
+        worker_policy=matmul_workers, label="bq_linear",
+    ](pools, prof, num_tiles, n * m * seq_len,
+      inline_threshold_bytes=GEMV_INLINE_ROWS * m)
 
 
 @fieldwise_init
@@ -242,9 +244,11 @@ def dispatch_bq_block_linear[
         return Kern(act.data[r], act.scale[r], weight.data[r], weight.scale[r],
                     cs[r], output[r], seq_len, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_block_linear"](
-        pools, prof, num_tiles, seq_len * m + n * m,
-        inline_threshold_bytes=GEMV_INLINE_ROWS * m)
+    fanout_dispatch[
+        tp, make, max_worker_count=max_worker_count,
+        worker_policy=matmul_workers, label="bq_block_linear",
+    ](pools, prof, num_tiles, n * m * seq_len,
+      inline_threshold_bytes=GEMV_INLINE_ROWS * m)
 
 
 def dispatch_bq_qkv[
@@ -296,6 +300,6 @@ def dispatch_bq_qkv[
     fanout_dispatch[
         tp, make,
         max_worker_count=max_worker_count,
-        worker_policy=saturate_workers,
+        worker_policy=matmul_workers,
         label="bq_qkv",
-    ](pools, prof, total_tiles, seq_len * m + (qn + kvn + kvn) * m)
+    ](pools, prof, total_tiles, (qn + kvn + kvn) * m * seq_len)

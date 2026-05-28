@@ -5,7 +5,7 @@ from simd_math import pick_port_unroll
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 from .dispatch_heuristics import (
-    DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES,
+    DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES, MATMUL_DISPATCH_BW_PRODUCT,
 )
 from .profiling import Profiler, DispatchSpan
 
@@ -233,6 +233,12 @@ def tile_dispatch[
 @always_inline
 def saturate_workers(data_bytes: Int, capacity: Int) -> Int:
     return capacity
+
+
+@always_inline
+def matmul_workers(data_bytes: Int, capacity: Int) -> Int:
+    return recommended_workers[MATMUL_DISPATCH_BW_PRODUCT, 1 << 30](
+        data_bytes, capacity)
 
 
 def fanout_dispatch[
