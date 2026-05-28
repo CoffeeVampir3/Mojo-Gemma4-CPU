@@ -464,6 +464,5 @@ def main():
             selected_pools^, arenas_sliding, arenas_full)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_flash_prefill_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")

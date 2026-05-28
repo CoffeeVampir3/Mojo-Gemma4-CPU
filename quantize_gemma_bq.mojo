@@ -32,6 +32,5 @@ def main():
             print(t"quantize failed after {elapsed_s} s")
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_quantize,
     ](topo, "mode: isolated (spin-only)", "mode: cold (spin-backoff)")

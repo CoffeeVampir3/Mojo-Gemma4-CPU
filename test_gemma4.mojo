@@ -160,6 +160,7 @@ def load_and_run[
 
 
 def main():
+    print("Launching.")
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:
         print(t"failed to load tokenizer from {TOKENIZER_PATH}")
@@ -188,7 +189,6 @@ The decline of the aqueduct network paralleled the broader collapse of Roman adm
         load_and_run[degree=degree](topo, selected_pools^, tok, token_ids)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_gemma4_tp,
     ](
         topo, "mode: isolated (spin-only)", "mode: cold (spin-backoff)")

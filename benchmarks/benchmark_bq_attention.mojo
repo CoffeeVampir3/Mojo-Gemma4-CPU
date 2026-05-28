@@ -547,6 +547,5 @@ def main():
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_bq_attention_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")
