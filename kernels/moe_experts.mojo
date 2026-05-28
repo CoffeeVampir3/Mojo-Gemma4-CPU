@@ -24,12 +24,13 @@ def emit_gate_up_panel[
     gate_part: F32Ptr,
     up_part: F32Ptr,
     bucket_base: BF16Ptr,
+    n_cols: Int,
 ):
     var x_rows = InlineArray[BF16Ptr, panel](uninitialized=True)
     comptime for r in range(panel):
         x_rows[r] = x_normed + Int(routes[rec_start + r].token) * hidden
 
-    for j_off in range(tile_j):
+    for j_off in range(n_cols):
         var w_row_g = gate_w_base + j_off * hidden
         var w_row_u = up_w_base + j_off * hidden
         var g_vals = bf16_panel_dot_to_scalars[
@@ -46,7 +47,7 @@ def emit_gate_up_panel[
         var bucket_row = bucket_base + r * intermediate
         var src_g = gate_part + r * tile_j
         var src_u = up_part + r * tile_j
-        for j_off in range(0, tile_j, W):
+        for j_off in range(0, n_cols, W):
             var g = (src_g + j_off).load[width=W]()
             var u = (src_u + j_off).load[width=W]()
             var v = gelu_tanh_f32[W](g) * u
@@ -58,6 +59,13 @@ struct Phase1GateUpKernel[
     hidden: Int, gate_up_fused: Int, intermediate: Int, experts_per_rank: Int,
     tile_j: Int = 64, MR: Int = 4,
 ](WorkerRangePartitionedKernel):
+    """Column-partitioned gate/up projection. Each worker owns an
+    intermediate-column slice [col_start, col_end) and streams that slice
+    of every routed expert's gate_up weight. In decode a token routes to
+    only top_k experts, so partitioning over experts would leave each
+    expert's weight to a single worker; partitioning over columns spreads
+    every expert's weight stream across all workers. Bucket writes are
+    disjoint across workers by column."""
     comptime PU_GU = 4
 
     var x_normed: BF16Ptr
@@ -67,39 +75,34 @@ struct Phase1GateUpKernel[
     var gate_scratch: F32Ptr
     var hidden_bucket: BF16Ptr
     var worker_id: Int
-    var start: Int
-    var end: Int
+    var col_start: Int
+    var col_end: Int
 
     def execute(mut self):
         comptime PU_GU = Self.PU_GU
         comptime STRIDE_GU = PU_GU * BW
 
-        comptime assert Self.intermediate % Self.tile_j == 0, (
-            "Phase1: intermediate must be divisible by tile_j")
+        comptime assert Self.intermediate % W == 0, (
+            "Phase1: intermediate must be a multiple of f32 SIMD width")
         comptime assert Self.tile_j % W == 0, (
             "Phase1: tile_j must be a multiple of f32 SIMD width")
         comptime assert Self.hidden % STRIDE_GU == 0, (
             "Phase1: hidden must be divisible by STRIDE_GU")
         comptime assert Self.gate_up_fused == 2 * Self.intermediate, (
             "Phase1: gate_up_fused must be 2 * intermediate")
-        comptime n_tiles = Self.intermediate // Self.tile_j
-        comptime total_tiles = Self.experts_per_rank * n_tiles
         comptime worker_part = Self.MR * 2 * Self.tile_j
 
         debug_assert(
-            self.start >= 0 and self.start <= self.end and self.end <= total_tiles,
-            "Phase1: tile range out of bounds",
+            self.col_start >= 0 and self.col_start <= self.col_end
+            and self.col_end <= Self.intermediate,
+            "Phase1: column range out of bounds",
         )
 
         var worker_base = self.gate_scratch + self.worker_id * worker_part
         var gate_part = worker_base
         var up_part = worker_base + Self.MR * Self.tile_j
 
-        for tile_idx in range(self.start, self.end):
-            var expert = tile_idx // n_tiles
-            var t_in_expert = tile_idx % n_tiles
-            var j_lo = t_in_expert * Self.tile_j
-
+        for expert in range(Self.experts_per_rank):
             var rec_lo = Int(self.expert_offset[expert])
             var rec_hi = Int(self.expert_offset[expert + 1])
             var n_tok = rec_hi - rec_lo
@@ -107,49 +110,55 @@ struct Phase1GateUpKernel[
                 continue
 
             var gu_w = self.experts_gate_up + expert * Self.gate_up_fused * Self.hidden
-            var gate_w_base = gu_w + j_lo * Self.hidden
-            var up_w_base = gu_w + (Self.intermediate + j_lo) * Self.hidden
 
-            var rec_block = 0
-            while rec_block + Self.MR <= n_tok:
-                var bucket_base = (
-                    self.hidden_bucket
-                    + (rec_lo + rec_block) * Self.intermediate
-                    + j_lo)
-                emit_gate_up_panel[
-                    panel=Self.MR, hidden=Self.hidden,
-                    intermediate=Self.intermediate, tile_j=Self.tile_j,
-                    port_unroll=PU_GU,
-                ](
-                    self.routes, self.x_normed, rec_lo + rec_block,
-                    gate_w_base, up_w_base,
-                    gate_part, up_part, bucket_base,
-                )
-                rec_block += Self.MR
+            var j = self.col_start
+            while j < self.col_end:
+                var n_cols = min(Self.tile_j, self.col_end - j)
+                var gate_w_base = gu_w + j * Self.hidden
+                var up_w_base = gu_w + (Self.intermediate + j) * Self.hidden
 
-            while rec_block < n_tok:
-                var bucket_base = (
-                    self.hidden_bucket
-                    + (rec_lo + rec_block) * Self.intermediate
-                    + j_lo)
-                emit_gate_up_panel[
-                    panel=1, hidden=Self.hidden,
-                    intermediate=Self.intermediate, tile_j=Self.tile_j,
-                    port_unroll=PU_GU,
-                ](
-                    self.routes, self.x_normed, rec_lo + rec_block,
-                    gate_w_base, up_w_base,
-                    gate_part, up_part, bucket_base,
-                )
-                rec_block += 1
+                var rec_block = 0
+                while rec_block + Self.MR <= n_tok:
+                    var bucket_base = (
+                        self.hidden_bucket
+                        + (rec_lo + rec_block) * Self.intermediate
+                        + j)
+                    emit_gate_up_panel[
+                        panel=Self.MR, hidden=Self.hidden,
+                        intermediate=Self.intermediate, tile_j=Self.tile_j,
+                        port_unroll=PU_GU,
+                    ](
+                        self.routes, self.x_normed, rec_lo + rec_block,
+                        gate_w_base, up_w_base,
+                        gate_part, up_part, bucket_base, n_cols,
+                    )
+                    rec_block += Self.MR
+
+                while rec_block < n_tok:
+                    var bucket_base = (
+                        self.hidden_bucket
+                        + (rec_lo + rec_block) * Self.intermediate
+                        + j)
+                    emit_gate_up_panel[
+                        panel=1, hidden=Self.hidden,
+                        intermediate=Self.intermediate, tile_j=Self.tile_j,
+                        port_unroll=PU_GU,
+                    ](
+                        self.routes, self.x_normed, rec_lo + rec_block,
+                        gate_w_base, up_w_base,
+                        gate_part, up_part, bucket_base, n_cols,
+                    )
+                    rec_block += 1
+
+                j += Self.tile_j
 
     @always_inline
     def install_worker_range(
         mut self, worker_id: Int, start: Int, end: Int,
     ):
         self.worker_id = worker_id
-        self.start = start
-        self.end = end
+        self.col_start = start * W
+        self.col_end = end * W
 
 
 def dispatch_phase1_gate_up[
@@ -170,8 +179,7 @@ def dispatch_phase1_gate_up[
     comptime K = Phase1GateUpKernel[
         hidden, gate_up_fused, intermediate, experts_per_rank, tile_j, MR,
     ]
-    comptime n_tiles = intermediate // tile_j
-    comptime total_units = experts_per_rank * n_tiles
+    comptime n_strides = intermediate // W
 
     @parameter
     def make(r: Int) -> K:
@@ -184,7 +192,7 @@ def dispatch_phase1_gate_up[
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="phase1_gate_up",
-    ](pools, prof, total_units, total_units * hidden * 2)
+    ](pools, prof, n_strides, experts_per_rank * gate_up_fused * hidden * 2)
 
 
 @always_inline

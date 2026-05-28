@@ -77,6 +77,13 @@ def emit_bq_gate_up_panel[
 struct BqPhase1GateUpKernel[
     hidden: Int, gate_up: Int, inter: Int, experts_per_rank: Int, MR: Int = 4,
 ](RangePartitionedKernel):
+    """Intermediate-tile-partitioned gate/up projection. Each worker owns a
+    range of intermediate tiles [tile_start, tile_end) and processes that
+    range for every routed expert. In decode a token routes to only top_k
+    experts, so partitioning over experts would leave each expert's weight
+    to a single worker; partitioning over tiles spreads every expert's
+    weight stream across all workers. Bucket writes are disjoint across
+    workers by tile."""
     var x_i8: I8Ptr
     var x_sa: F32Ptr
     var expert_offset: I32Ptr
@@ -85,14 +92,12 @@ struct BqPhase1GateUpKernel[
     var gate_up_scale: F32Ptr
     var gate_up_colsum: F32Ptr
     var hidden_bucket: BF16Ptr
-    var start: Int
-    var end: Int
+    var tile_start: Int
+    var tile_end: Int
 
     def execute(mut self):
         comptime n_inter_tiles = Self.inter // VNNI_N_STEP
-        for unit in range(self.start, self.end):
-            var expert = unit // n_inter_tiles
-            var it = unit % n_inter_tiles
+        for expert in range(Self.experts_per_rank):
             var rec_lo = Int(self.expert_offset[expert])
             var rec_hi = Int(self.expert_offset[expert + 1])
             var n_tok = rec_hi - rec_lo
@@ -101,24 +106,25 @@ struct BqPhase1GateUpKernel[
             var w = self.experts_gate_up + expert * Self.gate_up * Self.hidden
             var wsc = self.gate_up_scale + expert * Self.gate_up
             var cs = self.gate_up_colsum + expert * Self.gate_up
-            var rb = 0
-            while rb + Self.MR <= n_tok:
-                emit_bq_gate_up_panel[
-                    Self.hidden, Self.gate_up, Self.inter, n_inter_tiles, Self.MR,
-                ](it, rec_lo + rb, self.x_i8, self.x_sa, self.routes,
-                  w, wsc, cs, self.hidden_bucket)
-                rb += Self.MR
-            while rb < n_tok:
-                emit_bq_gate_up_panel[
-                    Self.hidden, Self.gate_up, Self.inter, n_inter_tiles, 1,
-                ](it, rec_lo + rb, self.x_i8, self.x_sa, self.routes,
-                  w, wsc, cs, self.hidden_bucket)
-                rb += 1
+            for it in range(self.tile_start, self.tile_end):
+                var rb = 0
+                while rb + Self.MR <= n_tok:
+                    emit_bq_gate_up_panel[
+                        Self.hidden, Self.gate_up, Self.inter, n_inter_tiles, Self.MR,
+                    ](it, rec_lo + rb, self.x_i8, self.x_sa, self.routes,
+                      w, wsc, cs, self.hidden_bucket)
+                    rb += Self.MR
+                while rb < n_tok:
+                    emit_bq_gate_up_panel[
+                        Self.hidden, Self.gate_up, Self.inter, n_inter_tiles, 1,
+                    ](it, rec_lo + rb, self.x_i8, self.x_sa, self.routes,
+                      w, wsc, cs, self.hidden_bucket)
+                    rb += 1
 
     @always_inline
     def install_range(mut self, start: Int, end: Int):
-        self.start = start
-        self.end = end
+        self.tile_start = start
+        self.tile_end = end
 
 
 def dispatch_bq_phase1_gate_up[
@@ -140,7 +146,6 @@ def dispatch_bq_phase1_gate_up[
     comptime assert n == experts_per_rank * gate_up, "experts_gate_up DATA_N mismatch"
     comptime assert m == hidden, "experts_gate_up DATA_M mismatch"
     comptime n_inter_tiles = inter // VNNI_N_STEP
-    comptime total_units = experts_per_rank * n_inter_tiles
     comptime Kern = BqPhase1GateUpKernel[hidden, gate_up, inter, experts_per_rank, MR]
     var cs = experts_gate_up.colsum_checked()
 
@@ -155,7 +160,7 @@ def dispatch_bq_phase1_gate_up[
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="bq_phase1_gate_up",
-    ](pools, prof, total_units, total_units * hidden * 2)
+    ](pools, prof, n_inter_tiles, experts_per_rank * gate_up * hidden)
 
 
 @always_inline

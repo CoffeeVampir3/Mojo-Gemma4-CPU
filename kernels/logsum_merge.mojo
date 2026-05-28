@@ -28,7 +28,7 @@ def merge_segments[
     segments: InlineArray[MergeSegment, n_segments],
     h: Int,
     mut acc: InlineArray[SIMD[DType.float32, W], head_dim // W],
-) -> Tuple[Float32, Float32]:
+) -> Float32:
     comptime m_off = num_q * head_dim
     comptime l_off = m_off + num_q
     comptime PU = pick_port_unroll[W, head_dim]()
@@ -82,7 +82,7 @@ def merge_segments[
                             acc[i * PU + p] = v.fma(cv, acc[i * PU + p])
             batch_start += W
 
-    return (global_m, global_l)
+    return global_l
 
 
 @always_inline
@@ -99,9 +99,8 @@ def write_finalized_head[
 
     var acc = InlineArray[SIMD[DType.float32, W], LANES](
         uninitialized=True)
-    var result = merge_segments[head_dim, num_q, n_segments](
+    var global_l = merge_segments[head_dim, num_q, n_segments](
         segments, h, acc)
-    var global_l = result[1]
 
     if global_l <= 0:
         for i in range(head_dim // STRIDE):

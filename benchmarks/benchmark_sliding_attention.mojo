@@ -8,6 +8,7 @@ from threading.topological_dispatch import with_topological_rank_dispatch
 from kernels.attention_ops import flash_partial_stride
 from kernels.attention_dispatch_kernels import dispatch_sliding_attention
 from kernels.helpers import Binding, ArenaBases
+from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -90,6 +91,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[4] = 256; sizes[5] = 512; sizes[6] = 1024; sizes[7] = 4096
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     for s in range(NUM_CTX_SIZES):
         var vl = sizes[s]
@@ -103,7 +105,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
                 window=WINDOW, cache_size=WINDOW,
                 partial_stride=PSTRIDE, tp=tp,
-            ](q, k_cache, v_cache, output, partials, pos, 1, pools)
+            ](q, k_cache, v_cache, output, partials, pos, 1, pools, prof)
             keep(output[0][0])
 
         samples.clear()
@@ -114,7 +116,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
                 window=WINDOW, cache_size=WINDOW,
                 partial_stride=PSTRIDE, tp=tp,
-            ](q, k_cache, v_cache, output, partials, pos, 1, pools)
+            ](q, k_cache, v_cache, output, partials, pos, 1, pools, prof)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
@@ -137,13 +139,14 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     print("\n=== Validation (valid_len=64) ===")
     comptime VL = 64
     var pos = VL - 1
+    var prof = Profiler[False]()
 
     dispatch_sliding_attention[
         head_dim=HEAD_DIM, num_q=NUM_Q,
         gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
         window=WINDOW, cache_size=WINDOW,
         partial_stride=PSTRIDE, tp=tp,
-    ](q, k_cache, v_cache, output, partials, pos, 1, pools)
+    ](q, k_cache, v_cache, output, partials, pos, 1, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()

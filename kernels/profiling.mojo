@@ -153,11 +153,6 @@ struct ProfileRecord(Copyable, Movable):
         self.compute.add(compute_ns)
         self.join.add(join_ns)
 
-    @always_inline
-    def calls(self) -> Int:
-        return self.dispatch.count
-
-
 struct Profiler[Profile: Bool, N: Int = 64](Copyable, Movable):
     """Per-dispatch timing sink with bounded per-label statistics.
 

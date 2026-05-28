@@ -8,6 +8,7 @@ from threading.topological_dispatch import with_topological_rank_dispatch
 from kernels.helpers import Binding, ArenaBases
 from kernels.moe_router import SparseRoute
 from kernels.moe_experts import dispatch_phase1_gate_up, dispatch_phase2_down
+from kernels.profiling import Profiler
 from modeling.gemma4_common import Gemma4BaseConfig
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -143,13 +144,14 @@ def section_phase1[
     gate_scratch: Binding[Float32, tp],
     hidden_bucket: Binding[BFloat16, tp],
 ):
+    var prof = Profiler[False]()
     for _ in range(WARMUP):
         dispatch_phase1_gate_up[
             hidden=HIDDEN, gate_up_fused=GATE_UP_FUSED,
             intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](x_normed, expert_offset, routes,
-          experts_gate_up, gate_scratch, hidden_bucket, pools)
+          experts_gate_up, gate_scratch, hidden_bucket, pools, prof)
 
     samples.clear()
     for _ in range(SAMPLES):
@@ -159,7 +161,7 @@ def section_phase1[
             intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](x_normed, expert_offset, routes,
-          experts_gate_up, gate_scratch, hidden_bucket, pools)
+          experts_gate_up, gate_scratch, hidden_bucket, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts[tp=tp](pools)
         samples.push(t_done - t0, t1 - t0)
@@ -184,12 +186,13 @@ def section_phase2[
     moe_accum: Binding[Float32, tp],
     moe_out: Binding[BFloat16, tp],
 ):
+    var prof = Profiler[False]()
     for _ in range(WARMUP):
         dispatch_phase2_down[
             hidden=HIDDEN, intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](expert_offset, routes, hidden_bucket,
-          experts_down, moe_accum, moe_out, seq_len, pools)
+          experts_down, moe_accum, moe_out, seq_len, pools, prof)
 
     samples.clear()
     for _ in range(SAMPLES):
@@ -198,7 +201,7 @@ def section_phase2[
             hidden=HIDDEN, intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](expert_offset, routes, hidden_bucket,
-          experts_down, moe_accum, moe_out, seq_len, pools)
+          experts_down, moe_accum, moe_out, seq_len, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts[tp=tp](pools)
         samples.push(t_done - t0, t1 - t0)
@@ -226,18 +229,19 @@ def section_combined[
     moe_accum: Binding[Float32, tp],
     moe_out: Binding[BFloat16, tp],
 ):
+    var prof = Profiler[False]()
     for _ in range(WARMUP):
         dispatch_phase1_gate_up[
             hidden=HIDDEN, gate_up_fused=GATE_UP_FUSED,
             intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](x_normed, expert_offset, routes,
-          experts_gate_up, gate_scratch, hidden_bucket, pools)
+          experts_gate_up, gate_scratch, hidden_bucket, pools, prof)
         dispatch_phase2_down[
             hidden=HIDDEN, intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](expert_offset, routes, hidden_bucket,
-          experts_down, moe_accum, moe_out, seq_len, pools)
+          experts_down, moe_accum, moe_out, seq_len, pools, prof)
 
     samples.clear()
     for _ in range(SAMPLES):
@@ -247,12 +251,12 @@ def section_combined[
             intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](x_normed, expert_offset, routes,
-          experts_gate_up, gate_scratch, hidden_bucket, pools)
+          experts_gate_up, gate_scratch, hidden_bucket, pools, prof)
         dispatch_phase2_down[
             hidden=HIDDEN, intermediate=INTERMEDIATE,
             experts_per_rank=experts_per_rank, tp=tp,
         ](expert_offset, routes, hidden_bucket,
-          experts_down, moe_accum, moe_out, seq_len, pools)
+          experts_down, moe_accum, moe_out, seq_len, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts[tp=tp](pools)
         samples.push(t_done - t0, t1 - t0)

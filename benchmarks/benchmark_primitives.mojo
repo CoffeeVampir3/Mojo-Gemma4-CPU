@@ -11,6 +11,7 @@ from kernels.helpers import (
     tile_dispatch, join_all, worker_range,
 )
 from kernels.reductions import dispatch_allreduce
+from kernels.profiling import Profiler
 from modeling.model_spec import BF16, Encoding
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -434,6 +435,7 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[17] = MAX_ELEMS
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     for s in range(NUM_SIZES):
         var count = sizes[s]
@@ -444,12 +446,12 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
             db.ptrs[r] = dst[r]
 
         for _ in range(WARMUP):
-            dispatch_allreduce[BF16, tp](rb, db, pools)
+            dispatch_allreduce[BF16, tp](rb, db, pools, prof)
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_allreduce[BF16, tp](rb, db, pools)
+            dispatch_allreduce[BF16, tp](rb, db, pools, prof)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)

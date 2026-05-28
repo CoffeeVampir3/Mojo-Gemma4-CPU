@@ -1,5 +1,5 @@
 from std.algorithm import vectorize
-from std.memory import Span, UnsafePointer
+from std.memory import Span
 
 from threading.threading_traits import BurstThreadPool
 from .helpers import (
