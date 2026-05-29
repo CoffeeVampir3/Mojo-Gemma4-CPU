@@ -1,15 +1,15 @@
-from std.collections import Dict, InlineArray
+from std.collections import InlineArray
 from std.math import min
-from std.memory import Span, UnsafePointer, alloc
+from std.memory import Span, UnsafePointer
 from std.os import makedirs
 from std.os.path import dirname
 from std.pathlib import Path
 from std.reflection import reflect
-from std.sys.info import simd_width_of
+from std.sys.info import simd_width_of, size_of
 
 from linux.io_uring import IoRing, ReadOp, WriteOp, ReadMode, WriteMode
 import linux.sys as linux
-from numa import NumaTopology
+from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 from safetensors.parser import (
@@ -44,6 +44,7 @@ comptime W = simd_width_of[DType.float32]()
 comptime PANEL_ROWS = 2048
 comptime COPY_CHUNK = 16 * 1024 * 1024
 comptime QD = 64
+comptime QUANT_SCRATCH_ALIGNMENT = 64
 
 
 @fieldwise_init
@@ -366,43 +367,137 @@ def write_sync_many(mut ring: IoRing[QD], ops: Span[WriteOp[], MutAnyOrigin]) ->
     return True
 
 
-struct QuantScratch(Movable):
-    """Reusable per-worker staging buffers sized to the worst-case slot.
-    Owned and freed by the QuantScratch lifetime; never reallocated mid-run."""
-    var src_buf: PtrU8
-    var work: PtrF32
-    var qi: PtrI8
-    var scales: PtrF32
-    var ready: Bool
+@always_inline
+def align_quant(value: Int) -> Int:
+    return ((value + QUANT_SCRATCH_ALIGNMENT - 1)
+        // QUANT_SCRATCH_ALIGNMENT) * QUANT_SCRATCH_ALIGNMENT
 
-    def __init__(out self, cap: ScratchCapacity):
-        self.ready = False
-        self.src_buf = PtrU8.unsafe_dangling()
-        self.work = PtrF32.unsafe_dangling()
-        self.qi = PtrI8.unsafe_dangling()
-        self.scales = PtrF32.unsafe_dangling()
-        var pr = cap.max_panel_rows
-        var cols = cap.max_cols
-        if pr <= 0 or cols <= 0:
-            return
-        var src_bytes_per = cap.max_src_bytes_per if cap.max_src_bytes_per > 0 else 1
-        var scale_per = cap.max_scale_per_row if cap.max_scale_per_row > 0 else 1
-        self.src_buf = alloc[UInt8](pr * cols * src_bytes_per).as_any_origin()
-        self.work = alloc[Float32](pr * cols).as_any_origin()
-        self.qi = alloc[Scalar[DType.int8]](pr * cols).as_any_origin()
-        self.scales = alloc[Float32](pr * scale_per).as_any_origin()
-        self.ready = True
 
-    def __del__(deinit self):
-        if not self.ready:
-            return
-        self.src_buf.free()
-        self.work.free()
-        self.qi.free()
-        self.scales.free()
+@always_inline
+def quant_byte_count[T: AnyType](count: Int) -> Int:
+    return count * size_of[T]()
 
-    def __bool__(self) -> Bool:
-        return self.ready
+
+@always_inline
+def place_quant_region(mut cursor: Int, bytes: Int) -> Int:
+    cursor = align_quant(cursor)
+    var off = cursor
+    cursor += bytes
+    return off
+
+
+@fieldwise_init
+struct QuantScratchLayout(TrivialRegisterPassable):
+    """Runtime scratch schema. Offsets are byte offsets into one arena-owned
+    block, matching the model's layout-first scratch style while allowing the
+    quantizer's sizes to come from the parsed plan."""
+    var raw_off: Int
+    var f32_work_off: Int
+    var i8_quant_off: Int
+    var f32_scales_off: Int
+    var f32_gamma_off: Int
+    var bf16_centered_off: Int
+    var bf16_gauge_off: Int
+    var total_bytes: Int
+    var cap: ScratchCapacity
+
+    @staticmethod
+    def build(cap: ScratchCapacity) -> Self:
+        var cursor = 0
+        var raw_off = place_quant_region(cursor, cap.raw_bytes)
+        var f32_work_off = place_quant_region(
+            cursor, quant_byte_count[Float32](cap.f32_work))
+        var i8_quant_off = place_quant_region(
+            cursor, quant_byte_count[Int8](cap.i8_quant))
+        var f32_scales_off = place_quant_region(
+            cursor, quant_byte_count[Float32](cap.f32_scales))
+        var f32_gamma_off = place_quant_region(
+            cursor, quant_byte_count[Float32](cap.f32_gamma))
+        var bf16_centered_off = place_quant_region(
+            cursor, quant_byte_count[BFloat16](cap.bf16_centered))
+        var bf16_gauge_off = place_quant_region(
+            cursor, quant_byte_count[BFloat16](cap.bf16_gauge))
+        return Self(
+            raw_off=raw_off,
+            f32_work_off=f32_work_off,
+            i8_quant_off=i8_quant_off,
+            f32_scales_off=f32_scales_off,
+            f32_gamma_off=f32_gamma_off,
+            bf16_centered_off=bf16_centered_off,
+            bf16_gauge_off=bf16_gauge_off,
+            total_bytes=align_quant(cursor),
+            cap=cap,
+        )
+
+
+@fieldwise_init
+struct QuantScratch(TrivialRegisterPassable):
+    """Non-owning typed view over a rank-local scratch arena.
+
+    The surrounding `NumaArena` owns the bytes. This value is intentionally a
+    small descriptor that can ride in the `BurstKernel` mailbox.
+    """
+    var base: PtrU8
+    var layout: QuantScratchLayout
+
+    @always_inline
+    def raw(self) -> PtrU8:
+        return self.base + self.layout.raw_off
+
+    @always_inline
+    def work(self) -> PtrF32:
+        return (self.base + self.layout.f32_work_off).bitcast[Float32]()
+
+    @always_inline
+    def quant_i8(self) -> PtrI8:
+        return (self.base + self.layout.i8_quant_off).bitcast[
+            Scalar[DType.int8]]()
+
+    @always_inline
+    def scales(self) -> PtrF32:
+        return (self.base + self.layout.f32_scales_off).bitcast[Float32]()
+
+    @always_inline
+    def gamma(self) -> PtrF32:
+        return (self.base + self.layout.f32_gamma_off).bitcast[Float32]()
+
+    @always_inline
+    def router_centered(self) -> PtrBF16:
+        return (self.base + self.layout.bf16_centered_off).bitcast[
+            Scalar[DType.bfloat16]]()
+
+    @always_inline
+    def router_gauge(self) -> PtrBF16:
+        return (self.base + self.layout.bf16_gauge_off).bitcast[
+            Scalar[DType.bfloat16]]()
+
+    @always_inline
+    def raw_bytes(self) -> Int:
+        return self.layout.cap.raw_bytes
+
+    @always_inline
+    def work_count(self) -> Int:
+        return self.layout.cap.f32_work
+
+    @always_inline
+    def quant_i8_count(self) -> Int:
+        return self.layout.cap.i8_quant
+
+    @always_inline
+    def scale_count(self) -> Int:
+        return self.layout.cap.f32_scales
+
+    @always_inline
+    def gamma_count(self) -> Int:
+        return self.layout.cap.f32_gamma
+
+    @always_inline
+    def router_centered_count(self) -> Int:
+        return self.layout.cap.bf16_centered
+
+    @always_inline
+    def router_gauge_count(self) -> Int:
+        return self.layout.cap.bf16_gauge
 
 
 struct Quantizer(Movable):
@@ -610,6 +705,7 @@ struct Quantizer(Movable):
         loc: LocatedTensor, weight_off: Int,
     ):
         var bytes = loc.rows * loc.cols * size_of_dtype(loc.dtype)
+        self.scratch_cap.absorb_raw(min(COPY_CHUNK, bytes))
         var id = SlotIdentity(
             name=name, local_name=local, layer_idx=layer_idx,
             shard=loc.shard, src_offset=loc.data_start,
@@ -673,6 +769,19 @@ struct Quantizer(Movable):
                     bias_name, headers_span(self.headers), loc.rows):
                 return False
 
+        var src_bytes_per = size_of_dtype(loc.dtype)
+        self.scratch_cap.absorb_raw(loc.rows * loc.cols * src_bytes_per)
+        self.scratch_cap.absorb_f32_work(loc.cols)
+        self.scratch_cap.absorb_bf16_centered(loc.rows * loc.cols)
+        if emit_gauge:
+            self.scratch_cap.absorb_bf16_gauge(loc.cols)
+        if bias_name.byte_length() > 0:
+            var bias_loc_opt = find_tensor(bias_name, headers_span(self.headers))
+            if bias_loc_opt:
+                var bias_loc = bias_loc_opt.take()
+                self.scratch_cap.absorb_raw(bias_loc.byte_size)
+                self.scratch_cap.absorb_f32_work(loc.rows)
+
         var id = SlotIdentity(
             name=name, local_name=local, layer_idx=layer_idx,
             shard=loc.shard, src_offset=loc.data_start,
@@ -723,6 +832,30 @@ struct Quantizer(Movable):
             return False
 
         var buckets = partition_slots(self.slots, n)
+        var scratch_layout = QuantScratchLayout.build(self.scratch_cap)
+        var scratch_bytes = scratch_layout.total_bytes
+        if scratch_bytes <= 0:
+            print("quant: invalid scratch arena size")
+            return False
+
+        var scratch_arenas = List[
+            NumaArena[alignment=QUANT_SCRATCH_ALIGNMENT]
+        ](capacity=n)
+        var scratches = List[QuantScratch](capacity=n)
+        for w in range(n):
+            scratch_arenas.append(
+                NumaArena[alignment=QUANT_SCRATCH_ALIGNMENT](
+                    topo.node(w), scratch_bytes))
+            if not scratch_arenas[w]:
+                var node = topo.node(w)
+                print(t"quant: scratch arena allocation failed on node {node}")
+                return False
+            var base = scratch_arenas[w].alloc[UInt8](scratch_bytes)
+            if not base:
+                print(t"quant: scratch arena exhausted for rank {w}")
+                return False
+            scratches.append(QuantScratch(base.value(), scratch_layout))
+            _ = scratch_arenas[w].prefault(0, scratch_arenas[w].used())
 
         var kernels = List[QuantShardKernel](capacity=n)
         for w in range(n):
@@ -732,7 +865,7 @@ struct Quantizer(Movable):
                 headers=headers_span(self.headers),
                 slots=slots_span(buckets[w]),
                 data_start=self.data_start,
-                scratch_cap=self.scratch_cap,
+                scratch=scratches[w],
                 rank=w,
             ))
 
@@ -747,6 +880,8 @@ struct Quantizer(Movable):
             (pool_base + w)[].join()
 
         _ = kernels^
+        _ = scratches^
+        _ = scratch_arenas^
         _ = buckets
         _ = pools^
         return True
@@ -765,8 +900,8 @@ def gamma_label(ref g: GammaRef) -> StaticString:
 
 
 struct QuantWorker(Movable):
-    """One thread's worth of quantization state: its own io_uring, staging
-    scratch, and gamma cache. Fields holding spans into shared, read-only
+    """One thread's worth of quantization state: its own io_uring and
+    arena-backed staging scratch. Fields holding spans into shared, read-only
     storage (fds / headers) carry origins stripped to MutAnyOrigin so that
     QuantWorker is safe to construct on a worker thread; the caller is
     responsible for keeping the backing storage alive."""
@@ -779,8 +914,6 @@ struct QuantWorker(Movable):
     var data_start: Int
     var rank: Int
     var worker_idx: Int
-    var gamma_split: Dict[String, PtrF32]
-    var gamma_absorbed: Dict[String, PtrF32]
     var ready: Bool
 
     def __init__(
@@ -789,7 +922,7 @@ struct QuantWorker(Movable):
         output_fd_idx: Int,
         headers: Span[SafetensorsHeader, MutAnyOrigin],
         data_start: Int,
-        cap: ScratchCapacity,
+        scratch: QuantScratch,
         rank: Int = 0,
         worker_idx: Int = 0,
     ):
@@ -800,15 +933,10 @@ struct QuantWorker(Movable):
         self.rank = rank
         self.worker_idx = worker_idx
         self.ring = IoRing[QD]()
-        self.scratch = QuantScratch(cap)
-        self.gamma_split = Dict[String, PtrF32]()
-        self.gamma_absorbed = Dict[String, PtrF32]()
+        self.scratch = scratch
         self.ready = False
         if not self.ring:
             print("quant worker: io_uring setup failed")
-            return
-        if not self.scratch:
-            print("quant worker: scratch alloc failed")
             return
         try:
             _ = self.ring.register_fds(self.fds)
@@ -816,12 +944,6 @@ struct QuantWorker(Movable):
             print(t"quant worker: register_fds failed: {err.error_message()}")
             return
         self.ready = True
-
-    def __del__(deinit self):
-        for entry in self.gamma_split.items():
-            entry.value.free()
-        for entry in self.gamma_absorbed.items():
-            entry.value.free()
 
     def __bool__(self) -> Bool:
         return self.ready
@@ -893,10 +1015,6 @@ struct QuantWorker(Movable):
     def get_gamma(
         mut self, ref g: GammaRef, expected_cols: Int,
     ) -> Optional[PtrF32]:
-        var existing = self.gamma_absorbed.get(g.name) if g.absorbed else self.gamma_split.get(g.name)
-        if existing:
-            return existing.value()
-
         var loc_opt = find_tensor(g.name, self.headers)
         if not loc_opt:
             print(t"quant: missing gamma {g.name}")
@@ -906,43 +1024,42 @@ struct QuantWorker(Movable):
         if cols != expected_cols:
             print(t"quant: gamma {g.name} cols {cols} != expected {expected_cols}")
             return None
-
-        var raw = alloc[UInt8](loc.byte_size).as_any_origin()
-        if not read_sync(self.ring, loc.shard, loc.data_start, loc.byte_size, raw):
-            raw.free()
+        if loc.byte_size > self.scratch.raw_bytes():
+            print(t"quant: gamma {g.name} raw bytes exceed scratch")
+            return None
+        if cols > self.scratch.gamma_count():
+            print(t"quant: gamma {g.name} cols exceed scratch")
             return None
 
-        var buf = alloc[Float32](cols).as_any_origin()
-        if not decode_to_f32(loc.dtype, raw, buf, cols):
+        if not read_sync(self.ring, loc.shard, loc.data_start, loc.byte_size,
+                self.scratch.raw()):
+            return None
+
+        if not decode_to_f32(loc.dtype, self.scratch.raw(),
+                self.scratch.gamma(), cols):
             print(t"quant: unsupported gamma dtype for {g.name}: {loc.dtype}")
-            raw.free()
-            buf.free()
             return None
-        raw.free()
 
         if not g.absorbed:
-            gamma_sqrt_abs_in_place(buf, cols)
-            self.gamma_split[g.name] = buf
-        else:
-            self.gamma_absorbed[g.name] = buf
-        return buf
+            gamma_sqrt_abs_in_place(self.scratch.gamma(), cols)
+        return self.scratch.gamma()
 
     def do_passthrough(mut self, p: PassthroughPlan) -> Bool:
-        var chunk_cap = min(COPY_CHUNK, p.byte_count)
-        var buf = alloc[UInt8](chunk_cap).as_any_origin()
+        var chunk_cap = min(COPY_CHUNK, self.scratch.raw_bytes())
+        if chunk_cap <= 0:
+            print("quant: passthrough scratch unavailable")
+            return False
         var copied = 0
         while copied < p.byte_count:
-            var n = min(COPY_CHUNK, p.byte_count - copied)
+            var n = min(chunk_cap, p.byte_count - copied)
             if not read_sync(self.ring, p.id.shard,
-                    p.id.src_offset + copied, n, buf):
-                buf.free()
+                    p.id.src_offset + copied, n, self.scratch.raw()):
                 return False
             if not write_sync(self.ring, self.output_fd_idx,
-                    self.data_start + p.id.weight_off + copied, n, buf):
-                buf.free()
+                    self.data_start + p.id.weight_off + copied, n,
+                    self.scratch.raw()):
                 return False
             copied += n
-        buf.free()
         return True
 
     def do_quant(mut self, p: QuantPlan) -> Bool:
@@ -956,9 +1073,8 @@ struct QuantWorker(Movable):
             print(t"quant: unsupported source dtype for quant: {p.id.src_dtype}")
             return False
 
-        var gamma_ptr = PtrF32.unsafe_dangling()
-        var has_gamma = p.gamma.is_present()
-        if has_gamma:
+        var gamma_ptr = Optional[PtrF32](None)
+        if p.gamma.is_present():
             var g = self.get_gamma(p.gamma, p.id.cols)
             if not g:
                 return False
@@ -972,28 +1088,44 @@ struct QuantWorker(Movable):
         while row_off < p.id.rows:
             var panel_rows = min(pr, p.id.rows - row_off)
             var panel_bytes = panel_rows * p.id.cols * src_bytes_per
+            if panel_bytes > self.scratch.raw_bytes():
+                print("quant: source panel exceeds scratch")
+                return False
+            if panel_rows * p.id.cols > self.scratch.work_count():
+                print("quant: work panel exceeds scratch")
+                return False
+            if panel_rows * p.id.cols > self.scratch.quant_i8_count():
+                print("quant: quant panel exceeds scratch")
+                return False
+            if panel_rows * scale_per_row > self.scratch.scale_count():
+                print("quant: scale panel exceeds scratch")
+                return False
             var src_off = p.id.src_offset + row_off * p.id.cols * src_bytes_per
             if not read_sync(self.ring, p.id.shard, src_off, panel_bytes,
-                    self.scratch.src_buf):
+                    self.scratch.raw()):
                 return False
 
-            if not decode_to_f32(p.id.src_dtype, self.scratch.src_buf,
-                    self.scratch.work, panel_rows * p.id.cols):
+            var work = self.scratch.work()
+            var qi = self.scratch.quant_i8()
+            var scales = self.scratch.scales()
+            if not decode_to_f32(p.id.src_dtype, self.scratch.raw(),
+                    work, panel_rows * p.id.cols):
                 return False
 
-            if has_gamma:
+            if gamma_ptr:
+                var gp = gamma_ptr.value()
                 for r in range(panel_rows):
                     apply_gamma_in_place(
-                        self.scratch.work + r * p.id.cols, gamma_ptr, p.id.cols)
+                        work + r * p.id.cols, gp, p.id.cols)
 
             if p.per_block:
                 rotate_and_quant[True](
-                    p.fwht_block, self.scratch.work, self.scratch.qi,
-                    self.scratch.scales, panel_rows, p.id.cols, p.two_sided_m)
+                    p.fwht_block, work, qi, scales,
+                    panel_rows, p.id.cols, p.two_sided_m)
             else:
                 rotate_and_quant[False](
-                    p.fwht_block, self.scratch.work, self.scratch.qi,
-                    self.scratch.scales, panel_rows, p.id.cols, p.two_sided_m)
+                    p.fwht_block, work, qi, scales,
+                    panel_rows, p.id.cols, p.two_sided_m)
 
             var w_off = self.data_start + p.id.weight_off + row_off * p.id.cols
             var s_off = (self.data_start + p.scale_off
@@ -1003,11 +1135,11 @@ struct QuantWorker(Movable):
             ops[0] = WriteOp(
                 file_idx=self.output_fd_idx, offset=w_off,
                 length=panel_rows * p.id.cols,
-                src=self.scratch.qi.bitcast[UInt8](), id=0)
+                src=qi.bitcast[UInt8](), id=0)
             ops[1] = WriteOp(
                 file_idx=self.output_fd_idx, offset=s_off,
                 length=panel_rows * scale_per_row * 4,
-                src=self.scratch.scales.bitcast[UInt8](), id=1)
+                src=scales.bitcast[UInt8](), id=1)
             var n_ops = 2
 
             var ops_span = Span[WriteOp[], MutAnyOrigin](
@@ -1027,13 +1159,24 @@ struct QuantWorker(Movable):
             print(t"quant: router_center only supports bf16/f32 source; got {p.id.src_dtype}")
             return False
         var src_bytes_per = size_of_dtype(p.id.src_dtype)
+        var src_bytes = rows * cols * src_bytes_per
+        if src_bytes > self.scratch.raw_bytes():
+            print("quant: router source exceeds scratch")
+            return False
+        if cols > self.scratch.work_count():
+            print("quant: router gauge exceeds scratch")
+            return False
+        if rows * cols > self.scratch.router_centered_count():
+            print("quant: router centered output exceeds scratch")
+            return False
+        if p.emit_gauge and cols > self.scratch.router_gauge_count():
+            print("quant: router gauge bf16 exceeds scratch")
+            return False
 
-        var src_buf = alloc[UInt8](rows * cols * src_bytes_per).as_any_origin()
-        var gauge_f32 = alloc[Float32](cols).as_any_origin()
-        var centered = alloc[Scalar[DType.bfloat16]](rows * cols).as_any_origin()
-        var gauge_bf16 = PtrBF16.unsafe_dangling()
-        if p.emit_gauge:
-            gauge_bf16 = alloc[Scalar[DType.bfloat16]](cols).as_any_origin()
+        var src_buf = self.scratch.raw()
+        var gauge_f32 = self.scratch.work()
+        var centered = self.scratch.router_centered()
+        var gauge_bf16 = self.scratch.router_gauge()
 
         var ok = read_sync(self.ring, p.id.shard, p.id.src_offset,
             rows * cols * src_bytes_per, src_buf)
@@ -1070,11 +1213,6 @@ struct QuantWorker(Movable):
         if ok and p.bias_name.byte_length() > 0:
             ok = self.write_router_bias(p)
 
-        src_buf.free()
-        gauge_f32.free()
-        centered.free()
-        if p.emit_gauge:
-            gauge_bf16.free()
         return ok
 
     def write_router_bias(mut self, ref p: RouterPlan) -> Bool:
@@ -1087,21 +1225,22 @@ struct QuantWorker(Movable):
         if loc.rows * loc.cols != rows:
             print(t"quant: router bias {p.bias_name} size mismatch")
             return False
-        var raw = alloc[UInt8](loc.byte_size).as_any_origin()
-        if not read_sync(self.ring, loc.shard, loc.data_start, loc.byte_size, raw):
-            raw.free()
+        if loc.byte_size > self.scratch.raw_bytes():
+            print(t"quant: router bias {p.bias_name} raw bytes exceed scratch")
             return False
-        var f32 = alloc[Float32](rows).as_any_origin()
-        if not decode_to_f32(loc.dtype, raw, f32, rows):
+        if rows > self.scratch.work_count():
+            print(t"quant: router bias {p.bias_name} rows exceed scratch")
+            return False
+        if not read_sync(self.ring, loc.shard, loc.data_start, loc.byte_size,
+                self.scratch.raw()):
+            return False
+        if not decode_to_f32(loc.dtype, self.scratch.raw(),
+                self.scratch.work(), rows):
             print(t"quant: unsupported router bias dtype for {p.bias_name}: {loc.dtype}")
-            raw.free()
-            f32.free()
             return False
-        raw.free()
         var ok = write_sync(self.ring, self.output_fd_idx,
             self.data_start + p.bias_off, rows * 4,
-            f32.bitcast[UInt8]())
-        f32.free()
+            self.scratch.work().bitcast[UInt8]())
         return ok
 
 
@@ -1176,7 +1315,7 @@ struct QuantShardKernel(BurstKernel):
     var headers: Span[SafetensorsHeader, MutAnyOrigin]
     var slots: Span[SlotPlan, MutAnyOrigin]
     var data_start: Int
-    var scratch_cap: ScratchCapacity
+    var scratch: QuantScratch
     var rank: Int
 
     def execute(mut self):
@@ -1184,7 +1323,7 @@ struct QuantShardKernel(BurstKernel):
         var worker = QuantWorker(
             fds=self.fds, output_fd_idx=self.output_fd_idx,
             headers=self.headers, data_start=self.data_start,
-            cap=self.scratch_cap, rank=self.rank, worker_idx=0,
+            scratch=self.scratch, rank=self.rank, worker_idx=0,
         )
         if not worker:
             print("quant worker: setup failed")

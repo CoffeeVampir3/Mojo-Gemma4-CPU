@@ -67,24 +67,71 @@ comptime SlotPlan = Variant[PassthroughPlan, QuantPlan, RouterPlan]
 
 @fieldwise_init
 struct ScratchCapacity(TrivialRegisterPassable):
-    """Worst-case staging sizes computed during plan walk and consumed
-    by the per-worker scratch allocator. Trivially register-passable so it
-    can ride in a BurstKernel mailbox."""
+    """Worst-case staging sizes computed during plan walk.
+
+    The quantizer turns this into a rank-local arena layout. Counts are typed
+    element counts except `raw_bytes`, which is the largest byte-oriented read
+    staging region needed by any planned operation.
+    """
     var max_panel_rows: Int
-    var max_cols: Int
-    var max_src_bytes_per: Int
-    var max_scale_per_row: Int
+    var raw_bytes: Int
+    var f32_work: Int
+    var i8_quant: Int
+    var f32_scales: Int
+    var f32_gamma: Int
+    var bf16_centered: Int
+    var bf16_gauge: Int
 
     @staticmethod
     def zero(max_panel_rows: Int) -> Self:
-        return Self(max_panel_rows, 0, 0, 1)
+        return Self(max_panel_rows, 0, 0, 0, 0, 0, 0, 0)
+
+    @always_inline
+    def absorb_raw(mut self, bytes: Int):
+        if bytes > self.raw_bytes:
+            self.raw_bytes = bytes
+
+    @always_inline
+    def absorb_f32_work(mut self, count: Int):
+        if count > self.f32_work:
+            self.f32_work = count
+
+    @always_inline
+    def absorb_i8_quant(mut self, count: Int):
+        if count > self.i8_quant:
+            self.i8_quant = count
+
+    @always_inline
+    def absorb_f32_scales(mut self, count: Int):
+        if count > self.f32_scales:
+            self.f32_scales = count
+
+    @always_inline
+    def absorb_f32_gamma(mut self, count: Int):
+        if count > self.f32_gamma:
+            self.f32_gamma = count
+
+    @always_inline
+    def absorb_bf16_centered(mut self, count: Int):
+        if count > self.bf16_centered:
+            self.bf16_centered = count
+
+    @always_inline
+    def absorb_bf16_gauge(mut self, count: Int):
+        if count > self.bf16_gauge:
+            self.bf16_gauge = count
 
     @always_inline
     def absorb_quant(mut self, p: QuantPlan, src_bytes_per: Int):
-        if p.id.cols > self.max_cols:
-            self.max_cols = p.id.cols
-        if src_bytes_per > self.max_src_bytes_per:
-            self.max_src_bytes_per = src_bytes_per
+        var panel_rows = self.max_panel_rows
+        if p.id.rows < panel_rows:
+            panel_rows = p.id.rows
+        var panel_elems = panel_rows * p.id.cols
+        self.absorb_raw(panel_elems * src_bytes_per)
+        self.absorb_f32_work(panel_elems)
+        self.absorb_i8_quant(panel_elems)
         var spr = (p.id.cols // p.fwht_block) if p.per_block else 1
-        if spr > self.max_scale_per_row:
-            self.max_scale_per_row = spr
+        self.absorb_f32_scales(panel_rows * spr)
+        if p.gamma.is_present():
+            self.absorb_raw(p.id.cols * 4)
+            self.absorb_f32_gamma(p.id.cols)

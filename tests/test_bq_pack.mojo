@@ -4,6 +4,7 @@ from std.os import abort
 
 from threading.threading_traits import BurstKernel, BurstThreadPool
 from kernels.helpers import ArenaBases
+from kernels.profiling import Profiler
 from butterquant import (
     PackColsumTask, dispatch_pack_colsum,
 )
@@ -101,7 +102,8 @@ def run_case(rows: Int, cols: Int, block_cols: Int, colsum_row_major: Bool):
         rows=rows, cols=cols, block_cols=block_cols,
         colsum_row_major=colsum_row_major))
 
-    dispatch_pack_colsum[1](pools, bases, nodes, tasks)
+    var prof = Profiler[False]()
+    dispatch_pack_colsum[1](pools, prof, bases, nodes, tasks)
 
     var pack_ok = True
     for i in range(w_bytes):
