@@ -1,6 +1,7 @@
 from std.collections import InlineArray
 from std.math import min
 from std.memory import UnsafePointer
+from std.os import abort
 from std.sys import llvm_intrinsic
 
 from threading.threading_traits import BurstKernel, BurstThreadPool
@@ -114,12 +115,14 @@ struct AmxPrimeKernel(BurstKernel):
 def prime_amx_environment[
     P: BurstThreadPool, //, tp: Int, max_worker_count: Int = 128,
 ](mut pools: List[P]):
-    _ = request_amx_xstate()
-    prime_amx_worker()
-    var buf = DispatchBuffer[AmxPrimeKernel, max_worker_count]()
-    for r in range(tp):
-        var cap = min(max_worker_count, pools[r].get_capacity())
-        for _ in range(cap):
-            buf.slot()[] = AmxPrimeKernel()
-        buf.dispatch(pools[r])
-    join_all[tp](pools)
+    comptime if has_amx_int8():
+        if not request_amx_xstate():
+            abort("butterquant: AMX init failed; machine denied AMX tile xstate permission")
+        prime_amx_worker()
+        var buf = DispatchBuffer[AmxPrimeKernel, max_worker_count]()
+        for r in range(tp):
+            var cap = min(max_worker_count, pools[r].get_capacity())
+            for _ in range(cap):
+                buf.slot()[] = AmxPrimeKernel()
+            buf.dispatch(pools[r])
+        join_all[tp](pools)
