@@ -30,7 +30,7 @@ struct RingKV[window: Int](KVSlot):
 
 
 @always_inline
-def flash_partial_stride[num_q: Int, head_dim: Int]() -> Int:
+def flash_partial_stride(num_q: Int, head_dim: Int) -> Int:
     return ((num_q * head_dim + 2 * num_q) * 4 + 63) // 64 * 16
 
 
@@ -44,12 +44,12 @@ def full_local_kv_count(rank: Int, abs_pos: Int, degree: Int) -> Int:
 
 
 @always_inline
-def zero_accumulators[num_q: Int, head_dim: Int](
-    read acc_ptrs: InlineArray[F32Ptr, num_q],
+def zero_accumulators[max_q: Int, head_dim: Int](
+    read acc_ptrs: InlineArray[F32Ptr, max_q], num_q: Int,
 ):
     comptime assert head_dim % W == 0, (
         "attention head_dim must be divisible by f32 SIMD width")
-    comptime for h in range(num_q):
+    for h in range(num_q):
         for j in range(0, head_dim, W):
             (acc_ptrs[h] + j).store(SIMD[DType.float32, W](0))
 
@@ -74,22 +74,23 @@ def online_softmax_tile[
 
 @always_inline
 def process_kv_tile[
-    num_q: Int, //,
-    KV: KVSlot, head_dim: Int, gqa_ratio: Int, kv_stride: Int,
+    max_q: Int, //,
+    KV: KVSlot, head_dim: Int, gqa_ratio: Int,
 ](
-    read q_ptrs: InlineArray[BF16Ptr, num_q],
+    read q_ptrs: InlineArray[BF16Ptr, max_q],
     k_base: BF16Ptr, v_base: BF16Ptr,
     start_pos: Int, pos: Int, tile_len: Int,
-    mut m: InlineArray[Float32, num_q],
-    mut l: InlineArray[Float32, num_q],
-    read acc_ptrs: InlineArray[F32Ptr, num_q],
+    mut m: InlineArray[Float32, max_q],
+    mut l: InlineArray[Float32, max_q],
+    read acc_ptrs: InlineArray[F32Ptr, max_q],
+    num_q: Int, kv_stride: Int,
 ):
     var slots = InlineArray[Int, TILE](uninitialized=True)
     for t in range(tile_len):
         slots[t] = KV.slot(start_pos, pos + t)
 
-    comptime for q_idx in range(num_q):
-        comptime kv_h = q_idx // gqa_ratio
+    for q_idx in range(num_q):
+        var kv_h = q_idx // gqa_ratio
 
         var scores = SIMD[DType.float32, TILE](-1e30)
         for t in range(tile_len):

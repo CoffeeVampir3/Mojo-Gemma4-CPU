@@ -8,8 +8,7 @@ def dispatch_topological_rank_pools[
     P: BurstThreadPool,
     //,
     *,
-    degree: Int,
-    dispatch: def[Q: BurstThreadPool, //, degree: Int](
+    dispatch: def[Q: BurstThreadPool, //](
         var List[Q]
     ) capturing [_] -> None,
 ](
@@ -22,16 +21,12 @@ def dispatch_topological_rank_pools[
     for i in range(tp):
         print(t"  node {topo.node(i)}: {pools[i].get_capacity()} workers")
     print("")
-
-    if tp == degree:
-        dispatch[degree](pools^)
-    else:
-        print(t"unsupported tp={tp} (this build expects degree {degree})")
+    dispatch(pools^)
 
 
 def with_topological_rank_dispatch[
     *,
-    dispatch: def[P: BurstThreadPool, //, degree: Int](
+    dispatch: def[P: BurstThreadPool, //](
         var List[P]
     ) capturing [_] -> None,
 ](
@@ -43,11 +38,11 @@ def with_topological_rank_dispatch[
         var pools = List[IsolatedBurstPool[]](capacity=len(topo))
         for i in range(len(topo)):
             pools.append(IsolatedBurstPool[].for_rank(topo, i))
-        dispatch_topological_rank_pools[degree=4, dispatch=dispatch](
+        dispatch_topological_rank_pools[dispatch=dispatch](
             topo, isolated_mode, pools^)
     else:
         var pools = List[BurstPool[]](capacity=len(topo))
         for i in range(len(topo)):
             pools.append(BurstPool[].for_rank(topo, i))
-        dispatch_topological_rank_pools[degree=1, dispatch=dispatch](
+        dispatch_topological_rank_pools[dispatch=dispatch](
             topo, cold_mode, pools^)

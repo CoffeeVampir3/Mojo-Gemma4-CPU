@@ -23,7 +23,7 @@ def softcap_value[
 
 @always_inline
 def gemv_softcap_range[
-    rows: Int, cols: Int, cap: Float64,
+    cols: Int, cap: Float64,
 ](
     x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
     start: Int, end: Int,
@@ -36,7 +36,7 @@ def gemv_softcap_range[
 
 @fieldwise_init
 struct GemvSoftcapKernel[
-    rows: Int, cols: Int, cap: Float64,
+    cols: Int, cap: Float64,
 ](RangePartitionedKernel):
     var x: BF16Ptr
     var weight: BF16Ptr
@@ -45,7 +45,7 @@ struct GemvSoftcapKernel[
     var end: Int
 
     def execute(mut self):
-        gemv_softcap_range[Self.rows, Self.cols, Self.cap](
+        gemv_softcap_range[Self.cols, Self.cap](
             self.x, self.weight, self.output, self.start, self.end)
 
     @always_inline
@@ -55,22 +55,23 @@ struct GemvSoftcapKernel[
 
 
 def dispatch_gemv_softcap[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
-    rows: Int, cols: Int, tp: Int, cap: Float64,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    cols: Int, cap: Float64,
     max_worker_count: Int = 128,
 ](
-    x: Binding[BFloat16, tp],
-    weight: Binding[BFloat16, tp],
-    output: Binding[BFloat16, tp],
+    x: Binding[BFloat16, o],
+    weight: Binding[BFloat16, o],
+    output: Binding[BFloat16, o],
+    rows: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
-    comptime K = GemvSoftcapKernel[rows, cols, cap]
+    comptime K = GemvSoftcapKernel[cols, cap]
 
     @parameter
     def make(r: Int) -> K:
         return K(x[r], weight[r], output[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="gemv_softcap"](
+    fanout_dispatch[make, max_worker_count=max_worker_count, label="gemv_softcap"](
         pools, prof, rows, rows * cols * 2,
         inline_threshold_bytes=GEMV_INLINE_ROWS * cols * 2)

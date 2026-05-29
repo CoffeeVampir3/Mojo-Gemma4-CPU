@@ -30,77 +30,89 @@ def align_up(value: Int, alignment: Int = DEFAULT_ALIGNMENT) -> Int:
 trait ShapeLike:
     comptime SIZE_ON_DISK_N: Int
     comptime SIZE_ON_DISK_M: Int
-    comptime LOGICAL_N: Int
-    comptime LOGICAL_M: Int
-    comptime DATA_N: Int
-    comptime DATA_M: Int
+    comptime SHARD_N: Bool
+    comptime SHARD_M: Bool
 
     @staticmethod
-    def bytes[E: Encoding]() -> Int: ...
+    def logical_n(degree: Int) -> Int: ...
+
+    @staticmethod
+    def logical_m(degree: Int) -> Int: ...
+
+    @staticmethod
+    def data_n(degree: Int) -> Int: ...
+
+    @staticmethod
+    def data_m(degree: Int) -> Int: ...
+
+    @staticmethod
+    def bytes(degree: Int, elt_bytes: Int) -> Int: ...
+
 
 struct Shape[
     rows_on_disk: Int, cols_on_disk: Int,
     shard_n: Bool = False, shard_m: Bool = False,
-    degree: Int = 1,
     block_n: Int = 1, block_m: Int = 1,
 ](ShapeLike):
+    """Degree-free shape: the logical extent + shard axis are comptime
+    (intrinsic to the model); the physical per-rank extent is a runtime
+    function of the runtime tensor-parallel `degree`."""
     comptime SIZE_ON_DISK_N = Self.rows_on_disk
     comptime SIZE_ON_DISK_M = Self.cols_on_disk
-    comptime LOGICAL_N = (
-        align_up(Self.rows_on_disk, Self.degree * Self.block_n)
-        if Self.shard_n else Self.rows_on_disk
-    )
-    comptime LOGICAL_M = (
-        align_up(Self.cols_on_disk, Self.degree * Self.block_m)
-        if Self.shard_m else Self.cols_on_disk
-    )
-    comptime DATA_N = Self.LOGICAL_N // Self.degree if Self.shard_n else Self.LOGICAL_N
-    comptime DATA_M = Self.LOGICAL_M // Self.degree if Self.shard_m else Self.LOGICAL_M
+    comptime SHARD_N = Self.shard_n
+    comptime SHARD_M = Self.shard_m
 
+    @always_inline
     @staticmethod
-    def bytes[E: Encoding]() -> Int:
-        return Self.DATA_N * Self.DATA_M * E.ELEMENT_BYTES
+    def logical_n(degree: Int) -> Int:
+        return (
+            align_up(Self.rows_on_disk, degree * Self.block_n)
+            if Self.shard_n else Self.rows_on_disk
+        )
 
+    @always_inline
+    @staticmethod
+    def logical_m(degree: Int) -> Int:
+        return (
+            align_up(Self.cols_on_disk, degree * Self.block_m)
+            if Self.shard_m else Self.cols_on_disk
+        )
 
-trait DistributionDegreeLike:
-    comptime DEGREE: Int
-    comptime TENSOR: Int
-    comptime CONTEXT: Int
-    comptime EXPERT: Int
-    comptime VOCAB: Int
+    @always_inline
+    @staticmethod
+    def data_n(degree: Int) -> Int:
+        return Self.logical_n(degree) // degree if Self.shard_n else Self.rows_on_disk
 
+    @always_inline
+    @staticmethod
+    def data_m(degree: Int) -> Int:
+        return Self.logical_m(degree) // degree if Self.shard_m else Self.cols_on_disk
 
-struct DistributionDegree[degree: Int](DistributionDegreeLike):
-    comptime DEGREE = Self.degree
-    comptime TENSOR = Self.degree
-    comptime CONTEXT = Self.degree
-    comptime EXPERT = Self.degree
-    comptime VOCAB = Self.degree
+    @always_inline
+    @staticmethod
+    def bytes(degree: Int, elt_bytes: Int) -> Int:
+        return Self.data_n(degree) * Self.data_m(degree) * elt_bytes
 
 
 comptime Replicated[n: Int, m: Int] = Shape[
-    n, m, shard_n=False, shard_m=False, degree=1,
+    n, m, shard_n=False, shard_m=False,
 ]
-comptime TensorRowSharded[
-    n: Int, m: Int, D: DistributionDegreeLike, block: Int = 1,
-] = Shape[
-    n, m, shard_n=True, degree=D.TENSOR, block_n=block,
+comptime TensorRowSharded[n: Int, m: Int, block: Int = 1] = Shape[
+    n, m, shard_n=True, block_n=block,
 ]
-comptime TensorColumnSharded[
-    n: Int, m: Int, D: DistributionDegreeLike, block: Int = 1,
-] = Shape[
-    n, m, shard_m=True, degree=D.TENSOR, block_m=block,
+comptime TensorColumnSharded[n: Int, m: Int, block: Int = 1] = Shape[
+    n, m, shard_m=True, block_m=block,
 ]
-comptime ContextRowSharded[n: Int, m: Int, D: DistributionDegreeLike] = Shape[
-    n, m, shard_n=True, degree=D.CONTEXT,
+comptime ContextRowSharded[n: Int, m: Int] = Shape[
+    n, m, shard_n=True,
 ]
 comptime ExpertRowBlockSharded[
-    experts: Int, rows_per_expert: Int, cols: Int, D: DistributionDegreeLike,
+    experts: Int, rows_per_expert: Int, cols: Int,
 ] = Shape[
-    experts * rows_per_expert, cols, shard_n=True, degree=D.EXPERT,
+    experts * rows_per_expert, cols, shard_n=True,
 ]
-comptime VocabularyRowSharded[n: Int, m: Int, D: DistributionDegreeLike] = Shape[
-    n, m, shard_n=True, degree=D.VOCAB,
+comptime VocabularyRowSharded[n: Int, m: Int] = Shape[
+    n, m, shard_n=True,
 ]
 
 

@@ -4,7 +4,7 @@ from kernels.helpers import Binding
 
 
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
-comptime BF16Bind[tp: Int] = Binding[BFloat16, tp]
+comptime BF16Bind[o: ImmutOrigin] = Binding[BFloat16, o]
 
 
 @fieldwise_init

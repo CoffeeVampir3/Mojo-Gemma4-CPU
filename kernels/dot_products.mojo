@@ -57,6 +57,73 @@ def bf16_panel_dot[
 
 
 @always_inline
+def bf16_panel_dot_runtime[
+    panel: Int, port_unroll: Int, //,
+](
+    weight_row: BF16Ptr,
+    read x_rows: InlineArray[BF16Ptr, panel],
+    mut accs: InlineArray[
+        InlineArray[SIMD[DType.float32, W], port_unroll], panel,
+    ],
+    cols: Int,
+):
+    """Strip-mined panel dot with a RUNTIME contraction `cols` and a comptime
+    `port_unroll`. The SIMD width and unroll stay comptime; only the block-count
+    trip is runtime. Used by the column-sharded matmuls where cols = dim//degree.
+    A `cols` that is not a multiple of `port_unroll * BW` is finished by a BW-wide
+    remainder and a scalar remainder, both folded into lane 0 of accs[r][0]."""
+    comptime STRIDE = port_unroll * BW
+    var blocks = cols // STRIDE
+    for i in range(blocks):
+        comptime for p in range(port_unroll):
+            var off = i * STRIDE + p * BW
+            var w_v = (weight_row + off).load[width=BW]()
+            comptime for r in range(panel):
+                var x_v = (x_rows[r] + off).load[width=BW]()
+                accs[r][p] = bf16_pair_dot(accs[r][p], x_v, w_v)
+
+    var tail = blocks * STRIDE
+    while tail + BW <= cols:
+        var w_v = (weight_row + tail).load[width=BW]()
+        comptime for r in range(panel):
+            var x_v = (x_rows[r] + tail).load[width=BW]()
+            accs[r][0] = bf16_pair_dot(accs[r][0], x_v, w_v)
+        tail += BW
+
+    if tail < cols:
+        comptime for r in range(panel):
+            var s = Float32(0)
+            for k in range(tail, cols):
+                s += (
+                    x_rows[r][k].cast[DType.float32]()
+                    * weight_row[k].cast[DType.float32]()
+                )
+            var v = accs[r][0]
+            v[0] = v[0] + s
+            accs[r][0] = v
+
+
+@always_inline
+def bf16_panel_dot_to_scalars_runtime[
+    panel: Int, //,
+    port_unroll: Int,
+](
+    weight_row: BF16Ptr,
+    read x_rows: InlineArray[BF16Ptr, panel],
+    cols: Int,
+) -> InlineArray[Float32, panel]:
+    var accs = InlineArray[
+        InlineArray[SIMD[DType.float32, W], port_unroll], panel,
+    ](
+        fill=InlineArray[SIMD[DType.float32, W], port_unroll](
+            fill=SIMD[DType.float32, W](0),
+        ),
+    )
+    bf16_panel_dot_runtime[port_unroll=port_unroll](weight_row, x_rows, accs, cols)
+    return panel_accs_to_scalars(accs)
+
+
+@always_inline
 def panel_accs_to_scalars[
     panel: Int, port_unroll: Int, //,
 ](

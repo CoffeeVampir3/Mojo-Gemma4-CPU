@@ -100,15 +100,21 @@ struct Chain[A: OutputPartitionedKernel, B: OutputPartitionedKernel](
         self.b.set_partition(worker_id, start, end)
 
 
-struct RankBuffers[dtype: DType, tp: Int, origin: Origin]:
-    var ptrs: InlineArray[UnsafePointer[Scalar[Self.dtype], Self.origin], Self.tp]
+struct RankBuffers[dtype: DType, origin: Origin](Copyable, Movable):
+    var ptrs: List[UnsafePointer[Scalar[Self.dtype], Self.origin]]
     var count: Int
 
     def __init__(out self, count: Int):
-        self.ptrs = InlineArray[
-            UnsafePointer[Scalar[Self.dtype], Self.origin], Self.tp,
-        ](uninitialized=True)
+        self.ptrs = List[UnsafePointer[Scalar[Self.dtype], Self.origin]]()
         self.count = count
+
+    @always_inline
+    def add(mut self, p: UnsafePointer[Scalar[Self.dtype], Self.origin]):
+        self.ptrs.append(p)
+
+    @always_inline
+    def degree(self) -> Int:
+        return len(self.ptrs)
 
 
 struct DispatchBuffer[K: BurstKernel, max_worker_count: Int = 128]:
@@ -139,8 +145,8 @@ struct DispatchBuffer[K: BurstKernel, max_worker_count: Int = 128]:
         self.count = 0
 
 
-def join_all[P: BurstThreadPool, //, tp: Int](mut pools: List[P]):
-    for r in range(tp):
+def join_all[P: BurstThreadPool, //](mut pools: List[P]):
+    for r in range(len(pools)):
         pools[r].join()
 
 
@@ -151,16 +157,16 @@ struct FastFpInitKernel(BurstKernel):
 
 
 def prime_fp_environment[
-    P: BurstThreadPool, //, tp: Int, max_worker_count: Int = 128,
+    P: BurstThreadPool, //, max_worker_count: Int = 128,
 ](mut pools: List[P]):
     set_subnormal_zeroing()
     var buf = DispatchBuffer[FastFpInitKernel, max_worker_count]()
-    for r in range(tp):
+    for r in range(len(pools)):
         var cap = min(max_worker_count, pools[r].get_capacity())
         for _ in range(cap):
             buf.slot()[] = FastFpInitKernel()
         buf.dispatch(pools[r])
-    join_all[tp](pools)
+    join_all(pools)
 
 
 @always_inline
@@ -192,41 +198,45 @@ def recommended_workers[
 
 
 @fieldwise_init
-struct ArenaBases[tp: Int](Copyable, ImplicitlyCopyable):
-    var addrs: InlineArray[Int, Self.tp]
-
-    @staticmethod
-    def uninitialized() -> Self:
-        return Self(addrs=InlineArray[Int, Self.tp](uninitialized=True))
-
-    @always_inline
-    def __getitem__(self, rank: Int) -> Int:
-        return self.addrs[rank]
+struct RankView[o: ImmutOrigin](Copyable, ImplicitlyCopyable):
+    """Non-owning view over the model's per-rank arena bases. `len(bases)` is
+    the runtime tensor-parallel degree; the origin ties the view to the owning
+    List so the compiler enforces the lifetime. Every rank's arena is
+    byte-identical, so rank r's pointer = ptr + (bases[r] - bases[0])."""
+    var bases: Span[Int, Self.o]
 
     @always_inline
-    def __setitem__(mut self, rank: Int, addr: Int):
-        self.addrs[rank] = addr
+    def degree(self) -> Int:
+        return len(self.bases)
+
+    @always_inline
+    def delta(self, rank: Int) -> Int:
+        return self.bases[rank] - self.bases[0]
 
     @always_inline
     def bind[T: AnyType](
         self, ptr: UnsafePointer[T, MutAnyOrigin],
-    ) -> Binding[T, Self.tp]:
-        return Binding[T, Self.tp](ptr, self)
+    ) -> Binding[T, Self.o]:
+        return Binding[T, Self.o](ptr, self)
 
 
 @fieldwise_init
-struct Binding[T: AnyType, tp: Int](Copyable, ImplicitlyCopyable):
+struct Binding[T: AnyType, o: ImmutOrigin](Copyable, ImplicitlyCopyable):
     var ptr: UnsafePointer[Self.T, MutAnyOrigin]
-    var bases: ArenaBases[Self.tp]
+    var view: RankView[Self.o]
+
+    @always_inline
+    def degree(self) -> Int:
+        return self.view.degree()
 
     @always_inline
     def __getitem__(self, rank: Int) -> UnsafePointer[Self.T, MutAnyOrigin]:
         return UnsafePointer[Self.T, MutAnyOrigin](
-            unsafe_from_address=Int(self.ptr) + self.bases[rank] - self.bases[0])
+            unsafe_from_address=Int(self.ptr) + self.view.delta(rank))
 
     @always_inline
     def shifted(self, n: Int) -> Self:
-        return Self(self.ptr + n, self.bases)
+        return Self(self.ptr + n, self.view)
 
 
 def tile_dispatch[
@@ -263,7 +273,6 @@ def matmul_workers(data_bytes: Int, capacity: Int) -> Int:
 
 def fanout_dispatch[
     K: OutputPartitionedKernel, P: BurstThreadPool, Profile: Bool, N: Int, //,
-    tp: Int,
     proto_for: def(Int) capturing [_] -> K,
     max_worker_count: Int = 128,
     worker_policy: def(
@@ -281,25 +290,24 @@ def fanout_dispatch[
         return
     var span = DispatchSpan[Profile]()
     if inline_threshold_bytes >= 0 and data_bytes <= inline_threshold_bytes:
-        for r in range(tp):
+        for r in range(len(pools)):
             var k = proto_for(r)
             k.set_partition(0, 0, total)
             k.execute()
         span.finish_inline(prof, label)
         return
     var buf = DispatchBuffer[K, max_worker_count]()
-    for r in range(tp):
+    for r in range(len(pools)):
         var cap = min(max_worker_count, pools[r].get_capacity())
         _ = tile_dispatch(buf, proto_for(r), pools[r], total,
             num_workers=worker_policy(data_bytes, cap))
     span.issued()
-    join_all[tp](pools)
-    span.finish[tp](prof, pools, label)
+    join_all(pools)
+    span.finish(prof, pools, label)
 
 
 def fanout_dispatch_per_rank[
     K: OutputPartitionedKernel, P: BurstThreadPool, Profile: Bool, N: Int, //,
-    tp: Int,
     proto_for: def(Int) capturing [_] -> K,
     total_for: def(Int) capturing [_] -> Int,
     data_bytes_for: def(Int) capturing [_] -> Int,
@@ -311,19 +319,20 @@ def fanout_dispatch_per_rank[
 ](
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
-) -> InlineArray[Int, tp]:
-    var nws = InlineArray[Int, tp](fill=0)
+) -> List[Int]:
+    var nws = List[Int]()
     var span = DispatchSpan[Profile]()
     var buf = DispatchBuffer[K, max_worker_count]()
-    for r in range(tp):
+    for r in range(len(pools)):
         var total = total_for(r)
         if total <= 0:
+            nws.append(0)
             continue
         var cap = min(max_worker_count, pools[r].get_capacity())
         var nw = worker_policy(data_bytes_for(r), cap)
-        nws[r] = tile_dispatch(
-            buf, proto_for(r), pools[r], total, num_workers=nw)
+        nws.append(tile_dispatch(
+            buf, proto_for(r), pools[r], total, num_workers=nw))
     span.issued()
-    join_all[tp](pools)
-    span.finish[tp](prof, pools, label)
-    return nws
+    join_all(pools)
+    span.finish(prof, pools, label)
+    return nws^
