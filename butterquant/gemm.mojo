@@ -3,7 +3,9 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
 from butterquant.convert import store_out
-from butterquant.dot_products import act_broadcast_vnni, dot_loaded
+from butterquant.dot_products import (
+    act_broadcast_vnni, dot_loaded, vnni_colsum_correct,
+)
 from butterquant.types import F32Ptr, I8Ptr
 from butterquant.vnni import VNNI_BLK, VNNI_K_STEP, VNNI_N_STEP, VNNI_TILE_N
 
@@ -132,9 +134,8 @@ def gemm_i8_per_row_panel[N: Int, K: Int, PR: Int, Out: DType](
         comptime for a in range(acc_count):
             var n_base = ns + a * width
             var cs = (colsum + n_base).load[width=width]()
-            var corrected = (
-                iacc[r * acc_count + a].cast[DType.float32]()
-                - Float32(128) * cs)
+            var corrected = vnni_colsum_correct[width](
+                iacc[r * acc_count + a], cs)
             var res = corrected * ad * (wsc + n_base).load[width=width]()
             store_out[Out, width](res, dst + (m_panel + r) * N + n_base)
 
@@ -198,9 +199,8 @@ def gemm_i8_per_block_panel[N: Int, K: Int, block: Int, PR: Int, Out: DType](
             comptime for a in range(acc_count):
                 var n_base = ns + a * width
                 var cs = (colsum + b * N + n_base).load[width=width]()
-                var corrected = (
-                    iacc[r * acc_count + a].cast[DType.float32]()
-                    - Float32(128) * cs)
+                var corrected = vnni_colsum_correct[width](
+                    iacc[r * acc_count + a], cs)
                 facc[r * acc_count + a] = corrected.fma(
                     adv, facc[r * acc_count + a])
 

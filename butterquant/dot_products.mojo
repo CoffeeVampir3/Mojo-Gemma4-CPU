@@ -67,6 +67,13 @@ def i8_vnni_block_dot[block: Int](a: I8Ptr, b: I8Ptr) -> Int32:
 
 
 @always_inline
+def vnni_colsum_correct[width: Int](
+    iacc: SIMD[DType.int32, width], colsum: SIMD[DType.float32, width],
+) -> SIMD[DType.float32, width]:
+    return iacc.cast[DType.float32]() - Float32(128) * colsum
+
+
+@always_inline
 def head_logit_row[block: Int](
     x_i8: I8Ptr, sa: F32Ptr, weight: I8Ptr, scales: F32Ptr, cols: Int,
 ) -> Float32:

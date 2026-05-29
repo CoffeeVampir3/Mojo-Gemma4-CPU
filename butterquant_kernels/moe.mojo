@@ -12,6 +12,7 @@ from kernels.profiling import Profiler
 
 from butterquant.convert import store_bf16
 from butterquant.gemm import accumulate_n_step, accumulate_n_step_gathered
+from butterquant.dot_products import vnni_colsum_correct
 from butterquant.vnni import VNNI_N_STEP
 from butterquant.types import F32Ptr, I8Ptr
 from butterquant.weight import (
@@ -65,10 +66,10 @@ def emit_bq_gate_up_panel[
             var nu = up_tile * VNNI_N_STEP + a * width
             var gcs = (cs + ng).load[width=width]()
             var ucs = (cs + nu).load[width=width]()
-            var gv = (gacc[r * acc_count + a].cast[DType.float32]()
-                - Float32(128) * gcs) * ad * (wsc + ng).load[width=width]()
-            var uv = (uacc[r * acc_count + a].cast[DType.float32]()
-                - Float32(128) * ucs) * ad * (wsc + nu).load[width=width]()
+            var gv = vnni_colsum_correct[width](
+                gacc[r * acc_count + a], gcs) * ad * (wsc + ng).load[width=width]()
+            var uv = vnni_colsum_correct[width](
+                uacc[r * acc_count + a], ucs) * ad * (wsc + nu).load[width=width]()
             var res = gelu_tanh_f32[width](gv) * uv
             store_bf16[width](res, bucket_row + a * width)
 
@@ -208,9 +209,8 @@ def emit_bq_down_panel[
                 comptime for a in range(acc_count):
                     var n = t * VNNI_N_STEP + a * width
                     var ccs = (cs + b * data_n + e_row_base + n).load[width=width]()
-                    var corrected = (
-                        iacc[r * acc_count + a].cast[DType.float32]()
-                        - Float32(128) * ccs)
+                    var corrected = vnni_colsum_correct[width](
+                        iacc[r * acc_count + a], ccs)
                     facc[r * acc_count + a] = corrected.fma(
                         adv, facc[r * acc_count + a])
 

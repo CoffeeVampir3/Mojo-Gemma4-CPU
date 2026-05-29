@@ -3,18 +3,16 @@ from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
     BF16Ptr, F32Ptr, W, Binding, RangePartitionedKernel,
-    WorkerRangePartitionedKernel, fanout_dispatch, fanout_dispatch_per_rank,
+    WorkerRangePartitionedKernel, fanout_dispatch,
     accumulate_scaled, scale_unrolled,
 )
 from kernels.attention_ops import (
     KVSlot, RingKV, LinearKV, TILE, online_softmax_tile, zero_accumulators,
     full_local_kv_count,
 )
-from kernels.attention_dispatch_kernels import sliding_valid_len
-from kernels.logsum_merge import (
-    dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
+from kernels.attention_dispatch_kernels import (
+    dispatch_flash_sliding, dispatch_flash_full,
 )
-from kernels.flash_attention_prefill import dispatch_merge_flash_prefill_partials
 from kernels.dispatch_heuristics import ROPE_INLINE_TOKENS
 from kernels.profiling import Profiler
 
@@ -302,59 +300,33 @@ def dispatch_bq_sliding_attention[
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
-    if seq_len <= 0:
-        return
-    if seq_len == 1:
-        var valid_len = sliding_valid_len(base_pos, window)
-        if valid_len <= 0:
-            return
-        var start_pos = base_pos - valid_len + 1
-        comptime DecodeK = BqFlashAttentionKernel[
-            RingKV[cache_size],
-            head_dim, num_q, num_kv, gqa_ratio, kv_stride, partial_stride,
-        ]
+    comptime DecodeK = BqFlashAttentionKernel[
+        RingKV[cache_size],
+        head_dim, num_q, num_kv, gqa_ratio, kv_stride, partial_stride,
+    ]
+    comptime PrefillK = BqFlashPrefillSlidingKernel[
+        head_dim, num_q, num_kv, gqa_ratio, kv_stride, window, cache_size,
+        partial_stride,
+    ]
 
-        @parameter
-        def make_decode(r: Int) -> DecodeK:
-            return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
-                           v_base[r], v_scale[r], partials[r],
-                           0, start_pos, 0, 0)
+    @parameter
+    def make_decode(r: Int, start_pos: Int) -> DecodeK:
+        return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+                       v_base[r], v_scale[r], partials[r],
+                       0, start_pos, 0, 0)
 
-        @parameter
-        def total_for(r: Int) -> Int:
-            return valid_len
+    @parameter
+    def make_prefill(r: Int) -> PrefillK:
+        return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+                        v_base[r], v_scale[r], output[r], partials[r],
+                        base_pos, 0, 0, 0)
 
-        @parameter
-        def bytes_for(r: Int) -> Int:
-            return valid_len * kv_stride
-
-        var nws = fanout_dispatch_per_rank[
-            tp, make_decode, total_for, bytes_for,
-            max_worker_count=max_worker_count,
-            label="sliding_attention.decode",
-        ](pools, prof)
-
-        dispatch_merge_flash_partials[
-            head_dim, num_q, partial_stride, tp=tp,
-            max_worker_count=max_worker_count,
-        ](output, partials, nws, pools, prof)
-    else:
-        comptime PrefillK = BqFlashPrefillSlidingKernel[
-            head_dim, num_q, num_kv, gqa_ratio, kv_stride, window, cache_size,
-            partial_stride,
-        ]
-
-        @parameter
-        def make_prefill(r: Int) -> PrefillK:
-            return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
-                            v_base[r], v_scale[r], output[r], partials[r],
-                            base_pos, 0, 0, 0)
-
-        var per_q_kv = window if seq_len > window else seq_len
-        fanout_dispatch[
-            tp, make_prefill, max_worker_count=max_worker_count,
-            label="sliding_attention.prefill",
-        ](pools, prof, seq_len, seq_len * per_q_kv * kv_stride)
+    dispatch_flash_sliding[
+        head_dim, num_q, partial_stride, kv_stride, window, tp, 1,
+        make_decode, make_prefill,
+        "sliding_attention.decode", "sliding_attention.prefill",
+        max_worker_count=max_worker_count,
+    ](output, partials, base_pos, seq_len, pools, prof)
 
 
 def dispatch_bq_full_attention[
@@ -377,64 +349,31 @@ def dispatch_bq_full_attention[
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
-    if seq_len <= 0:
-        return
-    if seq_len == 1:
-        var valid_lens = InlineArray[Int, tp](uninitialized=True)
-        for rank in range(tp):
-            valid_lens[rank] = full_local_kv_count(rank, base_pos, tp)
+    comptime DecodeK = BqFlashAttentionKernel[
+        LinearKV, head_dim, num_q, num_kv, gqa_ratio, kv_stride,
+        partial_stride,
+    ]
+    comptime PrefillK = BqFlashPrefillFullKernel[
+        head_dim, num_q, num_kv, gqa_ratio, kv_stride, tp, partial_stride,
+    ]
 
-        comptime DecodeK = BqFlashAttentionKernel[
-            LinearKV, head_dim, num_q, num_kv, gqa_ratio, kv_stride,
-            partial_stride,
-        ]
+    @parameter
+    def make_decode(r: Int) -> DecodeK:
+        return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+                       v_base[r], v_scale[r], partials[r], 0, 0, 0, 0)
 
-        @parameter
-        def make_decode(r: Int) -> DecodeK:
-            return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
-                           v_base[r], v_scale[r], partials[r], 0, 0, 0, 0)
+    @parameter
+    def make_prefill(r: Int) -> PrefillK:
+        return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+                        v_base[r], v_scale[r], partials[r],
+                        base_pos, r, 0, 0)
 
-        @parameter
-        def total_for(r: Int) -> Int:
-            return valid_lens[r]
-
-        @parameter
-        def bytes_for(r: Int) -> Int:
-            return valid_lens[r] * kv_stride
-
-        var nws = fanout_dispatch_per_rank[
-            tp, make_decode, total_for, bytes_for,
-            max_worker_count=max_worker_count,
-            label="full_attention.decode",
-        ](pools, prof)
-
-        dispatch_merge_context_flash_partials[
-            head_dim=head_dim, num_q=num_q,
-            local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
-            max_worker_count=max_worker_count,
-        ](q_local_output, partials, nws, pools, prof)
-    else:
-        comptime PrefillK = BqFlashPrefillFullKernel[
-            head_dim, num_q, num_kv, gqa_ratio, kv_stride, tp, partial_stride,
-        ]
-
-        @parameter
-        def make_prefill(r: Int) -> PrefillK:
-            return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
-                            v_base[r], v_scale[r], partials[r],
-                            base_pos, r, 0, 0)
-
-        var avg_local_kv = (base_pos + seq_len // 2) // tp + 1
-        fanout_dispatch[
-            tp, make_prefill, max_worker_count=max_worker_count,
-            label="full_attention.prefill",
-        ](pools, prof, seq_len, seq_len * avg_local_kv * kv_stride)
-
-        dispatch_merge_flash_prefill_partials[
-            head_dim=head_dim, num_q=num_q,
-            local_num_q=local_num_q, partial_stride=partial_stride, tp=tp,
-            max_worker_count=max_worker_count,
-        ](q_local_output, partials, seq_len, pools, prof)
+    dispatch_flash_full[
+        head_dim, num_q, local_num_q, partial_stride, kv_stride, tp, 1,
+        make_decode, make_prefill,
+        "full_attention.decode", "full_attention.prefill",
+        max_worker_count=max_worker_count,
+    ](q_local_output, partials, base_pos, seq_len, pools, prof)
 
 
 @fieldwise_init

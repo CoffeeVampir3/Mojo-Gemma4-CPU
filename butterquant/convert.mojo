@@ -1,12 +1,7 @@
 from std.memory import UnsafePointer
-from std.sys.info import CompilationTarget
 
+from simd_math import has_avx512_bf16
 from butterquant.types import BF16Ptr
-
-
-@always_inline
-def has_avx512_bf16() -> Bool:
-    return CompilationTarget._has_feature["avx512bf16"]()
 
 
 @always_inline
