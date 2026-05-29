@@ -17,37 +17,79 @@ end
 
 set BINARY (string replace -r '\.mojo$' '' (basename $TARGET))
 
-# Note: SPR has 8 GP PMCs + fixed counters. This list exceeds that, so
-# perf will multiplex — check the [%] column in the output. Ratios among
-# events with similar [%] coverage are still meaningful; ratios across
-# very different coverage should be treated as indicative only.
-#
-# Baseline
-set PERF_EVENTS instructions cycles
-# FP/SIMD assists + pipeline clears
-set -a PERF_EVENTS assists.fp assists.sse_avx_mix machine_clears.count
-# Memory pipeline stalls
-set -a PERF_EVENTS ld_blocks.store_forward mem_inst_retired.split_loads dtlb_load_misses.walk_completed
-# L1 dcache + LFB occupancy — LFB saturation is the hidden MLP ceiling.
-#   fb_full/cycles high  => MLP-bound, more DRAM BW won't help
-#   pending/pending_cycles => avg outstanding L1 misses (vs ~16 LFBs)
-set -a PERF_EVENTS mem_load_retired.l1_hit mem_load_retired.l1_miss mem_load_retired.fb_hit
-set -a PERF_EVENTS l1d_pend_miss.pending l1d_pend_miss.pending_cycles l1d_pend_miss.fb_full
-# L2 demand traffic + demand miss rate.
-# (SPR JSON doesn't define l2_rqsts.pf_hit/pf_miss — those were SKX
-# umasks. To assess HW prefetcher utility, rerun with the L2 streamer
-# disabled via `wrmsr -a 0x1a4 0x1` and compare throughput.)
-set -a PERF_EVENTS mem_load_retired.l2_hit mem_load_retired.l2_miss
-set -a PERF_EVENTS l2_rqsts.all_demand_data_rd l2_rqsts.all_demand_miss
-# L3 + memory stall attribution (TMA-style) — tells you whether stalls
-# resolve in L2/L3 or reach DRAM.
-set -a PERF_EVENTS mem_load_retired.l3_hit mem_load_retired.l3_miss
-set -a PERF_EVENTS cycle_activity.stalls_l3_miss cycle_activity.stalls_total
-# NUMA: retired-load attribution (where do L3 misses actually land?)
-set -a PERF_EVENTS mem_load_l3_miss_retired.local_dram mem_load_l3_miss_retired.remote_dram
-set -a PERF_EVENTS mem_load_l3_miss_retired.remote_fwd mem_load_l3_miss_retired.remote_hitm
-# NUMA: broader off-core view — catches stores (RFOs) and HW prefetches
-set -a PERF_EVENTS ocr.reads_to_core.local_dram ocr.reads_to_core.remote_dram
+# SPR has 8 GP PMCs, but precise/offcore events can still conflict with each
+# other. Keep profiles focused, include cycles as a cheap overall progress
+# signal, and leave instructions out unless PERF_BASELINE=1 is set explicitly.
+# NUMA attribution is the default; use PERF_PROFILE=full for the original
+# broad sweep when needed.
+if not set -q PERF_PROFILE
+    set PERF_PROFILE numa
+end
+
+set PERF_EVENTS cycles
+
+if set -q PERF_BASELINE
+    set -a PERF_EVENTS instructions
+end
+
+switch $PERF_PROFILE
+    case numa
+        # Highest-signal default: retired-load NUMA attribution only.
+        # This keeps the event set small because precise/offcore events can
+        # still multiplex even when the total event count is under 8.
+        set -a PERF_EVENTS mem_load_retired.l3_miss
+        set -a PERF_EVENTS mem_load_l3_miss_retired.local_dram mem_load_l3_miss_retired.remote_dram
+        set -a PERF_EVENTS mem_load_l3_miss_retired.remote_fwd mem_load_l3_miss_retired.remote_hitm
+    case numa_wide
+        # Wider NUMA pass: add L2 misses plus offcore reads to catch traffic
+        # from stores/RFOs and HW prefetches. This may still multiplex.
+        set -a PERF_EVENTS mem_load_retired.l2_miss mem_load_retired.l3_miss
+        set -a PERF_EVENTS mem_load_l3_miss_retired.local_dram mem_load_l3_miss_retired.remote_dram
+        set -a PERF_EVENTS mem_load_l3_miss_retired.remote_fwd mem_load_l3_miss_retired.remote_hitm
+        set -a PERF_EVENTS ocr.reads_to_core.local_dram ocr.reads_to_core.remote_dram
+    case lfb
+        # Memory-level parallelism / LFB pressure. Useful when NUMA looks clean
+        # but throughput still suggests the core is waiting on misses.
+        set -a PERF_EVENTS l1d_pend_miss.pending l1d_pend_miss.pending_cycles l1d_pend_miss.fb_full
+        set -a PERF_EVENTS mem_load_retired.l1_miss mem_load_retired.fb_hit
+        set -a PERF_EVENTS mem_load_retired.l2_miss mem_load_retired.l3_miss
+    case stalls
+        # Coarse stall attribution. This is low-signal for the NUMA question,
+        # but can still be useful as a quick sanity check.
+        set -a PERF_EVENTS cycle_activity.stalls_total cycle_activity.stalls_l3_miss
+        set -a PERF_EVENTS l1d_pend_miss.pending l1d_pend_miss.pending_cycles l1d_pend_miss.fb_full
+        set -a PERF_EVENTS mem_load_retired.l2_miss mem_load_retired.l3_miss
+    case pipeline
+        # Low-rate sanity checks. Keep these out of the default profile unless
+        # a code change specifically risks assists, splits, or forwarding stalls.
+        set -a PERF_EVENTS assists.fp assists.sse_avx_mix machine_clears.count
+        set -a PERF_EVENTS ld_blocks.store_forward mem_inst_retired.split_loads dtlb_load_misses.walk_completed
+    case hierarchy
+        # Cache hierarchy shape. This is useful for miss-rate ratios, but it was
+        # less actionable than the compact profile for the recent memory-bound run.
+        set -a PERF_EVENTS mem_load_retired.l1_hit mem_load_retired.l1_miss mem_load_retired.fb_hit
+        set -a PERF_EVENTS mem_load_retired.l2_hit mem_load_retired.l2_miss
+        set -a PERF_EVENTS mem_load_retired.l3_hit mem_load_retired.l3_miss
+    case full
+        # Original broad sweep. This will multiplex; compare only events with
+        # similar [%] coverage in perf output.
+        set -a PERF_EVENTS assists.fp assists.sse_avx_mix machine_clears.count
+        set -a PERF_EVENTS ld_blocks.store_forward mem_inst_retired.split_loads dtlb_load_misses.walk_completed
+        set -a PERF_EVENTS mem_load_retired.l1_hit mem_load_retired.l1_miss mem_load_retired.fb_hit
+        set -a PERF_EVENTS l1d_pend_miss.pending l1d_pend_miss.pending_cycles l1d_pend_miss.fb_full
+        set -a PERF_EVENTS mem_load_retired.l2_hit mem_load_retired.l2_miss
+        set -a PERF_EVENTS l2_rqsts.all_demand_data_rd l2_rqsts.all_demand_miss
+        set -a PERF_EVENTS mem_load_retired.l3_hit mem_load_retired.l3_miss
+        set -a PERF_EVENTS cycle_activity.stalls_l3_miss cycle_activity.stalls_total
+        set -a PERF_EVENTS mem_load_l3_miss_retired.local_dram mem_load_l3_miss_retired.remote_dram
+        set -a PERF_EVENTS mem_load_l3_miss_retired.remote_fwd mem_load_l3_miss_retired.remote_hitm
+        set -a PERF_EVENTS ocr.reads_to_core.local_dram ocr.reads_to_core.remote_dram
+    case '*'
+        echo "Unknown PERF_PROFILE: $PERF_PROFILE"
+        echo "Expected one of: numa, numa_wide, lfb, stalls, pipeline, hierarchy, full"
+        exit 1
+end
+
 set PERF_EVENTS_CSV (string join , $PERF_EVENTS)
 
 rsync -av \
