@@ -25,13 +25,33 @@ struct GammaRef(Copyable, Movable):
     sqrt-abs split factor and the raw absorbed gain."""
     var name: String
     var absorbed: Bool
+    var shard: Int
+    var src_offset: Int
+    var byte_size: Int
+    var src_dtype: DType
+    var cols: Int
 
     @staticmethod
     def none() -> Self:
-        return Self(String(""), False)
+        return Self(String(""), False, 0, 0, 0, DType.float32, 0)
+
+    @staticmethod
+    def named(name: String, absorbed: Bool) -> Self:
+        return Self(name, absorbed, 0, 0, 0, DType.float32, 0)
 
     def is_present(self) -> Bool:
         return self.name.byte_length() > 0
+
+    @always_inline
+    def locate(
+        mut self, shard: Int, src_offset: Int, byte_size: Int,
+        src_dtype: DType, cols: Int,
+    ):
+        self.shard = shard
+        self.src_offset = src_offset
+        self.byte_size = byte_size
+        self.src_dtype = src_dtype
+        self.cols = cols
 
 
 @fieldwise_init
@@ -60,6 +80,10 @@ struct RouterPlan(Copyable, Movable):
     var emit_gauge: Bool
     var bias_name: String
     var bias_off: Int
+    var bias_shard: Int
+    var bias_src_offset: Int
+    var bias_byte_size: Int
+    var bias_src_dtype: DType
 
 
 comptime SlotPlan = Variant[PassthroughPlan, QuantPlan, RouterPlan]

@@ -27,6 +27,7 @@ from butterquant.kernels import (
 from quant.recipe import (
     Passthrough, PerRowQuant, PerBlockQuant, RouterCenter,
     SoftmaxRouterCenter, SplitGamma, AbsorbedGamma, TwoSided,
+    GammaMode, RotationMode,
 )
 from quant.plan import (
     SlotIdentity, GammaRef, PassthroughPlan, QuantPlan, RouterPlan, SlotPlan,
@@ -173,108 +174,38 @@ def supports_router_source(dt: DType) -> Bool:
     return dt == DType.bfloat16 or dt == DType.float32
 
 
-def validate_gamma_tensor(
-    name: String,
-    headers: Span[SafetensorsHeader, MutAnyOrigin],
-    expected_cols: Int,
-) -> Bool:
-    var loc_opt = find_tensor(name, headers)
-    if not loc_opt:
-        print(t"quant plan: missing gamma {name}")
-        return False
-    var loc = loc_opt.take()
-    var cols = loc.rows * loc.cols
-    if cols != expected_cols:
-        print(t"quant plan: gamma {name} cols {cols} != expected {expected_cols}")
-        return False
-    if not supports_decode_to_f32(loc.dtype):
-        print(t"quant plan: unsupported gamma dtype for {name}: {loc.dtype}")
-        return False
-    return True
-
-
-def validate_router_bias_tensor(
-    name: String,
-    headers: Span[SafetensorsHeader, MutAnyOrigin],
-    expected_rows: Int,
-) -> Bool:
-    var loc_opt = find_tensor(name, headers)
-    if not loc_opt:
-        print(t"quant plan: missing router bias {name}")
-        return False
-    var loc = loc_opt.take()
-    var rows = loc.rows * loc.cols
-    if rows != expected_rows:
-        print(t"quant plan: router bias {name} rows {rows} != expected {expected_rows}")
-        return False
-    if not supports_decode_to_f32(loc.dtype):
-        print(t"quant plan: unsupported router bias dtype for {name}: {loc.dtype}")
-        return False
-    return True
+@always_inline
+def gamma_ref_from[gam: GammaMode](prefix: String) -> GammaRef:
+    comptime if gam.isa[SplitGamma]():
+        return GammaRef.named(prefix + String(gam[SplitGamma].name), False)
+    comptime if gam.isa[AbsorbedGamma]():
+        return GammaRef.named(prefix + String(gam[AbsorbedGamma].name), True)
+    return GammaRef.none()
 
 
 @always_inline
-def headers_span(
-    ref headers: List[SafetensorsHeader],
-) -> Span[SafetensorsHeader, MutAnyOrigin]:
-    """Strip origin tracking from `headers` for storage in worker structs.
-    Caller guarantees `headers` outlives the returned span."""
-    return Span[SafetensorsHeader, MutAnyOrigin](
-        ptr=UnsafePointer[SafetensorsHeader, MutAnyOrigin](
-            unsafe_from_address=Int(headers.unsafe_ptr())),
-        length=len(headers),
+def two_sided_m_of[rot: RotationMode]() -> Int:
+    comptime if rot.isa[TwoSided]():
+        return rot[TwoSided].m_block
+    return 0
+
+
+@always_inline
+def as_mut_any_span[T: Movable](
+    ref items: List[T],
+) -> Span[T, MutAnyOrigin]:
+    """Strip origin tracking from `items` for storage in worker structs.
+    Caller guarantees `items` outlives the returned span."""
+    return Span[T, MutAnyOrigin](
+        ptr=UnsafePointer[T, MutAnyOrigin](
+            unsafe_from_address=Int(items.unsafe_ptr())),
+        length=len(items),
     )
 
 
 @always_inline
-def fds_span(
-    ref fds: List[Int32],
-) -> Span[Int32, MutAnyOrigin]:
-    return Span[Int32, MutAnyOrigin](
-        ptr=UnsafePointer[Int32, MutAnyOrigin](
-            unsafe_from_address=Int(fds.unsafe_ptr())),
-        length=len(fds),
-    )
-
-
-@always_inline
-def slots_span(
-    ref slots: List[SlotPlan],
-) -> Span[SlotPlan, MutAnyOrigin]:
-    return Span[SlotPlan, MutAnyOrigin](
-        ptr=UnsafePointer[SlotPlan, MutAnyOrigin](
-            unsafe_from_address=Int(slots.unsafe_ptr())),
-        length=len(slots),
-    )
-
-
-@always_inline
-def decode_bf16(src: PtrU8, dst: PtrF32, count: Int):
-    var p = src.bitcast[Scalar[DType.bfloat16]]()
-    var k = 0
-    while k + W <= count:
-        (dst + k).store((p + k).load[width=W]().cast[DType.float32]())
-        k += W
-    while k < count:
-        dst[k] = p[k].cast[DType.float32]()
-        k += 1
-
-
-@always_inline
-def decode_f32(src: PtrU8, dst: PtrF32, count: Int):
-    var p = src.bitcast[Float32]()
-    var k = 0
-    while k + W <= count:
-        (dst + k).store((p + k).load[width=W]())
-        k += W
-    while k < count:
-        dst[k] = p[k]
-        k += 1
-
-
-@always_inline
-def decode_f16(src: PtrU8, dst: PtrF32, count: Int):
-    var p = src.bitcast[Scalar[DType.float16]]()
+def decode_from[dt: DType](src: PtrU8, dst: PtrF32, count: Int):
+    var p = src.bitcast[Scalar[dt]]()
     var k = 0
     while k + W <= count:
         (dst + k).store((p + k).load[width=W]().cast[DType.float32]())
@@ -286,13 +217,13 @@ def decode_f16(src: PtrU8, dst: PtrF32, count: Int):
 
 def decode_to_f32(dt: DType, src: PtrU8, dst: PtrF32, count: Int) -> Bool:
     if dt == DType.bfloat16:
-        decode_bf16(src, dst, count)
+        decode_from[DType.bfloat16](src, dst, count)
         return True
     if dt == DType.float32:
-        decode_f32(src, dst, count)
+        decode_from[DType.float32](src, dst, count)
         return True
     if dt == DType.float16:
-        decode_f16(src, dst, count)
+        decode_from[DType.float16](src, dst, count)
         return True
     return False
 
@@ -618,7 +549,7 @@ struct Quantizer(Movable):
         comptime QV = FT.QUANT
 
         var full = prefix + String(FT.NAME)
-        var loc_opt = find_tensor(full, headers_span(self.headers))
+        var loc_opt = find_tensor(full, as_mut_any_span(self.headers))
         if not loc_opt:
             print(t"quant plan: missing {full}")
             return False
@@ -652,33 +583,19 @@ struct Quantizer(Movable):
 
         comptime if QV.isa[PerRowQuant]():
             comptime QT = QV[PerRowQuant]
-            var tsm = 0
-            comptime if QT.rotation.isa[TwoSided]():
-                tsm = QT.rotation[TwoSided].m_block
-            var gamma = GammaRef.none()
-            comptime if QT.gamma.isa[SplitGamma]():
-                gamma = GammaRef(prefix + String(QT.gamma[SplitGamma].name), False)
-            comptime if QT.gamma.isa[AbsorbedGamma]():
-                gamma = GammaRef(prefix + String(QT.gamma[AbsorbedGamma].name), True)
             if not self.plan_quant(full, local, layer_idx, loc,
                 per_block=False, fwht=QT.fwht_block,
-                two_sided_m=tsm, gamma=gamma,
+                two_sided_m=two_sided_m_of[QT.rotation](),
+                gamma=gamma_ref_from[QT.gamma](prefix),
                 weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE]):
                 return False
 
         comptime if QV.isa[PerBlockQuant]():
             comptime QT = QV[PerBlockQuant]
-            var tsm = 0
-            comptime if QT.rotation.isa[TwoSided]():
-                tsm = QT.rotation[TwoSided].m_block
-            var gamma = GammaRef.none()
-            comptime if QT.gamma.isa[SplitGamma]():
-                gamma = GammaRef(prefix + String(QT.gamma[SplitGamma].name), False)
-            comptime if QT.gamma.isa[AbsorbedGamma]():
-                gamma = GammaRef(prefix + String(QT.gamma[AbsorbedGamma].name), True)
             if not self.plan_quant(full, local, layer_idx, loc,
                 per_block=True, fwht=QT.fwht_block,
-                two_sided_m=tsm, gamma=gamma,
+                two_sided_m=two_sided_m_of[QT.rotation](),
+                gamma=gamma_ref_from[QT.gamma](prefix),
                 weight_off=offs[QuantRole.WEIGHT], scale_off=offs[QuantRole.SCALE]):
                 return False
 
@@ -714,10 +631,26 @@ struct Quantizer(Movable):
         )
         self.slots.append(PassthroughPlan(id^, bytes))
 
+    def locate_gamma(mut self, mut g: GammaRef, expected_cols: Int) -> Bool:
+        var loc_opt = find_tensor(g.name, as_mut_any_span(self.headers))
+        if not loc_opt:
+            print(t"quant plan: missing gamma {g.name}")
+            return False
+        var loc = loc_opt.take()
+        var cols = loc.rows * loc.cols
+        if cols != expected_cols:
+            print(t"quant plan: gamma {g.name} cols {cols} != expected {expected_cols}")
+            return False
+        if not supports_decode_to_f32(loc.dtype):
+            print(t"quant plan: unsupported gamma dtype for {g.name}: {loc.dtype}")
+            return False
+        g.locate(loc.shard, loc.data_start, loc.byte_size, loc.dtype, cols)
+        return True
+
     def plan_quant(
         mut self, name: String, local: String, layer_idx: Int,
         loc: LocatedTensor, per_block: Bool,
-        fwht: Int, two_sided_m: Int, gamma: GammaRef,
+        fwht: Int, two_sided_m: Int, var gamma: GammaRef,
         weight_off: Int, scale_off: Int,
     ) -> Bool:
         if loc.rows <= 0 or loc.cols <= 0:
@@ -734,7 +667,7 @@ struct Quantizer(Movable):
                 print(t"quant plan: rows {loc.rows} not divisible by M-axis FWHT block {two_sided_m} for {name}")
                 return False
         if gamma.is_present():
-            if not validate_gamma_tensor(gamma.name, headers_span(self.headers), loc.cols):
+            if not self.locate_gamma(gamma, loc.cols):
                 return False
 
         var id = SlotIdentity(
@@ -744,7 +677,7 @@ struct Quantizer(Movable):
             weight_off=weight_off,
         )
         var plan = QuantPlan(
-            id^, per_block, fwht, two_sided_m, gamma.copy(), scale_off,
+            id^, per_block, fwht, two_sided_m, gamma^, scale_off,
         )
         self.scratch_cap.absorb_quant(plan, size_of_dtype(loc.dtype))
         self.slots.append(plan^)
@@ -764,10 +697,28 @@ struct Quantizer(Movable):
         if loc.cols % W != 0:
             print(t"quant plan: router cols {loc.cols} not divisible by SIMD width {W} for {name}")
             return False
+
+        var bias_shard = 0
+        var bias_src_offset = 0
+        var bias_byte_size = 0
+        var bias_src_dtype = DType.float32
         if bias_name.byte_length() > 0:
-            if not validate_router_bias_tensor(
-                    bias_name, headers_span(self.headers), loc.rows):
+            var bias_loc_opt = find_tensor(bias_name, as_mut_any_span(self.headers))
+            if not bias_loc_opt:
+                print(t"quant plan: missing router bias {bias_name}")
                 return False
+            var bias_loc = bias_loc_opt.take()
+            var bias_rows = bias_loc.rows * bias_loc.cols
+            if bias_rows != loc.rows:
+                print(t"quant plan: router bias {bias_name} rows {bias_rows} != expected {loc.rows}")
+                return False
+            if not supports_decode_to_f32(bias_loc.dtype):
+                print(t"quant plan: unsupported router bias dtype for {bias_name}: {bias_loc.dtype}")
+                return False
+            bias_shard = bias_loc.shard
+            bias_src_offset = bias_loc.data_start
+            bias_byte_size = bias_loc.byte_size
+            bias_src_dtype = bias_loc.dtype
 
         var src_bytes_per = size_of_dtype(loc.dtype)
         self.scratch_cap.absorb_raw(loc.rows * loc.cols * src_bytes_per)
@@ -776,11 +727,8 @@ struct Quantizer(Movable):
         if emit_gauge:
             self.scratch_cap.absorb_bf16_gauge(loc.cols)
         if bias_name.byte_length() > 0:
-            var bias_loc_opt = find_tensor(bias_name, headers_span(self.headers))
-            if bias_loc_opt:
-                var bias_loc = bias_loc_opt.take()
-                self.scratch_cap.absorb_raw(bias_loc.byte_size)
-                self.scratch_cap.absorb_f32_work(loc.rows)
+            self.scratch_cap.absorb_raw(bias_byte_size)
+            self.scratch_cap.absorb_f32_work(loc.rows)
 
         var id = SlotIdentity(
             name=name, local_name=local, layer_idx=layer_idx,
@@ -788,7 +736,9 @@ struct Quantizer(Movable):
             src_dtype=loc.dtype, rows=loc.rows, cols=loc.cols,
             weight_off=weight_off,
         )
-        self.slots.append(RouterPlan(id^, gauge_off, emit_gauge, bias_name, bias_off))
+        self.slots.append(RouterPlan(
+            id^, gauge_off, emit_gauge, bias_name, bias_off,
+            bias_shard, bias_src_offset, bias_byte_size, bias_src_dtype))
         return True
 
     def add_entry(
@@ -860,10 +810,10 @@ struct Quantizer(Movable):
         var kernels = List[QuantShardKernel](capacity=n)
         for w in range(n):
             kernels.append(QuantShardKernel(
-                fds=fds_span(self.fds),
+                fds=as_mut_any_span(self.fds),
                 output_fd_idx=self.output_fd_idx,
-                headers=headers_span(self.headers),
-                slots=slots_span(buckets[w]),
+                headers=as_mut_any_span(self.headers),
+                slots=as_mut_any_span(buckets[w]),
                 data_start=self.data_start,
                 scratch=scratches[w],
                 rank=w,
@@ -897,6 +847,16 @@ def gamma_label(ref g: GammaRef) -> StaticString:
     if not g.is_present(): return "none"
     if g.absorbed: return "absorbed"
     return "split"
+
+
+def slot_name(read plan: SlotPlan) -> String:
+    if plan.isa[PassthroughPlan]():
+        return plan[PassthroughPlan].id.name
+    if plan.isa[QuantPlan]():
+        return plan[QuantPlan].id.name
+    if plan.isa[RouterPlan]():
+        return plan[RouterPlan].id.name
+    return String("<unknown>")
 
 
 struct QuantWorker(Movable):
@@ -1001,43 +961,25 @@ struct QuantWorker(Movable):
             print(t"[r{self.rank}/w{self.worker_idx} tail ] {id.local_name} :: {desc}")
 
     def report_slot_failure(self, plan: SlotPlan):
-        var name: String
-        if plan.isa[PassthroughPlan]():
-            name = plan[PassthroughPlan].id.name
-        elif plan.isa[QuantPlan]():
-            name = plan[QuantPlan].id.name
-        elif plan.isa[RouterPlan]():
-            name = plan[RouterPlan].copy().id.name
-        else:
-            name = String("<unknown>")
+        var name = slot_name(plan)
         print(t"quant: failed at {name}")
 
-    def get_gamma(
-        mut self, ref g: GammaRef, expected_cols: Int,
-    ) -> Optional[PtrF32]:
-        var loc_opt = find_tensor(g.name, self.headers)
-        if not loc_opt:
-            print(t"quant: missing gamma {g.name}")
-            return None
-        var loc = loc_opt.take()
-        var cols = loc.rows * loc.cols
-        if cols != expected_cols:
-            print(t"quant: gamma {g.name} cols {cols} != expected {expected_cols}")
-            return None
-        if loc.byte_size > self.scratch.raw_bytes():
+    def get_gamma(mut self, ref g: GammaRef) -> Optional[PtrF32]:
+        var cols = g.cols
+        if g.byte_size > self.scratch.raw_bytes():
             print(t"quant: gamma {g.name} raw bytes exceed scratch")
             return None
         if cols > self.scratch.gamma_count():
             print(t"quant: gamma {g.name} cols exceed scratch")
             return None
 
-        if not read_sync(self.ring, loc.shard, loc.data_start, loc.byte_size,
+        if not read_sync(self.ring, g.shard, g.src_offset, g.byte_size,
                 self.scratch.raw()):
             return None
 
-        if not decode_to_f32(loc.dtype, self.scratch.raw(),
+        if not decode_to_f32(g.src_dtype, self.scratch.raw(),
                 self.scratch.gamma(), cols):
-            print(t"quant: unsupported gamma dtype for {g.name}: {loc.dtype}")
+            print(t"quant: unsupported gamma dtype for {g.name}: {g.src_dtype}")
             return None
 
         if not g.absorbed:
@@ -1075,7 +1017,7 @@ struct QuantWorker(Movable):
 
         var gamma_ptr = Optional[PtrF32](None)
         if p.gamma.is_present():
-            var g = self.get_gamma(p.gamma, p.id.cols)
+            var g = self.get_gamma(p.gamma)
             if not g:
                 return False
             gamma_ptr = g.value()
@@ -1216,27 +1158,19 @@ struct QuantWorker(Movable):
         return ok
 
     def write_router_bias(mut self, ref p: RouterPlan) -> Bool:
-        var loc_opt = find_tensor(p.bias_name, self.headers)
-        if not loc_opt:
-            print(t"quant: missing router bias {p.bias_name}")
-            return False
-        var loc = loc_opt.take()
         var rows = p.id.rows
-        if loc.rows * loc.cols != rows:
-            print(t"quant: router bias {p.bias_name} size mismatch")
-            return False
-        if loc.byte_size > self.scratch.raw_bytes():
+        if p.bias_byte_size > self.scratch.raw_bytes():
             print(t"quant: router bias {p.bias_name} raw bytes exceed scratch")
             return False
         if rows > self.scratch.work_count():
             print(t"quant: router bias {p.bias_name} rows exceed scratch")
             return False
-        if not read_sync(self.ring, loc.shard, loc.data_start, loc.byte_size,
-                self.scratch.raw()):
+        if not read_sync(self.ring, p.bias_shard, p.bias_src_offset,
+                p.bias_byte_size, self.scratch.raw()):
             return False
-        if not decode_to_f32(loc.dtype, self.scratch.raw(),
+        if not decode_to_f32(p.bias_src_dtype, self.scratch.raw(),
                 self.scratch.work(), rows):
-            print(t"quant: unsupported router bias dtype for {p.bias_name}: {loc.dtype}")
+            print(t"quant: unsupported router bias dtype for {p.bias_name}: {p.bias_src_dtype}")
             return False
         var ok = write_sync(self.ring, self.output_fd_idx,
             self.data_start + p.bias_off, rows * 4,
