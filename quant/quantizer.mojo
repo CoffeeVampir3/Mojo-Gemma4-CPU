@@ -1,6 +1,8 @@
 from std.collections import Dict, InlineArray
 from std.math import min
 from std.memory import Span, UnsafePointer, alloc
+from std.os import makedirs
+from std.os.path import dirname
 from std.pathlib import Path
 from std.reflection import reflect
 from std.sys.info import simd_width_of
@@ -463,6 +465,13 @@ struct Quantizer(Movable):
             self.fds.append(Int32(fd))
 
         var out_path_str = String(output_path)
+        var out_dir = dirname(out_path_str)
+        if out_dir.byte_length() > 0:
+            try:
+                makedirs(out_dir, exist_ok=True)
+            except err:
+                print(t"quant: mkdir failed for {out_dir}: {err}")
+                return
         var ofd = sys.sys_openat(linux.AT_FDCWD, out_path_str,
             WriteMode.OPEN_FLAGS, WriteMode.CREATE_MODE)
         if ofd < 0:
