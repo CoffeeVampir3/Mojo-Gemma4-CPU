@@ -1,3 +1,4 @@
+from std.os import getenv
 from std.time import perf_counter_ns
 from threading.threading_traits import BurstThreadPool
 
@@ -51,6 +52,58 @@ def rule(n: Int) -> String:
     for _ in range(n):
         s += "-"
     return s
+
+
+def pad_center(s: String, w: Int) -> String:
+    var n = s.byte_length()
+    if n >= w:
+        return s
+    var left = (w - n) // 2
+    var right = w - n - left
+    var out = String("")
+    for _ in range(left):
+        out += " "
+    out += s
+    for _ in range(right):
+        out += " "
+    return out
+
+
+def color_enabled() -> Bool:
+    return getenv("NO_COLOR", default="") == ""
+
+
+def colorize(s: String, code: String, enabled: Bool) -> String:
+    if not enabled:
+        return s
+    return "\U0000001B[" + code + "m" + s + "\U0000001B[0m"
+
+
+def pct_tenths(part: Int, whole: Int) -> Int:
+    if whole <= 0:
+        return 0
+    return part * 1000 // whole
+
+
+def heat_pct(part: Int, whole: Int, s: String, enabled: Bool) -> String:
+    var tenths = pct_tenths(part, whole)
+    if tenths >= 100:
+        return colorize(s, "1;31", enabled)
+    if tenths >= 30:
+        return colorize(s, "33", enabled)
+    if tenths >= 10:
+        return colorize(s, "36", enabled)
+    if part == 0:
+        return colorize(s, "2", enabled)
+    return s
+
+
+def metric_header(cw: Int, pct_w: Int) -> String:
+    return (pad_left("mean", cw)
+        + " "
+        + pad_left("p99", cw)
+        + " "
+        + pad_left("%wall", pct_w))
 
 
 struct ReservoirMetric[N: Int = PROFILE_RESERVOIR](Copyable, Movable):
@@ -122,16 +175,21 @@ struct ReservoirMetric[N: Int = PROFILE_RESERVOIR](Copyable, Movable):
             hi_idx = filled - 1
         return (ordered[lo_idx], ordered[hi_idx])
 
-    def fmt_row(self, section: String, name_w: Int, cw: Int, grand: Int) -> String:
+    def fmt_cells(self, cw: Int, pct_w: Int, grand: Int, colors: Bool) -> String:
         var q = self.quantiles(0.5, 0.99)
-        return (pad_right(section, name_w)
-            + pad_left(String(self.count), 8)
-            + pad_left(human_ns(self.minv), cw)
-            + pad_left(human_ns(q[0]), cw)
-            + pad_left(human_ns(q[1]), cw)
-            + pad_left(human_ns(self.maxv), cw)
-            + pad_left(human_ns(self.mean()), cw)
-            + pad_left(pct_str(self.total, grand), 8))
+        var p50 = q[0]
+        var p99 = q[1]
+        var mean_s = pad_left(human_ns(self.mean()), cw)
+        var p99_s = pad_left(human_ns(p99), cw)
+        if (p50 > 0 and p99 > p50 * 4 and p99 > 10_000) or (
+            p50 == 0 and p99 > 10_000
+        ):
+            p99_s = colorize(p99_s, "35", colors)
+        var wall_s = heat_pct(
+            self.total, grand, pad_left(pct_str(self.total, grand), pct_w),
+            colors,
+        )
+        return mean_s + " " + p99_s + " " + wall_s
 
 
 struct ProfileRecord(Copyable, Movable):
@@ -201,10 +259,14 @@ struct Profiler[Profile: Bool, N: Int = 64](Copyable, Movable):
                 return
             var name_w = 7  # byte_length("section")
             for i in range(self.count):
-                var w = self.records[i].label.byte_length() + 11  # + " / dispatch"
+                var w = self.records[i].label.byte_length()
                 if w > name_w:
                     name_w = w
-            var cw = 11
+            var calls_w = 6
+            var cw = 8
+            var pct_w = 6
+            var group_w = cw * 2 + pct_w + 2
+            var colors = color_enabled()
 
             # per-label totals, then order labels by cost desc
             var totals = List[Int](capacity=self.count)
@@ -223,39 +285,67 @@ struct Profiler[Profile: Bool, N: Int = 64](Copyable, Movable):
                     b -= 1
                 order[b + 1] = key
 
-            var header = (pad_right("section", name_w)
-                + pad_left("calls", 8)
-                + pad_left("min", cw) + pad_left("p50", cw)
-                + pad_left("p99", cw) + pad_left("max", cw)
-                + pad_left("mean", cw) + pad_left("%wall", 8))
+            var section_h = pad_right("section", name_w)
+            var calls_h = pad_left("calls", calls_w)
+            var header_top = (
+                section_h + calls_h
+                + " | " + pad_center("dispatch", group_w)
+                + " | " + pad_center("compute", group_w)
+                + " | " + pad_center("join", group_w)
+            )
+            var blanks = pad_right("", name_w + calls_w)
+            var metrics = metric_header(cw, pct_w)
+            var header_bottom = (
+                blanks
+                + " | " + metrics
+                + " | " + metrics
+                + " | " + metrics
+            )
             print()
-            print("=== " + String(title) + " : per-dispatch latency ===")
-            print(header)
-            print(rule(header.byte_length()))
+            print(t"=== {title} : per-dispatch latency ===")
+            print(header_top)
+            print(header_bottom)
+            print(rule(header_top.byte_length()))
             var td = 0
             var tc = 0
             var tj = 0
             for oi in range(self.count):
                 ref r = self.records[order[oi]]
-                var lbl = String(r.label)
-                print(r.dispatch.fmt_row(lbl + " / dispatch", name_w, cw, self.wall_ns))
-                print(r.compute.fmt_row(lbl + " / compute", name_w, cw, self.wall_ns))
-                print(r.join.fmt_row(lbl + " / join", name_w, cw, self.wall_ns))
+                var label = pad_right(String(r.label), name_w)
+                var calls = pad_left(String(r.dispatch.count), calls_w)
+                var dispatch = r.dispatch.fmt_cells(
+                    cw, pct_w, self.wall_ns, colors)
+                var compute = r.compute.fmt_cells(
+                    cw, pct_w, self.wall_ns, colors)
+                var join = r.join.fmt_cells(
+                    cw, pct_w, self.wall_ns, colors)
+                print(t"{label}{calls} | {dispatch} | {compute} | {join}")
                 td += r.dispatch.total
                 tc += r.compute.total
                 tj += r.join.total
-            print(rule(header.byte_length()))
+            print(rule(header_top.byte_length()))
             var accounted = td + tc + tj
             var wall = self.wall_ns
             var dark = wall - accounted
             if dark < 0:
                 dark = 0
-            print("by phase   dispatch " + human_ns(td) + " (" + pct_str(td, wall) + ")"
-                + "   compute " + human_ns(tc) + " (" + pct_str(tc, wall) + ")"
-                + "   join " + human_ns(tj) + " (" + pct_str(tj, wall) + ")")
-            print("wall " + human_ns(wall)
-                + "   accounted " + human_ns(accounted) + " (" + pct_str(accounted, wall) + ")"
-                + "   dark " + human_ns(dark) + " (" + pct_str(dark, wall) + ")")
+            var td_h = human_ns(td)
+            var td_pct = pct_str(td, wall)
+            var tc_h = human_ns(tc)
+            var tc_pct = pct_str(tc, wall)
+            var tj_h = human_ns(tj)
+            var tj_pct = pct_str(tj, wall)
+            var td_pct_hot = heat_pct(td, wall, td_pct, colors)
+            var tc_pct_hot = heat_pct(tc, wall, tc_pct, colors)
+            var tj_pct_hot = heat_pct(tj, wall, tj_pct, colors)
+            print(t"by phase   dispatch {td_h} ({td_pct_hot})   compute {tc_h} ({tc_pct_hot})   join {tj_h} ({tj_pct_hot})")
+            var wall_h = human_ns(wall)
+            var accounted_h = human_ns(accounted)
+            var accounted_pct = pct_str(accounted, wall)
+            var dark_h = human_ns(dark)
+            var dark_pct = pct_str(dark, wall)
+            var dark_pct_hot = heat_pct(dark, wall, dark_pct, colors)
+            print(t"wall {wall_h}   accounted {accounted_h} ({accounted_pct})   dark {dark_h} ({dark_pct_hot})")
 
 
 @always_inline
