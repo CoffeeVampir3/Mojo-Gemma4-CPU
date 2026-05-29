@@ -8,7 +8,7 @@ from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from std.sys.info import simd_width_of
 from simd_math.ops import sqrt
-from kernels.helpers import ArenaBases, Binding
+from kernels.helpers import ArenaBases, Binding, prime_fp_environment
 from kernels.profiling import Profiler
 from kernels.moe_router import (
     RouterCandidate, SparseRoute,
@@ -1086,6 +1086,8 @@ struct Gemma4[
         ref layout = self.layout
         comptime width = simd_width_of[DType.float32]()
         comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
+
+        prime_fp_environment[Self.degree, Self.max_worker_count](self.pools)
 
         @parameter
         def bake_router_scale(p: UnsafePointer[BFloat16, MutAnyOrigin]):

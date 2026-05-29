@@ -1,8 +1,10 @@
 # ButterQuant Reference
 
-## Int8 Encoding and Dequantization Identities for Hadamard-Domain Transformer Operators
+## Int8 Encoding and Dequantization Identities for Hadamard-Domain Operators
 
-This document specifies the int8 quantization scheme that operates on top of the Hadamard-domain transformer algebra of the Hadamard Arithmetic Reference (HAR). HAR establishes which transformer operations preserve which Hadamard bases. This document specifies the int8 encoding of activations and weights, the dequantization identities at operator boundaries, and the recipes that match each operator class.
+This document specifies an int8 quantization scheme that operates on top of the Hadamard-domain linear algebra of the Hadamard Arithmetic Reference (HAR). HAR establishes which operations preserve which Hadamard bases. This document specifies the int8 encoding of activations and weights, the dequantization identities at operator boundaries, and the recipes that match each operator class.
+
+This is a specification of *encodings and identities*, not a procedure. Where an order of operations is stated, it is because a non-commutation (HAR §6.4) or the basis in which a quantity is defined forces that order; such cases are called out explicitly. Operations that are not so constrained may be applied in any order, and no ordering should be inferred from the order of presentation.
 
 The conventions of HAR are inherited. $\mathcal{H}_d$ is the normalized block-diagonal Hadamard with block size $n$ such that $n \mid d$. $\mathcal{Q}$ is a coordinatewise quantization-reconstruction operator. $\tilde x = \mathcal{H}_d x$.
 
@@ -60,7 +62,7 @@ $$\mathrm{cs}[n, b] = \sum_{k \in \Omega_b} W_{n,k}.$$
 
 ## 1.5 Hardware operand constraints
 
-Different SIMD/tile dot-product instructions impose different operand-sign requirements:
+This is a hardware-aware encoding: the int8 storage form of each operand follows the operand-sign requirements of the dot-product instruction that consumes it. Different SIMD/tile dot-product instructions impose different requirements:
 
 | Instruction | A operand | B operand |
 |---|---|---|
@@ -69,11 +71,11 @@ Different SIMD/tile dot-product instructions impose different operand-sign requi
 | `tdpbsud` (AMX) | i8 (tile) | u8 (tile) |
 | `tdpbssd` (AMX) | i8 (tile) | i8 (tile) |
 
-Where the dot product instruction takes one unsigned operand and that operand encodes signed data via the affine relation of §1.4, the signed-signed inner product is recovered by subtracting $128$ times the sum of the operand that remains signed, taken over the contraction index. The location of this correction depends on which operand is unsigned: in a linear projection where the activation is encoded as $u_8$ and the weight stays $i_8$, the correction is $128 \cdot \sum_k W_{i_8}[n, k]$ (one value per output row, the weight colsum); in attention scoring where the cached K is encoded as $u_8$ and the query stays $i_8$, the correction is $128 \cdot \sum_k q_{i_8}[k]$ (one value per query head per query position, the query int8 sum).
+Where the dot product instruction takes one unsigned operand and that operand encodes signed data via the affine relation of §1.4, the signed-signed inner product is recovered by subtracting $128$ times the sum of the operand that remains signed, taken over the contraction index. The location of this correction depends on which operand is unsigned: where the activation is encoded as $u_8$ and the weight stays $i_8$, the correction is $128 \cdot \sum_k W_{i_8}[n, k]$ (one value per output row, the weight colsum); where one operand of a score-style dot is encoded as $u_8$ and the other stays $i_8$, the correction is $128$ times the sum of the signed operand over the contraction index (one value per output of that operand).
 
-Where the unsigned operand encodes non-negative data directly (without the $+128$ offset, e.g., a u8 attention weight in $[0, 255]$ representing a non-negative softmax product), no such correction is applied. Where the instruction admits a signed-signed form, both operands are consumed as $i_8$ and no correction is applied.
+Where the unsigned operand encodes non-negative data directly (without the $+128$ offset, e.g., a u8 value in $[0, 255]$ representing a non-negative quantity), no such correction is applied. Where the instruction admits a signed-signed form, both operands are consumed as $i_8$ and no correction is applied.
 
-The dequantized identity is the same in all forms. The choice of operand sign at each kernel site is a property of the available instruction and the data range of each operand.
+The dequantized identity is the same in all forms. The choice of operand sign at each kernel site is a property of the available instruction and the data range of each operand: it selects the storage form and the location of any correction, but does not change the dequantized identity.
 
 ---
 
@@ -95,7 +97,7 @@ $$x_{i_8}[k] = Q_{S_a[b]}(x_k) \text{ for } k \in \Omega_b, \qquad S_a[b] = \max
 
 Output: one i8 vector of length $K$ and $K/B$ f32 scales.
 
-Since $\Omega_b \subseteq \{1, \ldots, K\}$, $S_a[b] \le S_a$ for every $b$. The per-block grid step $S_a[b] / 127$ is therefore at most as coarse as the per-row grid step $S_a / 127$ over the same coordinates. The relative magnitudes of the per-block grid steps within a row depend on the within-row energy distribution and are not bounded above by a fixed function of $B$ and $K$. The cost is $K/B$ scales per row in place of one.
+Since $\Omega_b \subseteq \{1, \ldots, K\}$, $S_a[b] \le S_a$ for every $b$. The per-block grid step $S_a[b] / 127$ is therefore at most as coarse as the per-row grid step $S_a / 127$ over the same coordinates. The relative magnitudes of the per-block grid steps within a row depend on the within-row energy distribution and are not bounded above by a fixed function of $B$ and $K$. The cost is $K/B$ scales per row in place of one. The choice between per-row and per-block is governed by measurable factors — scale utilization under the data's magnitude structure (§3.6) and the accumulation structure the consuming hardware permits (§7.6) — not by preference.
 
 ## 2.3 Weight encodings
 
@@ -159,13 +161,13 @@ The two-sided encoding applies $\mathcal{H}_K^T$ to the rows of $W$ and $\mathca
 
 The runtime activation FWHT for the K axis is identical in single-sided and two-sided forms. The two encodings differ at the M-axis output: single-sided produces $W x$ directly; two-sided produces $\mathcal{H}_M W x$.
 
-The two-sided form moves one runtime FWHT — the M-axis rotation that the next consumer would otherwise perform — into the offline weight encoding. The single-sided form leaves that FWHT at runtime.
+The two-sided form moves one FWHT — the M-axis rotation that a consumer operating in the rotated basis would otherwise perform — into the offline weight encoding. The single-sided form leaves that FWHT at the output.
 
 ## 3.4 Block-size constraint
 
-When the M-axis rotation $\mathcal{H}_M$ has block size $d$, the next consumer that operates in the rotated basis must have a K-axis encoding with the same block size $d$. If the block sizes differ, the runtime must apply a basis-change FWHT, which is the same FWHT the single-sided encoding would have placed at runtime; the offline rotation is then redundant.
+When the M-axis rotation $\mathcal{H}_M$ has block size $d$, a consumer that operates in the rotated basis must have a K-axis encoding with the same block size $d$. If the block sizes differ, a basis-change FWHT is required, which is the same FWHT the single-sided encoding would have placed at the output; the offline rotation is then redundant.
 
-For per-head consumers (where the next operation is structured per head of dimension $d_{\text{head}}$), $d = d_{\text{head}}$.
+For per-block consumers (where the next operation is structured per block of dimension $d$), the M-axis block size is $d$.
 
 ## 3.5 Effect on the per-row absmax
 
@@ -174,6 +176,14 @@ By Parseval, $\|H_n x\|_2 = \|x\|_2$. The per-coordinate distribution differs in
 The relationship between the rotated absmax $\max_k |(H_n x)_k|$ and the original absmax $\max_k |x_k|$ is not monotone. For $x$ aligned with a single coordinate ($x = c \cdot e_i$), the rotated absmax is $|c|/\sqrt n$, smaller than the original $|c|$ by factor $\sqrt n$. For $x$ aligned with one row of $H_n$ ($x = c \cdot h_i^T$), the rotated absmax is $|c|$, larger than the original $|c|/\sqrt n$ by factor $\sqrt n$. For inputs in between, the rotated absmax falls in between.
 
 The rotation does not eliminate per-row magnitude variance across rows. Per-row dynamic scales handle inter-row variance independently of the rotation.
+
+## 3.6 Scale axis and utilization
+
+A scale covers the absmax of every value it is shared across, so a value whose local absmax $a$ is smaller than the shared scale $S$ occupies only the fraction $u = a / S \le 1$ of the int8 range. The effective precision loss relative to a scale matched to $a$ is approximately $\log_2(1/u)$ bits. The axis along which a scale is held fixed is therefore a measurable choice, not a free one.
+
+A block-diagonal Hadamard redistributes energy among the coordinates *within* a vector (§3.5), but acts identically and independently on every vector along an index axis. It flattens within-vector coordinate variance and leaves cross-vector magnitude variance along the index axis unchanged. A scale shared across an index axis that carries magnitude variance — for example one fixed scale per coordinate, held constant across rows or across cached positions — must size to the largest-magnitude vector on that axis, leaving every smaller vector at low utilization. The rotation cannot recover this loss, because it does not act across that axis.
+
+The dynamic scale is therefore placed on the axis that carries the magnitude variance: one scale per vector along that axis (per-row, §II; per cached position, §VIII), computed from that vector's own absmax. The rotation handles the orthogonal within-vector variance so that one per-vector scale suffices. A scale shared across an index axis is appropriate only where magnitude variance along that axis is small enough that the resulting utilization is acceptable; otherwise the shared-scale form is measurably lossier at no benefit the rotation can offset.
 
 ---
 
@@ -187,7 +197,7 @@ $$\gamma_k = \mathrm{sign}(\gamma_k) \sqrt{|\gamma_k|} \cdot \sqrt{|\gamma_k|}.$
 
 For $\gamma_k = 0$, the right-hand side is $0$ when $\mathrm{sign}(0)$ is taken as $0$.
 
-## 4.2 Application to RMSNorm followed by linear map
+## 4.2 Application to RMSNorm followed by a linear map
 
 Let $W \in \mathbb{R}^{N \times K}$ follow $\mathrm{RMSNorm}_\gamma$ in the operator chain $W \cdot \mathrm{RMSNorm}_\gamma(x)$. Define
 
@@ -199,29 +209,29 @@ Then
 
 $$\sum_k W'_{n, k} \cdot x'_k = \sum_k W_{n, k} \cdot \frac{x_k}{\mathrm{rms}(x)} \cdot \gamma_k = W \cdot \mathrm{RMSNorm}_\gamma(x).$$
 
-In exact arithmetic, the split factorization equals absorption (HAR §5.4) with $W'' = W \mathrm{diag}(\gamma)$ and no runtime gain. The split is a reparameterization of absorption.
+In exact arithmetic, the split factorization equals absorption (HAR §5.4) with $W'' = W \mathrm{diag}(\gamma)$ and no separate gain. The split is a reparameterization of absorption.
 
 ## 4.3 Effect on quantization grids
 
-Under absorption, the offline quantizer $Q_{S_{w''}}$ for $W'' = W \mathrm{diag}(\gamma)$ sees per-row dynamic ranges scaled by $\max_k |\gamma_k|$ relative to $W$. The runtime quantizer sees $x / \mathrm{rms}(x)$ with no gain factor.
+Under absorption, the offline quantizer $Q_{S_{w''}}$ for $W'' = W \mathrm{diag}(\gamma)$ sees per-row dynamic ranges scaled by $\max_k |\gamma_k|$ relative to $W$. The activation quantizer sees $x / \mathrm{rms}(x)$ with no gain factor.
 
-Under split, the offline quantizer for $W' = W \mathrm{diag}(\sqrt{|\gamma|})$ sees per-row dynamic ranges scaled by $\max_k \sqrt{|\gamma_k|}$. The runtime quantizer sees $x / \mathrm{rms}(x) \cdot \mathrm{sign}(\gamma) \sqrt{|\gamma|}$, scaled by $\max_k \sqrt{|\gamma_k|}$.
+Under split, the offline quantizer for $W' = W \mathrm{diag}(\sqrt{|\gamma|})$ sees per-row dynamic ranges scaled by $\max_k \sqrt{|\gamma_k|}$. The activation quantizer sees $x / \mathrm{rms}(x) \cdot \mathrm{sign}(\gamma) \sqrt{|\gamma|}$, scaled by $\max_k \sqrt{|\gamma_k|}$.
 
 The split distributes $\sqrt{|\gamma|}$ symmetrically across the two quantization grids. Absorption concentrates the full $|\gamma|$ on the offline grid.
 
 ## 4.4 Stability floor
 
-The runtime activation factor may be evaluated as
+The activation-side factor may be evaluated as
 
 $$\sigma_\gamma[k] = \mathrm{sign}(\gamma_k) \sqrt{\max(|\gamma_k|, \epsilon_\gamma)}.$$
 
-For $|\gamma_k| > \epsilon_\gamma$, $\sigma_\gamma[k] = \mathrm{sign}(\gamma_k) \sqrt{|\gamma_k|}$ as in §4.1, and the offline-runtime product equals $\gamma_k$.
+For $|\gamma_k| > \epsilon_\gamma$, $\sigma_\gamma[k] = \mathrm{sign}(\gamma_k) \sqrt{|\gamma_k|}$ as in §4.1, and the offline–activation product equals $\gamma_k$.
 
-For $|\gamma_k| \le \epsilon_\gamma$, the product is $\sqrt{|\gamma_k| \cdot \epsilon_\gamma}$ when the offline factor uses $\sqrt{|\gamma_k|}$ without floor. The mismatch is bounded by $\sqrt{\epsilon_\gamma \cdot \max(|\gamma_k|, \epsilon_\gamma)}$ and vanishes at $\gamma_k = 0$ when $\mathrm{sign}(0) = 0$.
+For $|\gamma_k| \le \epsilon_\gamma$, the product is $\sqrt{|\gamma_k| \cdot \epsilon_\gamma}$ when the offline factor uses $\sqrt{|\gamma_k|}$ without floor. The mismatch is bounded by $\sqrt{\epsilon_\gamma \cdot \max(|\gamma_k|, \epsilon_\gamma)}$ and vanishes at $\gamma_k = 0$ when $\mathrm{sign}(0) = 0$. The floor is applied on the activation side only; the offline factor uses $\sqrt{|\gamma_k|}$ without floor.
 
 ## 4.5 Availability
 
-The split is defined when an RMSNorm with gain $\gamma$ immediately precedes a linear map. The decomposition has no meaning otherwise: when no preceding RMSNorm exists, no $\gamma$ is available to split, and the linear map's weight encoding is the un-absorbed form.
+The split is defined when an RMSNorm with gain $\gamma$ immediately precedes a linear map: that is the only configuration in which a $\gamma$ exists to split and a private weight exists to absorb the offline half. It has no meaning otherwise. When the weight that would carry the offline factor is shared or tied to another operator, the offline half cannot be baked in without altering the other use; the full gain then stays on the activation side and the weight is encoded in its un-absorbed form.
 
 ---
 
@@ -234,7 +244,7 @@ For $y = Wx$ with $W \in \mathbb{R}^{N \times K}$, two int8 encodings are availa
 - Single-sided: $W^\sharp = W \mathcal{H}_K^T$, dequantized output $y$ in original basis.
 - Two-sided: $\tilde W = \mathcal{H}_M W \mathcal{H}_K^T$, dequantized output $\mathcal{H}_M y$ in M-rotated basis.
 
-Both are exact reformulations of $y = Wx$. The runtime cost of the K-axis FWHT on the activation is identical. The output basis differs.
+Both are exact reformulations of $y = Wx$. The cost of the K-axis FWHT on the activation is identical. The output basis differs.
 
 ## 5.2 Operations preserving the M-rotated basis
 
@@ -251,11 +261,11 @@ The following operations on $y$ commute with the M-axis Hadamard $\mathcal{H}_M$
 The following operations do not in general commute with $\mathcal{H}_M$:
 
 - Coordinatewise nonlinearities $\phi(y)$: HAR §6.1, $\mathcal{H}_M \phi(y) \ne \phi(\mathcal{H}_M y)$ in general.
-- Coordinatewise gain $\mathrm{diag}(\beta) y$ when $\beta$ is not constant per Hadamard block: $\mathcal{H}_M \mathrm{diag}(\beta) \mathcal{H}_M^T$ is dense.
-- Position-dependent rotations applied in the original coordinate basis (e.g., RoPE on a partial-RoPE layout): $\mathcal{H}_M R_p \mathcal{H}_M^T$ is dense.
+- Coordinatewise gain $\mathrm{diag}(\beta) y$ when $\beta$ is not constant per Hadamard block: $\mathcal{H}_M \mathrm{diag}(\beta) \mathcal{H}_M^T$ is dense (HAR §6.4).
+- Position-dependent rotations applied in the original coordinate basis: $\mathcal{H}_M R_p \mathcal{H}_M^T$ is dense (HAR §6.4).
 - Reductions whose statistic is not norm-based.
 - Residual addition into a vector in the original basis.
-- Vocabulary logits.
+- A coordinate-basis output (e.g. an output consumed directly in its own coordinate system, such as a set of logits read by a sampler).
 
 After such an operation, a downstream linear map's encoding starts from a fresh K-axis rotation if int8 is to be re-entered.
 
@@ -263,21 +273,11 @@ After such an operation, a downstream linear map's encoding starts from a fresh 
 
 The two-sided form for $W$ is legal — meaning the encoding requires no basis-change FWHT beyond what is already in the operator chain — if and only if every operation between $W$ and the next operation requiring original coordinates is in the class of §5.2.
 
-When the two-sided form is legal, the M-axis FWHT is applied once offline at weight quantization, in place of one runtime FWHT per token after the matmul output. When the two-sided form is not legal, using it requires inserting an explicit inverse FWHT before the next operation that requires original coordinates.
+When the two-sided form is legal, the M-axis FWHT is applied once offline at weight quantization, in place of one FWHT at the matmul output. When the two-sided form is not legal, using it requires inserting an explicit inverse FWHT before the next operation that requires original coordinates.
 
-The single-sided form requires no basis-change FWHT in either case; it leaves the M-axis FWHT at runtime when one is required by the next consumer, and inserts no FWHT when one is not.
+The single-sided form requires no basis-change FWHT in either case; it leaves the M-axis FWHT at the output when one is required by the next consumer, and inserts no FWHT when one is not.
 
-## 5.5 Specific operator chains
-
-The following classifications follow from §5.2 and §5.3 applied to standard transformer block structures.
-
-V projection, then V-aggregation, then O projection. V-aggregation $\sum_t a_t v_{g, t}$ is in §5.2 (scalar multiplication and sum over a disjoint axis). The O projection consumes its input on a K axis that can be K-rotated to match V's M-axis rotation. The two-sided form for V is available with $\mathcal{H}_M$ block size $d_{\text{head}}$ and is legal in the §5.4 sense (no additional basis conversion is required). The V cache stores $\tilde v$ in the rotated basis. The V-aggregation kernel applies no FWHT at runtime. The O projection is single-sided with K-axis block size $d_{\text{head}}$.
-
-Q projection, then full-vector RMSNorm, then per-head gain, then RoPE, then per-head FWHT, then quantization. The full-vector RMS denominator $\alpha_Q = 1/\sqrt{\|q\|_2^2/D_Q + \epsilon}$ is norm-based and is preserved by Parseval (HAR §10.2): the same scalar $\alpha_Q$ can be collected from $q$ in any orthonormal basis. The per-head gain $\gamma_Q$ and the RoPE rotation $R_p$ applied in the original coordinate basis do not commute with the per-head Hadamard $H_{d_{\text{head}}}$ (HAR §10.1): $H_{d_{\text{head}}} \mathrm{diag}(\gamma_Q) H_{d_{\text{head}}}^T$ and $H_{d_{\text{head}}} R_p H_{d_{\text{head}}}^T$ are dense in general. A two-sided Q encoding with $\mathcal{H}_M = \bigoplus H_{d_{\text{head}}}$ would produce projection output in the per-head rotated basis; applying $\gamma_Q$ and $R_p$ then requires an explicit basis conversion (one inverse FWHT per head) before the gain and a re-entry rotation (one forward FWHT per head) after RoPE. The single-sided encoding places one runtime FWHT per head after $R_p$; the two-sided encoding would place two. K projection is identical.
-
-FFN gate and up projections, then $\mathrm{silu}(\text{gate}) \odot \text{up}$, then down projection. The pointwise nonlinearity is in §5.3. A two-sided encoding of gate or up would produce output in a rotated basis and require an inverse FWHT before the nonlinearity. The single-sided encoding of gate and up places the K-axis FWHT in the offline weight only; the activation feeding the down projection is freshly quantized after the nonlinearity (a runtime FWHT entry into a per-block rotated basis). The down projection is single-sided because its output enters the residual stream in the original basis (residual addition is in §5.2 only when both operands share a basis, and the pre-existing residual is in original).
-
-LM head. The matmul output is vocabulary logits, consumed in the vocabulary coordinate basis. A two-sided encoding would produce logits in a rotated basis and require an inverse FWHT before sampling. The single-sided encoding produces logits directly in the sampler's basis.
+A coordinatewise nonlinearity, a non-block-constant gain, or a position-dependent rotation between $W$ and the next consumer therefore disqualifies the two-sided form for $W$: the operation in §5.3 forces a return to original coordinates that the two-sided rotation would have to be undone for.
 
 ---
 
@@ -321,7 +321,7 @@ The colsum is not consumed.
 
 ## 6.4 Equivalence
 
-In exact arithmetic, the two forms produce identical $\hat y[n]$. The choice is determined by the available dot-product instruction at the kernel site.
+In exact arithmetic, the two forms produce identical $\hat y[n]$. The choice is determined by the available dot-product instruction at the kernel site (§1.5).
 
 ---
 
@@ -371,137 +371,129 @@ The per-block GEMV admits a per-call output scalar $\beta \in \mathbb{R}$:
 
 $$\hat y[n] = \beta \cdot \bar S_w[n] \cdot \sum_b (r[n, b] - 128 \cdot \mathrm{cs}[n, b]) \cdot \frac{S_a[b]}{127}.$$
 
-The scalar $\beta$ folds into the bf16 cast at the kernel output. This admits per-call scaling factors such as a routing weight in MoE down projections.
+The scalar $\beta$ multiplies the dequantized f32 result before it is accumulated or written. Because the dequantization tail is linear in its result, $\beta$ may be applied at any point after the block sum is formed and before the output store. This admits per-call scaling factors carried alongside each output row.
+
+## 7.6 Accumulation structure and tile hardware
+
+The granularity of the activation scale fixes where the scale sits relative to the K-axis reduction, and that placement determines whether the integer reduction can run uninterrupted on tile-accumulation hardware.
+
+- *Per-row activation scale* (§6.2): the scale multiplies outside the K-sum. The contraction is one uninterrupted integer reduction over all of $K$; dequantization is a single f32 post-multiply per output. A tile multiply-accumulate unit can accumulate the full $K$ dimension in-tile and apply the scale once at the end.
+- *Per-block activation scale* (§7.2): the scale multiplies inside the cross-block sum. The $K$ reduction is segmented into blocks of size $B$; each block's integer partial is scaled by its own f32 scale and summed in f32. The integer accumulator cannot span the full $K$ dimension.
+
+On a per-output (GEMV) path the per-block form costs little. On a tile-accumulation (AMX-style) path it breaks the tile reduction pattern: the accumulator must be drained per block and an f32 scale applied mid-reduction. The per-block weight colsum is segmented the same way (§2.5), with the correction $128 \cdot \mathrm{cs}[n, b]$ applied per block; a per-row weight scale stays a single post-accumulation multiply and is tile-accumulation-friendly, whereas a per-block weight scale is not.
+
+The granularity decision is thus a hardware decision as much as a precision one: per-block buys finer adaptation to within-row energy structure (§2.2) and tighter utilization (§3.6) at the cost of the tile reduction; per-row preserves the tile reduction at the cost of one scale per row. Neither dominates; the choice follows from the consuming hardware and the measured magnitude structure of the operand.
 
 ---
 
-# VIII. KV Cache Encoding
+# VIII. Cache Encoding
+
+A cache stores, per cached index, the int8 encoding of a per-element vector that a later operator consumes on a contraction axis — the score contraction (§X) and the aggregation (§XI). Per cached index the cache holds int8 data plus one f32 scale per (group, index).
 
 ## 8.1 Cache contents
 
-For one cached position $t$ at KV head $g$:
+For one cached position $t$ at group $g$:
 
 | Quantity | Type | Storage |
 |---|---|---|
-| $K_{i_8}[g, t]$ | int8 | $(d_{\text{head}},)$ in u8 or i8 form |
-| $V_{i_8}[g, t]$ | int8 | $(d_{\text{head}},)$ in i8 form |
+| $K_{i_8}[g, t]$ | int8 | $(d,)$ in u8 or i8 form |
+| $V_{i_8}[g, t]$ | int8 | $(d,)$ in i8 form |
 | $K_{\text{scale}}[g, t]$ | f32 | $()$ |
 | $V_{\text{scale}}[g, t]$ | f32 | $()$ |
 
-## 8.2 K cache content
+where $d$ is the per-group block size.
 
-The K cache stores the per-head FWHT of the post-RoPE per-head normalized K vector:
+## 8.2 Cached vector
 
-$$\tilde k_{g, t} = H_{d_{\text{head}}} \, R_t \, (\gamma_K \odot \alpha_K \cdot k_{g, t})$$
+Let $c_{g, t} \in \mathbb{R}^d$ be the per-element vector the downstream contraction consumes in original coordinates. The cache stores the int8 quantization of its block-Hadamard rotation:
 
-where $R_t$ is RoPE at position $t$, $\gamma_K$ is the per-head K norm gain, and $\alpha_K$ is the full-vector K inverse RMS scalar. Then
+$$\hat c_{i_8}[g, t, k] = Q_{S_c[g, t]}\big((\mathcal{H}_d\, c_{g, t})_k\big), \qquad S_c[g, t] = \max_k |(\mathcal{H}_d\, c_{g, t})_k|.$$
 
-$$K_{i_8}[g, t, k] = Q_{S_K[g, t]}(\tilde k_{g, t, k}), \qquad K_{\text{scale}}[g, t] = S_K[g, t] = \max_k |\tilde k_{g, t, k}|.$$
+Forced orderings:
 
-The cache may store $K_{i_8}$ in i8 form or in u8 form ($K_{i_8} \oplus \mathtt{0x80}$). The choice is determined by the operand convention of the score dot instruction. The dequantized score is identical under both storage choices.
+- Any coordinatewise gain or position-dependent rotation that the producing operator applies to $c$ in the original basis must complete before $\mathcal{H}_d$, since its conjugate under $\mathcal{H}_d$ is dense (HAR §6.4).
+- The quantization follows $\mathcal{H}_d$: the scale $S_c$ is the absmax of the rotated vector, not of the original.
 
-## 8.3 V cache content, single-sided V
+Free choices:
 
-When the V projection uses the single-sided encoding (§3.1), the V cache stores the per-head FWHT of the projected V:
+- The rotation $\mathcal{H}_d c$ may be formed at cache-write time, or absorbed offline into the producing weight (the two-sided form of §3.2 with M-axis block size $d$), in which case the producing operator already emits $\mathcal{H}_d c$ and the cache write applies no transform. The stored layout, the scale, and the dequantized result are identical either way.
+- The int8 may be stored in i8 or u8 form (the u8 form is $\hat c_{i_8} \oplus \mathtt{0x80}$, §1.4). The choice follows the operand convention of the consuming dot product (§1.5). The dequantized result is identical under both storage choices.
 
-$$\tilde v_{g, t} = H_{d_{\text{head}}} v_{g, t},$$
+## 8.3 Storage footprint
 
-$$V_{i_8}[g, t, k] = Q_{S_V[g, t]}(\tilde v_{g, t, k}), \qquad V_{\text{scale}}[g, t] = S_V[g, t] = \max_k |\tilde v_{g, t, k}|.$$
+Per cached position per group, the cache holds $d$ int8 values for each cached vector, plus the per-(group, position) f32 scale of §8.1. The byte footprint is $d$ bytes per cached vector per position, independent of arrangement.
 
-The per-head FWHT is applied at cache write time.
-
-## 8.4 V cache content, two-sided V
-
-When the V projection uses the two-sided encoding (§3.2), the projection output $v_{g, t}$ is already in the head-rotated basis. The cache stores it directly:
-
-$$V_{i_8}[g, t, k] = Q_{S_V[g, t]}(v_{g, t, k}), \qquad V_{\text{scale}}[g, t] = \max_k |v_{g, t, k}|.$$
-
-No FWHT is applied at cache write time. The cache layout, scale storage, and downstream V-aggregation are identical to §8.3.
-
-## 8.5 Storage footprint
-
-Per cached position per head, the cache holds $d_{\text{head}}$ int8 K values and $d_{\text{head}}$ int8 V values, plus the per-(head, position) f32 scales $K_{\text{scale}}$ and $V_{\text{scale}}$ of §8.1. The byte footprint is $d_{\text{head}}$ bytes for K and $d_{\text{head}}$ bytes for V at each position, independent of arrangement.
-
-The physical layout of these bytes — contiguous per position, grouped across positions, or transposed between the K and V tensors — is not fixed by this encoding. It is an implementation choice of the score (§10) and V-aggregation (§11) kernels, determined by their dot-product access patterns, and the K encoding (i8 or u8, §8.2) follows the score dot's operand convention. The dequantized score and attention output are identical across layouts.
+The physical layout of these bytes — contiguous per position, grouped across positions, or transposed between two cached tensors — is not fixed by this encoding. It is determined by the dot-product access patterns of the consuming kernels (§X, §XI), and the int8/u8 storage choice follows the consuming dot's operand convention. The dequantized result is identical across layouts.
 
 ---
 
-# IX. Q Preparation
+# IX. Score-Operand Preparation
 
-## 9.1 Recipe
+The non-cached operand of the score contraction (the query side) is encoded once per use rather than stored in the cache. The encoding mirrors §8.2; the difference is that auxiliary scalars are stored for the dequantization tail of §X.
 
-Per query head $h$ at position $p$, with optional per-head gain $\gamma_Q$ and optional full-vector inverse RMS scalar $\alpha_Q$:
+## 9.1 Encoding
 
-1. Load bf16 query head into f32 SIMD registers.
-2. Apply gain and inverse RMS: $q_k \leftarrow q_k \cdot \alpha_Q \cdot \gamma_Q[k]$.
-3. Apply RoPE in the rotary prefix.
-4. Apply $H_{d_{\text{head}}}$ in-register.
-5. $S_Q[h, p] = \max_k |q_k|$.
-6. $q_{i_8}[h, p, k] = Q_{S_Q[h, p]}(q_k)$.
+For a query operand $q \in \mathbb{R}^d$,
 
-Steps 2 and 3 are skipped if QK normalization or RoPE is absent in the architecture.
+$$q_{i_8}[k] = Q_{S_q}\big((\mathcal{H}_d\, q')_k\big), \qquad S_q = \max_k |(\mathcal{H}_d\, q')_k|,$$
+
+where $q'$ is the query after any preprocessing the producing operator applies in the original basis (for example normalization, a coordinatewise gain, or a position-dependent rotation). The two orderings of §8.2 are forced for the same reasons: original-basis coordinatewise or position-dependent operators precede $\mathcal{H}_d$ (HAR §6.4); the quantization follows $\mathcal{H}_d$. Whether $q'$ involves any such preprocessing, and in what order, is a property of the producing operator and is not fixed by this encoding.
 
 ## 9.2 Stored auxiliary scalars
 
-Per query head per position:
+Per query operand:
 
-$$b_q[h, p] = 128 \cdot \sum_k q_{i_8}[h, p, k],$$
+$$b_q = 128 \cdot \sum_k q_{i_8}[k], \qquad f_q = S_q.$$
 
-$$f_Q[h, p] = \frac{S_Q[h, p]}{\sqrt{d_{\text{head}}}}.$$
+$b_q$ is the §1.4 correction consumed by the score dot when the cached operand is stored in u8 form: it is $128$ times the sum of the signed query operand over the contraction index. $f_q$ is the raw query absmax, applied at score dequantization (§10.2).
 
-The $1/\sqrt{d_{\text{head}}}$ is folded into $f_Q$ so the score loop consumes one per-position factor instead of two.
-
-## 9.3 Position-dependent operations
-
-The full-vector RMSNorm scalar $\alpha_Q = 1/\sqrt{(\sum_i q_i^2) / D_Q + \epsilon}$ depends on the projected Q values. By HAR §10.2, the squared sum can be accumulated in the projection epilogue. One cross-rank scalar reduction provides the global $\alpha_Q$.
-
-The per-head RoPE is position-dependent and applied before the per-head FWHT. By HAR §10.1, the conjugated operator $H_{d_{\text{head}}} R_p H_{d_{\text{head}}}^T$ is dense for the partial-RoPE layout, so the runtime exit/re-entry around RoPE is required. The RoPE-then-FWHT order is the entry into the rotated cache basis.
+Any additional per-output scalar that a consumer applies to the score (for example a fixed inner-product normalization) is not part of this encoding; it is a separate scalar (HAR §3.4) applied at or after the dequantization tail.
 
 ---
 
-# X. Attention Score Identity
+# X. Score Dequantization Identity
 
 ## 10.1 Raw score
 
-For one query head $h$ at position $p$ and one cached KV head $g$ at position $t$,
+For one query operand at position $p$ and one cached group $g$ at position $t$,
 
-$$r[h, p, g, t] = \sum_k q_{i_8}[h, p, k] \cdot K_{u_8}[g, t, k]$$
+$$r[p, g, t] = \sum_k q_{i_8}[p, k] \cdot K_{u_8}[g, t, k]$$
 
 where $K_{u_8}[g, t, k] = K_{i_8}[g, t, k] + 128$ (or $K_{u_8}$ stored directly as u8).
 
 ## 10.2 Dequantized score
 
-The dequantized attention score is
+The dequantized score is
 
-$$s[h, p, g, t] = (r[h, p, g, t] - b_q[h, p]) \cdot \frac{f_Q[h, p]}{127^2} \cdot K_{\text{scale}}[g, t].$$
+$$s[p, g, t] = (r[p, g, t] - b_q[p]) \cdot \frac{f_q[p]}{127} \cdot \frac{K_{\text{scale}}[g, t]}{127} = (r[p, g, t] - b_q[p]) \cdot \frac{S_q[p] \cdot K_{\text{scale}}[g, t]}{127^2}.$$
 
-Derivation: $r - b_q$ is the signed-signed inner product of $q_{i_8}$ and $K_{i_8}$ by §1.4. Dequantization applies $S_Q/127$ on the Q side and $K_{\text{scale}}/127$ on the K side, contributing $S_Q \cdot K_{\text{scale}} / 127^2$. The score normalization $1/\sqrt{d_{\text{head}}}$ is folded into $f_Q$ at §9.2.
+Derivation: $r - b_q$ is the signed-signed inner product of $q_{i_8}$ and $K_{i_8}$ by §1.4. Dequantization applies $S_q/127$ on the query side and $K_{\text{scale}}/127$ on the cached side, contributing $S_q \cdot K_{\text{scale}} / 127^2$. No further normalization is part of this identity; any fixed score-scaling scalar is applied separately (§9.2).
 
-## 10.3 Causal and validity masking
+## 10.3 Masking
 
-For positions outside the valid context (causal or padding), $s[h, p, g, t] \leftarrow -\infty$. The masking is applied after dequantization, before the softmax.
+For positions outside the valid contraction support, the score is set to $-\infty$ before the softmax (or, equivalently, those positions are excluded from the contraction). Whichever realization is used, it acts after dequantization and before the softmax, and does not change the dequantized score at valid positions.
 
 ---
 
-# XI. Online Softmax and V-Aggregation
+# XI. Online Softmax and Aggregation
 
 ## 11.1 Per-position folded weight
 
-For each cached position $t$, the unnormalized attention weight is $a_t = \exp(s[h, p, g, t] - m)$, where $m$ is the running max maintained by the online softmax. The folded weight is
+For each cached position $t$, the unnormalized weight is $a_t = \exp(s[p, g, t] - m)$, where $m$ is the running max maintained by the online softmax. The folded weight is
 
 $$w[t] = a_t \cdot V_{\text{scale}}[g, t].$$
 
-## 11.2 V-aggregation identity
+## 11.2 Aggregation identity
 
-Let $\ell[h, p] = \sum_t a_t$ be the softmax denominator. The dequantized attention output is
+Let $\ell[p] = \sum_t a_t$ be the softmax denominator. The dequantized aggregation output is
 
-$$y[h, p, d] = \frac{1}{127 \cdot \ell[h, p]} \sum_t a_t \cdot V_{\text{scale}}[g, t] \cdot V_{i_8}[g, t, d] = \frac{1}{127 \cdot \ell[h, p]} \sum_t w[t] \cdot V_{i_8}[g, t, d].$$
+$$y[p, d] = \frac{1}{127 \cdot \ell[p]} \sum_t a_t \cdot V_{\text{scale}}[g, t] \cdot V_{i_8}[g, t, d] = \frac{1}{127 \cdot \ell[p]} \sum_t w[t] \cdot V_{i_8}[g, t, d].$$
 
 The factor $1/127$ is the V dequantization; $1/\ell$ is the softmax normalization. This identity fixes the result. The order of accumulation and the arithmetic used to form the sum are implementation choices that do not change the dequantized output.
 
 ## 11.3 Efficient u8-fold implementation (non-normative)
 
-The sum of §11.2 may be formed in any arithmetic that realizes the identity; a direct f32 accumulation of $w[t] \cdot V_{i_8}$ uses no intermediate quantization. One efficient alternative quantizes the folded weights of a tile of positions to u8 so the sum becomes a VNNI u8·i8 dot. Over a tile with positions $t \in \mathrm{grp}$:
+The sum of §11.2 may be formed in any arithmetic that realizes the identity; a direct f32 accumulation of $w[t] \cdot V_{i_8}$ uses no intermediate quantization. One efficient alternative quantizes the folded weights of a tile of positions to u8 so the sum becomes a u8·i8 dot. Over a tile with positions $t \in \mathrm{grp}$:
 
 $$m_w = \max_{t \in \mathrm{grp}} w[t], \qquad w_{u_8}[t] = \mathrm{clamp}(\mathrm{round}(255 \cdot w[t] / m_w), 0, 255)$$
 
@@ -509,54 +501,40 @@ $$m_w = \max_{t \in \mathrm{grp}} w[t], \qquad w_{u_8}[t] = \mathrm{clamp}(\math
 
 ---
 
-# XII. Norm-Output Kernels
+# XII. Norm-Output Encoding
 
-## 12.1 Single-output norm
+## 12.1 Definition
 
-The single-output RMSNorm + γ-split + FWHT + int8 kernel produces, per row $x \in \mathbb{R}^d$:
+The int8 activation produced from an RMSNorm-with-gain followed by a K-axis rotation is the quantization of the Hadamard-rotated, gain-split normalized vector. Per row $x \in \mathbb{R}^d$:
 
-1. $\sigma^2 = \sum_k x_k^2$ in f32, with the bf16-to-f32 cast performed in the same pass.
-2. $\alpha = 1/\sqrt{\sigma^2/d + \epsilon}$.
-3. $w_k = x_k \cdot \alpha \cdot \sigma_\gamma[k]$ where $\sigma_\gamma$ is the activation-side split-gain (§4.4).
-4. $w \leftarrow \mathcal{H}_d w$.
-5. $S_a = \max_k |w_k|$, optionally floored.
-6. $x_{i_8}[k] = Q_{S_a}(w_k)$.
+$$x_{i_8} = Q_{S_a}\!\Big(\mathcal{H}_d\big(\sigma_\gamma \odot \tfrac{x}{\mathrm{rms}(x)}\big)\Big), \qquad S_a = \max_k \big|\big(\mathcal{H}_d(\sigma_\gamma \odot \tfrac{x}{\mathrm{rms}(x)})\big)_k\big|,$$
 
-The per-block variant replaces step 5 with per-block absmax and step 6 with per-block quantization, producing $S_a[b]$ and $x_{i_8}[k]$ for $k \in \Omega_b$.
+where $\sigma_\gamma$ is the activation-side split-gain factor of §4.4. The per-block variant replaces $S_a$ with a per-block absmax $S_a[b]$ over each $\Omega_b$ and quantizes per block.
+
+Two orderings are forced, each by a non-commutation or by the basis in which a quantity is defined; everything else is free:
+
+- **The gain $\sigma_\gamma$ precedes $\mathcal{H}_d$.** A coordinatewise gain does not commute with the block-Hadamard — $\mathcal{H}_d \mathrm{diag}(\sigma_\gamma) \mathcal{H}_d^T$ is dense (HAR §6.4) — so it cannot be applied in the rotated basis without materializing a dense operator.
+- **The quantization follows $\mathcal{H}_d$.** The int8 grid and its scale $S_a$ are defined on the rotated coordinates: $S_a$ is the absmax of $\mathcal{H}_d(\cdot)$, not of the original vector.
+
+The RMS factor $\alpha = 1/\sqrt{\mathrm{rms}(x)^2}$ is a scalar and commutes with every step (HAR §3.4); where it is applied is immaterial, and it may be folded into $\sigma_\gamma$ or applied separately for arithmetic economy. The squared sum that defines it is norm-based and may be collected in either basis (HAR §5.1), including from per-shard partial sums (HAR §7.3).
 
 The output dtype is i8 for $x_{i_8}$ and f32 for $S_a$ (or $S_a[\cdot]$).
-
-## 12.2 Dual-output norm
-
-For an operator chain in which the same RMS reduction supports two simultaneous output encodings — one bf16 normalized output (with the original $\gamma$, no FWHT) and one int8 quantized output (with $\sigma_\gamma$ and FWHT) — the dual-output kernel computes the RMS reduction once and emits both outputs:
-
-1. $\sigma^2$ and $\alpha$ as in §12.1.
-2. bf16 output: $y_{\text{bf16}}[k] = \mathrm{bf16}(x_k \cdot \alpha \cdot \gamma_k)$ using the original $\gamma$.
-3. int8 output: as in §12.1 steps 3–6 using $\sigma_\gamma$.
-
-The reduction is the only shared computation; the two outputs feed independent downstream consumers.
-
-The dual-output form has no precision benefit over running two independent norm kernels. It avoids one read of the input $x$ and one $\sigma^2$ reduction.
 
 ---
 
 # XIII. Router Encodings
 
-## 13.1 F32 router
+## 13.1 Linear router score
 
-For a router weight $W \in \mathbb{R}^{E \times d}$ and bias $b \in \mathbb{R}^E$, per-token routing computes:
+A router computes a per-expert linear score
 
-1. $\delta_e = \sum_k x_k \cdot W_{e, k}$ in f32.
-2. $r_e = \sigma(\delta_e)$ where $\sigma$ is the score activation (commonly sigmoid).
-3. $s_e = r_e + b_e$.
+$$\delta_e = \sum_k x_k \cdot W[e, k]$$
 
-Top-K selection by $s_e$. Mixture weights are renormalized $r_e$ values for the selected $e$:
-
-$$\mu_e = \frac{r_e}{\sum_{e' \in \mathrm{top}\text{-}K} r_{e'}}.$$
+for a router weight $W \in \mathbb{R}^{E \times d}$. Any selection policy applied to $\delta$ — an activation $\sigma$, an additive per-expert term, a top-$K$ selection, a mixture-weight renormalization — is a property of the consuming operator. The encodings below concern only the storage and exact reconstruction of $\delta_e$; they are agnostic to the policy, except where a policy property (shift-invariance, §13.5) permits dropping stored data.
 
 ## 13.2 Centered bf16 router with gauge
 
-For a router weight $W \in \mathbb{R}^{E \times d}$, define the column gauge
+Define the column gauge
 
 $$g[k] = \frac{1}{E} \sum_e W[e, k]$$
 
@@ -570,96 +548,33 @@ The stored encoding:
 |---|---|---|
 | $C$ | bf16 | $(E, d)$ |
 | $g$ | bf16 | $(d,)$ |
-| $b$ | f32 | $(E,)$ |
 
-The runtime computation:
+The reconstruction:
 
-1. $p = \sum_k x_k \cdot g[k]$ (one bf16 dot per token).
-2. $c_e = \sum_k x_k \cdot C[e, k]$ (one bf16 dot per expert per token).
+1. $p = \sum_k x_k \cdot g[k]$ (one dot per token).
+2. $c_e = \sum_k x_k \cdot C[e, k]$ (one dot per expert per token).
 3. $\delta_e = c_e + p$.
-4. $r_e = \sigma(\delta_e)$.
-5. $s_e = r_e + b_e$.
 
 In exact arithmetic, $\delta_e = \sum_k x_k \cdot W[e, k]$, since $c_e + p = \sum_k x_k C[e, k] + \sum_k x_k g[k] = \sum_k x_k (C[e, k] + g[k])$.
 
-Top-K selection and mixture weights as in §13.1.
+Centering can reduce the bf16 cast error of the stored matrix when the column-mean component dominates per-element magnitudes: the bf16 round-trip relative error scales with element magnitude, and the gauge $g$ is stored at full bf16 precision separately. The pivot $p$ is the cost of recovering the exact $\delta_e$ from the centered representation.
 
 ## 13.3 Pivot requirement
 
-The selection score $s_e = \sigma(c_e + p) + b_e$ is not shift-invariant in $c_e$ when $\sigma$ is non-linear. For two experts $e_1, e_2$ with $c_{e_1} > c_{e_2}$, the ordering of $s_{e_1}, s_{e_2}$ depends on the values of $\sigma(c + p) + b$ at both $c$ values, not just on their difference.
+When the selection policy is not shift-invariant in $\delta$ (for example, a nonlinear activation applied to $\delta_e$ before selection), the absolute $\delta_e$ must be reconstructed, and the pivot $p$ of §13.2 is required: omitting it replaces the policy's argument $\delta_e$ with $c_e = \delta_e - p$, shifting every argument by $-p$, which a non-shift-invariant policy does not absorb.
 
-Omitting $p$ replaces $\sigma(c_e + p)$ with $\sigma(c_e)$, shifting the input to $\sigma$ by $-p$. For sigmoid, this changes which output regime each expert occupies (saturated vs. linear), and the bias $b_e$ added after $\sigma$ interacts differently with each regime.
+## 13.4 Additive-term precision
 
-The pivot $p$ reconstructs $\delta_e$ from $c_e$ exactly. Centering $W \to C$ can reduce the bf16 cast error of the stored matrix when the column-mean component dominates per-element magnitudes; the bf16 round-trip relative error scales with element magnitude, and the gauge $g$ is stored at full bf16 precision separately. The pivot is the cost of recovering the exact argument to $\sigma$ from the centered representation.
+If the selection policy adds a per-expert term that is compared directly against the score margin between adjacent selection ranks, the dtype of that term sets the noise floor of the selection. If the margin between ranks $K$ and $K+1$ falls below the bf16 floor on a non-trivial fraction of decisions, storing the term as bf16 introduces selection mismatches at that fraction; storing it at f32 keeps it above the bf16 noise floor. This applies only to a policy that has such an additive term.
 
-## 13.4 Bias dtype constraint
+## 13.5 Shift-invariant policies
 
-The bias $b$ is added after $\sigma$ and is compared directly against the score margin between adjacent selection ranks. Its dtype determines the noise floor of the selection.
+For a policy that is invariant to subtracting one scalar from every expert score — for example selection from `softmax(δ)` with no pre-selection additive term — the gauge pivot is not required. Centering produces
 
-If the score margin between ranks $K$ and $K+1$ falls below the bf16 floor on a non-trivial fraction of decisions, $b$ stored as bf16 introduces selection mismatches at that fraction. Storing $b$ as f32 keeps the bias above the bf16 noise floor.
+$$c_e = \sum_k x_k C[e, k] = \delta_e - p$$
 
-## 13.5 Shift-invariant softmax routers
-
-For routers that select from `softmax(logits)` with no additive bias before top-k, the gauge pivot is not required at runtime. Centering produces
-
-$$c_e = \sum_k x_k C[e, k] = \sum_k x_k W[e, k] - p$$
-
-with the same $p = \sum_k x_k g[k]$ for every expert. Both softmax and top-k are invariant to subtracting the same scalar from every expert logit:
+with the same $p = \sum_k x_k g[k]$ for every expert, and
 
 $$\operatorname{softmax}(\delta - p) = \operatorname{softmax}(\delta), \qquad \operatorname{topk}(\delta - p) = \operatorname{topk}(\delta).$$
 
-The `SoftmaxRouterCenter` recipe stores only the centered bf16 weight. It intentionally omits the gauge sidecar because the runtime never needs to reconstruct absolute logits for this router class.
-
----
-
-# XIV. Layer Composition
-
-## 14.1 Operator-to-recipe mapping
-
-The encoding of each operator in a standard decoder layer follows from the basis-preservation classification of §5.5:
-
-| Operator | Weight encoding | Activation source |
-|---|---|---|
-| Q projection | Single-sided per-row, split-gain on input layernorm γ | §12.1 single-output norm |
-| K projection | Single-sided per-row, split-gain on input layernorm γ | §12.1 single-output norm |
-| V projection | Single-sided per-row split-gain, or two-sided per-row split-gain with M-axis block $d_{\text{head}}$ matching the O projection's K-axis rotation | §12.1 single-output norm |
-| Q prep | §9 | QKV projection output, partitioned by head |
-| K cache write | §8.2 | QKV projection output, partitioned by head |
-| V cache write, single-sided | §8.3 | QKV projection output, partitioned by head |
-| V cache write, two-sided | §8.4 | QKV projection output, partitioned by head |
-| Attention scoring | §10 | Q prep, K cache |
-| Online softmax + V-fold + V-agg | §11 | Score, V cache |
-| Per-head attention output | Per-head dynamic absmax | V-aggregation output, normalized |
-| O projection | Single-sided per-row, no gain split, K-block size $d_{\text{head}}$ | Per-head attention output |
-| Pre-FFN norm | §12.1 (when no bf16 router branch) or §12.2 (with bf16 router) | Residual stream |
-| Router | §13.1 or §13.2 | bf16 norm output |
-| Gate / up projections | Single-sided per-row, split-gain on post-attention layernorm γ | int8 norm output |
-| Post-nonlinearity int8 | Per-block dynamic absmax over an FWHT block | $\mathrm{silu}(\text{gate}) \odot \text{up}$ output, FWHT |
-| Down projection | Single-sided per-row, no gain split, K-block size matching post-nonlinearity FWHT block | Post-nonlinearity int8 output |
-| Final norm | §12.1 per-block | Last residual row |
-| LM head | Single-sided per-block, split-gain on final norm γ | Final norm output |
-
-## 14.2 Tensor-parallel sharding
-
-Each operator admits sharding along one axis:
-
-| Operator | Sharded axis |
-|---|---|
-| QKV projection | Output rows |
-| O projection | Input columns |
-| Gate / up projections | Output rows |
-| Down projection | Input columns |
-| MoE experts | Expert index (block-sharded) |
-| Router (centered) | Output rows (expert index) |
-| Router (gauge, bias) | Replicated |
-| LM head | Output rows |
-
-Norms and elementwise residual operations are replicated across ranks. Allreduce inserts at the boundary between operators sharded on different axes.
-
-## 14.3 Boundary norm reductions
-
-The full-vector QK normalization reduces over the full Q vector across all heads (and all TP ranks if Q is row-sharded). By HAR §10.2, the squared sum can be accumulated in the projection epilogue from local sums-of-squares, with one cross-rank scalar reduction supplying the global inverse RMS.
-
-The post-attention residual addition is a vector add of the rank-local attention output (after the O projection allreduce) into the residual stream.
-
-The final norm is a single-rank reduction over the last residual row before the LM head.
+The encoding for this class stores only the centered bf16 weight and omits the gauge sidecar, because the policy never needs the absolute score.

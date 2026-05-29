@@ -2,6 +2,7 @@ from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
 from simd_math import pick_port_unroll
+from simd_math.fast_flags import set_subnormal_zeroing
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 from .dispatch_heuristics import (
@@ -141,6 +142,25 @@ struct DispatchBuffer[K: BurstKernel, max_worker_count: Int = 128]:
 def join_all[P: BurstThreadPool, //, tp: Int](mut pools: List[P]):
     for r in range(tp):
         pools[r].join()
+
+
+@fieldwise_init
+struct FastFpInitKernel(BurstKernel):
+    def execute(mut self):
+        set_subnormal_zeroing()
+
+
+def prime_fp_environment[
+    P: BurstThreadPool, //, tp: Int, max_worker_count: Int = 128,
+](mut pools: List[P]):
+    set_subnormal_zeroing()
+    var buf = DispatchBuffer[FastFpInitKernel, max_worker_count]()
+    for r in range(tp):
+        var cap = min(max_worker_count, pools[r].get_capacity())
+        for _ in range(cap):
+            buf.slot()[] = FastFpInitKernel()
+        buf.dispatch(pools[r])
+    join_all[tp](pools)
 
 
 @always_inline

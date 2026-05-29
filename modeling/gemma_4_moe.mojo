@@ -8,7 +8,7 @@ from simd_math.ops import sqrt
 from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
-from kernels.helpers import Binding, ArenaBases
+from kernels.helpers import Binding, ArenaBases, prime_fp_environment
 from kernels.reductions import dispatch_allreduce_inplace
 from kernels.embedding import dispatch_embed_lookup
 from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
@@ -912,6 +912,8 @@ struct Gemma4[
     def model_init(mut self):
         ref layout = self.layout
         comptime width = simd_width_of[DType.float32]()
+
+        prime_fp_environment[Self.degree, Self.max_worker_count](self.pools)
 
         comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
         for rank in range(Self.degree):
