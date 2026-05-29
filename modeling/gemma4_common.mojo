@@ -22,6 +22,7 @@ struct Gemma4BaseConfig:
     comptime INTERMEDIATE = 2112
     comptime MOE_GATE_UP_FUSED = 1408
     comptime MOE_INTERMEDIATE = 704
+    comptime DOWN_FWHT_BLOCK = 64
     comptime NUM_EXPERTS = 128
     comptime TOP_K = 8
 

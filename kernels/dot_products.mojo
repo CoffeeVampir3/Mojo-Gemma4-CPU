@@ -1,14 +1,9 @@
 from std.collections import InlineArray
-from std.sys import CompilationTarget, llvm_intrinsic
+from std.sys import llvm_intrinsic
 from std.sys.info import size_of
 
-from simd_math import pick_port_unroll, tree_reduce_accs
+from simd_math import pick_port_unroll, tree_reduce_accs, has_avx512_bf16
 from .helpers import BF16Ptr, F32Ptr, W, BW
-
-
-@always_inline
-def has_avx512_bf16() -> Bool:
-    return CompilationTarget._has_feature["avx512bf16"]()
 
 
 @always_inline

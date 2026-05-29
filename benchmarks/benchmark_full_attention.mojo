@@ -8,6 +8,7 @@ from threading.topological_dispatch import with_topological_rank_dispatch
 from kernels.attention_ops import flash_partial_stride
 from kernels.attention_dispatch_kernels import dispatch_full_attention
 from kernels.helpers import Binding, ArenaBases
+from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -80,6 +81,7 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     print("\n=== Validation (valid_len=64) ===")
     comptime VL = 64
     comptime LOCAL_NUM_Q = GLOBAL_NUM_Q // tp
+    var prof = Profiler[False]()
 
     dispatch_full_attention[
         head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
@@ -91,7 +93,7 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
         Binding[BFloat16, tp](v_cache, bases),
         Binding[BFloat16, tp](output, bases),
         Binding[Float32, tp](partials, bases),
-        VL - 1, 1, pools)
+        VL - 1, 1, pools, prof)
 
     var o0 = output[0].cast[DType.float32]()
     var o1 = output[1].cast[DType.float32]()
@@ -119,6 +121,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[4] = 256; sizes[5] = 512; sizes[6] = 1024; sizes[7] = 4096
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     for s in range(8):
         var vl = sizes[s]
@@ -136,7 +139,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](v_cache, bases),
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                vl - 1, 1, pools)
+                vl - 1, 1, pools, prof)
             keep(output[0])
 
         samples.clear()
@@ -152,7 +155,7 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](v_cache, bases),
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                vl - 1, 1, pools)
+                vl - 1, 1, pools, prof)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
@@ -220,6 +223,5 @@ def main():
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_full_attention_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")

@@ -10,6 +10,7 @@ from kernels.rope import (
     rope_head, dispatch_rope_cache_write,
     init_rope_table, init_rope_table_partial_strided,
 )
+from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -190,6 +191,7 @@ def section_sliding_cache_write[
     var vc = Binding[BFloat16, tp](v_cache, bases)
     var cos = Binding[Float32, tp](cos_sl, bases)
     var sin = Binding[Float32, tp](sin_sl, bases)
+    var prof = Profiler[False]()
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
@@ -197,7 +199,7 @@ def section_sliding_cache_write[
             num_q=NUM_Q, num_kv=NUM_KV,
             head_dim=HEAD_DIM_SLIDING, kv_cache_stride=KV_ROWS,
             slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
+        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
 
     var samples = SampleBuffer(SAMPLES)
     samples.clear()
@@ -208,7 +210,7 @@ def section_sliding_cache_write[
             num_q=NUM_Q, num_kv=NUM_KV,
             head_dim=HEAD_DIM_SLIDING, kv_cache_stride=KV_ROWS,
             slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
+        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts[tp=tp](pools)
         samples.push(t_done - t0, t1 - t0)
@@ -247,6 +249,7 @@ def section_full_cache_write[
     var vc = Binding[BFloat16, tp](v_cache, bases)
     var cos = Binding[Float32, tp](full_cos, owner_bases)
     var sin = Binding[Float32, tp](full_sin, owner_bases)
+    var prof = Profiler[False]()
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
@@ -254,7 +257,7 @@ def section_full_cache_write[
             num_q=NUM_Q, num_kv=NUM_KV,
             head_dim=HEAD_DIM_FULL, kv_cache_stride=KV_DIM_FULL,
             slot_mask=-1, cache_degree=tp, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
+        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
 
     var samples = SampleBuffer(SAMPLES)
     samples.clear()
@@ -265,7 +268,7 @@ def section_full_cache_write[
             num_q=NUM_Q, num_kv=NUM_KV,
             head_dim=HEAD_DIM_FULL, kv_cache_stride=KV_DIM_FULL,
             slot_mask=-1, cache_degree=tp, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools)
+        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts[tp=tp](pools)
         samples.push(t_done - t0, t1 - t0)
@@ -389,6 +392,5 @@ def main():
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_rope_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")

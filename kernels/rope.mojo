@@ -9,6 +9,7 @@ from .helpers import (
     BF16Ptr, F32Ptr, W,
 )
 from .dispatch_heuristics import ROPE_INLINE_TOKENS
+from .profiling import Profiler
 
 
 @always_inline
@@ -103,7 +104,7 @@ struct RopeCacheWriteKernel[
 
 
 def dispatch_rope_cache_write[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     half: Int, pair_stride: Int,
     num_q: Int, num_kv: Int, head_dim: Int,
     kv_cache_stride: Int, slot_mask: Int,
@@ -118,6 +119,7 @@ def dispatch_rope_cache_write[
     sin_table: Binding[Float32, tp],
     base_pos: Int, seq_len: Int,
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     comptime K = RopeCacheWriteKernel[
         half, pair_stride, num_q, num_kv, head_dim,
@@ -131,8 +133,8 @@ def dispatch_rope_cache_write[
                  cos_table[r], sin_table[r],
                  base_pos, r % cache_degree, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count](
-        pools, seq_len, seq_len * row_bytes,
+    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="rope_cache_write"](
+        pools, prof, seq_len, seq_len * row_bytes,
         inline_threshold_bytes=ROPE_INLINE_TOKENS * row_bytes)
 
 def init_rope_table_partial_strided[rotary_half: Int, rows: Int](

@@ -11,6 +11,7 @@ from .helpers import (
 from .dispatch_heuristics import (
     MERGE_INLINE_MAX_BYTES, MERGE_SATURATE_BYTES,
 )
+from .profiling import Profiler, DispatchSpan
 
 
 @fieldwise_init
@@ -27,7 +28,7 @@ def merge_segments[
     segments: InlineArray[MergeSegment, n_segments],
     h: Int,
     mut acc: InlineArray[SIMD[DType.float32, W], head_dim // W],
-) -> Tuple[Float32, Float32]:
+) -> Float32:
     comptime m_off = num_q * head_dim
     comptime l_off = m_off + num_q
     comptime PU = pick_port_unroll[W, head_dim]()
@@ -81,7 +82,7 @@ def merge_segments[
                             acc[i * PU + p] = v.fma(cv, acc[i * PU + p])
             batch_start += W
 
-    return (global_m, global_l)
+    return global_l
 
 
 @always_inline
@@ -98,9 +99,8 @@ def write_finalized_head[
 
     var acc = InlineArray[SIMD[DType.float32, W], LANES](
         uninitialized=True)
-    var result = merge_segments[head_dim, num_q, n_segments](
+    var global_l = merge_segments[head_dim, num_q, n_segments](
         segments, h, acc)
-    var global_l = result[1]
 
     if global_l <= 0:
         for i in range(head_dim // STRIDE):
@@ -206,7 +206,7 @@ def merge_workers[num_q: Int](data_bytes: Int, capacity: Int) -> Int:
 
 
 def dispatch_merge_flash_partials[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
@@ -214,10 +214,13 @@ def dispatch_merge_flash_partials[
     partials_buf: Binding[Float32, tp],
     num_sources: InlineArray[Int, tp],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
     inline_max_bytes: Int = MERGE_INLINE_MAX_BYTES,
 ):
     comptime K = FinalizeKernel[head_dim, num_q, partial_stride]
     var buf = DispatchBuffer[K, max_worker_count]()
+    var span = DispatchSpan[Profile]()
+    var dispatched = False
     for r in range(tp):
         if num_sources[r] <= 0:
             memset_zero(output[r], num_q * head_dim)
@@ -234,11 +237,17 @@ def dispatch_merge_flash_partials[
         _ = tile_dispatch(buf,
             K(output[r], partials_buf[r], num_sources[r], 0, 0),
             pools[r], num_q, num_workers=nw)
+        dispatched = True
+    if not dispatched:
+        span.finish_inline(prof, "merge_flash_partials")
+        return
+    span.issued()
     join_all[tp](pools)
+    span.finish[tp](prof, pools, "merge_flash_partials")
 
 
 def dispatch_merge_context_flash_partials[
-    P: BurstThreadPool, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     head_dim: Int, num_q: Int, local_num_q: Int, partial_stride: Int, tp: Int,
     max_worker_count: Int = 128,
 ](
@@ -246,6 +255,7 @@ def dispatch_merge_context_flash_partials[
     partials_buf: Binding[Float32, tp],
     num_sources: InlineArray[Int, tp],
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ):
     var total_sources = 0
     for r in range(tp):
@@ -272,4 +282,6 @@ def dispatch_merge_context_flash_partials[
         tp, make,
         max_worker_count=max_worker_count,
         worker_policy=merge_workers[local_num_q],
-    ](pools, local_num_q, total_sources * (head_dim + 2) * 4 * local_num_q)
+        label="merge_context_flash_partials",
+    ](pools, prof, local_num_q,
+      total_sources * (head_dim + 2) * 4 * local_num_q)

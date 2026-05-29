@@ -14,6 +14,7 @@ from kernels.rmsnorm import (
     dispatch_rms_norm, fused_norm_residual_add,
     RmsNormTokenKernel,
 )
+from kernels.profiling import Profiler
 from simd_math.ops import sqrt
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -226,6 +227,7 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[8] = 256
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     for s in range(NUM_SIZES):
         var seq = sizes[s]
@@ -252,7 +254,7 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](src, bases),
                 Binding[BFloat16, tp](dst, bases),
                 Binding[BFloat16, tp](weight, bases),
-                seq, pools)
+                seq, pools, prof)
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
@@ -260,7 +262,7 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](src, bases),
                 Binding[BFloat16, tp](dst, bases),
                 Binding[BFloat16, tp](weight, bases),
-                seq, pools)
+                seq, pools, prof)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
@@ -290,6 +292,7 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[8] = 256
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     for s in range(NUM_SIZES):
         var seq = sizes[s]
@@ -321,7 +324,7 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](residual, bases),
                 Binding[BFloat16, tp](res_dst, bases),
                 Binding[BFloat16, tp](weight, bases),
-                seq, pools)
+                seq, pools, prof)
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
@@ -332,7 +335,7 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
                 Binding[BFloat16, tp](residual, bases),
                 Binding[BFloat16, tp](res_dst, bases),
                 Binding[BFloat16, tp](weight, bases),
-                seq, pools)
+                seq, pools, prof)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
             samples.push(t_done - t0, t1 - t0)
@@ -401,6 +404,5 @@ def main():
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_rmsnorm_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")

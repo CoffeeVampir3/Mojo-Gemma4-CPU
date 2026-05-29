@@ -10,6 +10,7 @@ from kernels.attention_dispatch_kernels import (
 )
 from kernels.attention_ops import flash_partial_stride
 from kernels.helpers import Binding, ArenaBases
+from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -105,6 +106,7 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[3] = 4096; sizes[4] = 8192; sizes[5] = 16384
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     comptime q_stride = SLIDING_NUM_Q * SLIDING_HEAD_DIM
 
@@ -126,7 +128,7 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
                     output.shifted(done * q_stride), worker_scratch,
-                    done, chunk_len, pools)
+                    done, chunk_len, pools, prof)
                 done += chunk_len
             keep(output[0][0])
 
@@ -145,7 +147,7 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
                     output.shifted(done * q_stride), worker_scratch,
-                    done, chunk_len, pools)
+                    done, chunk_len, pools, prof)
                 done += chunk_len
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
@@ -175,6 +177,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
     sizes[3] = 2048; sizes[4] = 4096
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     comptime q_stride = FULL_NUM_Q * FULL_HEAD_DIM
     comptime local_q_stride = LOCAL_NUM_Q * FULL_HEAD_DIM
@@ -196,7 +199,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
                     output.shifted(done * local_q_stride),
-                    partials_scratch, done, chunk_len, pools)
+                    partials_scratch, done, chunk_len, pools, prof)
                 done += chunk_len
             keep(output[0][0])
 
@@ -214,7 +217,7 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
                     output.shifted(done * local_q_stride),
-                    partials_scratch, done, chunk_len, pools)
+                    partials_scratch, done, chunk_len, pools, prof)
                 done += chunk_len
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
@@ -240,6 +243,7 @@ def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
 ):
     print("\n=== Validation (sliding, seq_len=64) ===")
     comptime SL = 64
+    var prof = Profiler[False]()
 
     dispatch_sliding_attention[
         head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
@@ -247,7 +251,7 @@ def section_validation_sliding[P: BurstThreadPool, //, tp: Int](
         window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
         partial_stride=SLIDING_PSTRIDE, tp=tp,
         max_worker_count=MAX_WORKERS,
-    ](q, k_cache, v_cache, output, worker_scratch, 0, SL, pools)
+    ](q, k_cache, v_cache, output, worker_scratch, 0, SL, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()
@@ -278,13 +282,14 @@ def section_validation_full[P: BurstThreadPool, //, tp: Int](
     comptime OUT_STRIDE = LOCAL_NUM_Q * FULL_HEAD_DIM
     comptime M_OFF = FULL_NUM_Q * FULL_HEAD_DIM
     comptime L_OFF = M_OFF + FULL_NUM_Q
+    var prof = Profiler[False]()
 
     dispatch_full_attention[
         head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
         local_num_q=LOCAL_NUM_Q, gqa_ratio=FULL_GQA,
         kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE, tp=tp,
         max_worker_count=MAX_WORKERS,
-    ](q, k_cache, v_cache, output, partials_scratch, 0, SL, pools)
+    ](q, k_cache, v_cache, output, partials_scratch, 0, SL, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()
@@ -436,9 +441,9 @@ def main():
 
     comptime ARENA_BYTES = 512 * 1024 * 1024
     var arenas_sliding = List[
-        NumaArena[alignment=ALIGNMENT]](tp)
+        NumaArena[alignment=ALIGNMENT]](capacity=tp)
     var arenas_full = List[
-        NumaArena[alignment=ALIGNMENT]](tp)
+        NumaArena[alignment=ALIGNMENT]](capacity=tp)
     for i in range(tp):
         arenas_sliding.append(
             NumaArena[alignment=ALIGNMENT](topo[i], ARENA_BYTES))
@@ -459,6 +464,5 @@ def main():
             selected_pools^, arenas_sliding, arenas_full)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_flash_prefill_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")

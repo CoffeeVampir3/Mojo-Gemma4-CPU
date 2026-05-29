@@ -11,6 +11,7 @@ from kernels.helpers import (
     OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
     Binding, ArenaBases,
 )
+from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -131,6 +132,7 @@ def run_config[
     counts[6] = 128
 
     var samples = SampleBuffer(SAMPLES)
+    var prof = Profiler[False]()
 
     for s in range(7):
         var ns = counts[s]
@@ -141,7 +143,7 @@ def run_config[
             dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools,
+                source_counts[tp](ns), pools, prof,
                 inline_max_bytes=FORCE_INLINE)
             keep(output[0])
 
@@ -151,7 +153,7 @@ def run_config[
             dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools,
+                source_counts[tp](ns), pools, prof,
                 inline_max_bytes=FORCE_INLINE)
             var t1 = now_ns()
             samples.push(t1 - t0, t1 - t0)
@@ -166,7 +168,7 @@ def run_config[
             dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools,
+                source_counts[tp](ns), pools, prof,
                 inline_max_bytes=0)
             keep(output[0])
 
@@ -176,7 +178,7 @@ def run_config[
             dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
                 Binding[BFloat16, tp](output, bases),
                 Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools,
+                source_counts[tp](ns), pools, prof,
                 inline_max_bytes=0)
             var t1 = now_ns()
             var t_done = max_last_ts[tp=tp](pools)
@@ -219,6 +221,5 @@ def main():
         run_all[tp=degree](arenas, selected_pools)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_logsum_merge_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")

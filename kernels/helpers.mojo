@@ -2,11 +2,13 @@ from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
 from simd_math import pick_port_unroll
+from simd_math.fast_flags import set_subnormal_zeroing
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 from .dispatch_heuristics import (
-    DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES,
+    DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES, MATMUL_DISPATCH_BW_PRODUCT,
 )
+from .profiling import Profiler, DispatchSpan
 
 
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
@@ -142,6 +144,25 @@ def join_all[P: BurstThreadPool, //, tp: Int](mut pools: List[P]):
         pools[r].join()
 
 
+@fieldwise_init
+struct FastFpInitKernel(BurstKernel):
+    def execute(mut self):
+        set_subnormal_zeroing()
+
+
+def prime_fp_environment[
+    P: BurstThreadPool, //, tp: Int, max_worker_count: Int = 128,
+](mut pools: List[P]):
+    set_subnormal_zeroing()
+    var buf = DispatchBuffer[FastFpInitKernel, max_worker_count]()
+    for r in range(tp):
+        var cap = min(max_worker_count, pools[r].get_capacity())
+        for _ in range(cap):
+            buf.slot()[] = FastFpInitKernel()
+        buf.dispatch(pools[r])
+    join_all[tp](pools)
+
+
 @always_inline
 def worker_range(
     total: Int, num_workers: Int, worker_id: Int, base: Int = 0,
@@ -155,12 +176,15 @@ def worker_range(
 
 
 @always_inline
-def recommended_workers(data_bytes: Int, capacity: Int) -> Int:
+def recommended_workers[
+    bw_product: Int = DISPATCH_BW_PRODUCT,
+    amortized_bytes: Int = PARALLEL_AMORTIZED_BYTES,
+](data_bytes: Int, capacity: Int) -> Int:
     if capacity <= 1:
         return capacity
-    if data_bytes >= PARALLEL_AMORTIZED_BYTES:
+    if data_bytes >= amortized_bytes:
         return capacity
-    var target = data_bytes // DISPATCH_BW_PRODUCT
+    var target = data_bytes // bw_product
     var n = 1
     while (n + 1) * (n + 1) <= target and n < capacity:
         n += 1
@@ -231,38 +255,50 @@ def saturate_workers(data_bytes: Int, capacity: Int) -> Int:
     return capacity
 
 
+@always_inline
+def matmul_workers(data_bytes: Int, capacity: Int) -> Int:
+    return recommended_workers[MATMUL_DISPATCH_BW_PRODUCT, 1 << 30](
+        data_bytes, capacity)
+
+
 def fanout_dispatch[
-    K: OutputPartitionedKernel, P: BurstThreadPool, //,
+    K: OutputPartitionedKernel, P: BurstThreadPool, Profile: Bool, N: Int, //,
     tp: Int,
     proto_for: def(Int) capturing [_] -> K,
     max_worker_count: Int = 128,
     worker_policy: def(
         data_bytes: Int, capacity: Int,
-    ) thin -> Int = recommended_workers,
+    ) thin -> Int = recommended_workers[DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES],
+    label: StaticString = "?",
 ](
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
     total: Int,
     data_bytes: Int,
     inline_threshold_bytes: Int = -1,
 ):
     if total <= 0:
         return
+    var span = DispatchSpan[Profile]()
     if inline_threshold_bytes >= 0 and data_bytes <= inline_threshold_bytes:
         for r in range(tp):
             var k = proto_for(r)
             k.set_partition(0, 0, total)
             k.execute()
+        span.finish_inline(prof, label)
         return
     var buf = DispatchBuffer[K, max_worker_count]()
     for r in range(tp):
         var cap = min(max_worker_count, pools[r].get_capacity())
         _ = tile_dispatch(buf, proto_for(r), pools[r], total,
             num_workers=worker_policy(data_bytes, cap))
+    span.issued()
     join_all[tp](pools)
+    span.finish[tp](prof, pools, label)
 
 
 def fanout_dispatch_per_rank[
-    K: OutputPartitionedKernel, P: BurstThreadPool, //,
+    K: OutputPartitionedKernel, P: BurstThreadPool, Profile: Bool, N: Int, //,
     tp: Int,
     proto_for: def(Int) capturing [_] -> K,
     total_for: def(Int) capturing [_] -> Int,
@@ -270,11 +306,14 @@ def fanout_dispatch_per_rank[
     max_worker_count: Int = 128,
     worker_policy: def(
         data_bytes: Int, capacity: Int,
-    ) thin -> Int = recommended_workers,
+    ) thin -> Int = recommended_workers[DISPATCH_BW_PRODUCT, PARALLEL_AMORTIZED_BYTES],
+    label: StaticString = "?",
 ](
     mut pools: List[P],
+    mut prof: Profiler[Profile, N],
 ) -> InlineArray[Int, tp]:
     var nws = InlineArray[Int, tp](fill=0)
+    var span = DispatchSpan[Profile]()
     var buf = DispatchBuffer[K, max_worker_count]()
     for r in range(tp):
         var total = total_for(r)
@@ -284,5 +323,7 @@ def fanout_dispatch_per_rank[
         var nw = worker_policy(data_bytes_for(r), cap)
         nws[r] = tile_dispatch(
             buf, proto_for(r), pools[r], total, num_workers=nw)
+    span.issued()
     join_all[tp](pools)
+    span.finish[tp](prof, pools, label)
     return nws

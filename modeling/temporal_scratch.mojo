@@ -57,13 +57,6 @@ struct ScratchPhase[first: StaticString, last: StaticString](
     comptime LAST_NAME = Self.last
 
 
-@fieldwise_init
-struct ScratchPlan(Copyable, ImplicitlyCopyable):
-    var offsets: InlineArray[Int, MAX_SCRATCH_SLOTS]
-    var peak: Int
-    var count: Int
-
-
 trait ScratchPhaseSchema:
     comptime PHASES: ScratchPhaseOrderLike
 
@@ -72,10 +65,21 @@ trait ScratchPhaseSchema:
         return Self.PHASES.index[name]()
 
 
+@fieldwise_init
+struct ScratchPlan(Copyable, ImplicitlyCopyable):
+    var offsets: InlineArray[Int, MAX_SCRATCH_SLOTS]
+    var peak: Int
+    var count: Int
+
+
 def derive_scratch_plan[T: ScratchPhaseSchema]() -> ScratchPlan:
+    comptime assert reflect[T].field_count() <= MAX_SCRATCH_SLOTS, (
+        "scratch island field count exceeds scratch offset capacity")
     var sizes = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
     var firsts = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
     var lasts = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    var fields = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    var field_offsets = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
     var n = 0
     var cur_first = -1
     var cur_last = -1
@@ -96,6 +100,7 @@ def derive_scratch_plan[T: ScratchPhaseSchema]() -> ScratchPlan:
             sizes[n] = FT.SIZE
             firsts[n] = cur_first
             lasts[n] = cur_last
+            fields[n] = i
             n += 1
 
     var order = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
@@ -110,7 +115,7 @@ def derive_scratch_plan[T: ScratchPhaseSchema]() -> ScratchPlan:
         order[i] = order[best]
         order[best] = tmp
 
-    var offsets = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
+    var placed_offsets = InlineArray[Int, MAX_SCRATCH_SLOTS](fill=0)
     var placed = InlineArray[Bool, MAX_SCRATCH_SLOTS](fill=False)
     var peak = 0
     for k in range(n):
@@ -124,18 +129,19 @@ def derive_scratch_plan[T: ScratchPhaseSchema]() -> ScratchPlan:
                     continue
                 if firsts[idx] > lasts[j] or lasts[idx] < firsts[j]:
                     continue
-                var jl = offsets[j]
-                var jh = offsets[j] + sizes[j]
+                var jl = placed_offsets[j]
+                var jh = placed_offsets[j] + sizes[j]
                 if x < jh and jl < x + sizes[idx]:
                     x = jh
                     stable = False
                     break
-        offsets[idx] = x
+        placed_offsets[idx] = x
         placed[idx] = True
+        field_offsets[fields[idx]] = x
         if x + sizes[idx] > peak:
             peak = x + sizes[idx]
 
-    return ScratchPlan(offsets=offsets, peak=peak, count=n)
+    return ScratchPlan(offsets=field_offsets, peak=peak, count=n)
 
 
 trait ScratchIsland(ScratchPhaseSchema):
@@ -147,21 +153,10 @@ def aggregate_scratch_peak[T: AnyType]() -> Int:
     comptime for i in range(reflect[T].field_count()):
         comptime FT = reflect[T].field_types()[i]
         comptime if conforms_to(FT, ScratchIsland):
-            if FT.PLAN.peak > m:
-                m = FT.PLAN.peak
+            comptime peak = FT.PLAN.peak
+            if peak > m:
+                m = peak
     return m
-
-
-def scratch_slot_index[T: AnyType, name: StringLiteral]() -> Int:
-    comptime target = reflect[T].field_index[name]()
-    var n = 0
-    comptime for i in range(reflect[T].field_count()):
-        if i == target:
-            return n
-        comptime FT = reflect[T].field_types()[i]
-        comptime if conforms_to(FT, ScratchBufferLike):
-            n += 1
-    return -1
 
 
 struct TemporalScratchPool[size: Int](Movable):
@@ -178,7 +173,7 @@ struct TemporalScratchPool[size: Int](Movable):
         downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
         MutAnyOrigin,
     ]:
-        comptime idx = scratch_slot_index[I, name]()
+        comptime idx = reflect[I].field_index[name]()
         comptime off = I.PLAN.offsets[idx]
         return UnsafePointer[
             downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,

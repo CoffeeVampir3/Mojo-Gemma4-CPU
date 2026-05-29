@@ -7,6 +7,7 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from kernels.helpers import Binding, ArenaBases
 from kernels.gemm import dispatch_gemm
+from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -74,15 +75,16 @@ def measure_gemm_m[
     outs: Binding[BFloat16, tp], output: BF16Ptr,
     m: Int, mut samples: SampleBuffer,
 ):
+    var prof = Profiler[False]()
     for _ in range(WARMUP):
         dispatch_gemm[rows=rows, cols=cols, tp=tp, MR=MR](
-            xs, ws, outs, m, pools)
+            xs, ws, outs, m, pools, prof)
     keep(output[0])
     samples.clear()
     for _ in range(SAMPLES):
         var t0 = now_ns()
         dispatch_gemm[rows=rows, cols=cols, tp=tp, MR=MR](
-            xs, ws, outs, m, pools)
+            xs, ws, outs, m, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts[tp=tp](pools)
         samples.push(t_done - t0, t1 - t0)
@@ -200,6 +202,5 @@ def main():
         run_all[tp=degree](selected_pools, arenas)
 
     with_topological_rank_dispatch[
-        power_of_two_unrolling=3,
         dispatch=dispatch_gemm_tp,
     ](topo, "mode: isolated", "mode: spin-backoff")

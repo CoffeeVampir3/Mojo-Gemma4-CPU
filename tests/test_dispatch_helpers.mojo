@@ -6,6 +6,7 @@ from kernels.helpers import (
     DispatchBuffer, OutputPartitionedKernel,
     fanout_dispatch_per_rank, saturate_workers, tile_dispatch,
 )
+from kernels.profiling import Profiler
 from threading.threading_traits import BurstKernel, BurstThreadPool
 
 
@@ -104,10 +105,11 @@ def test_fanout_per_rank_returns_actual_counts():
     def bytes_for(r: Int) -> Int:
         return 1024
 
+    var prof = Profiler[False]()
     var launched = fanout_dispatch_per_rank[
         tp, make, total_for, bytes_for,
         worker_policy=saturate_workers,
-    ](pools)
+    ](pools, prof)
 
     check(launched[0] == 2, "rank 0 should report two actual workers")
     check(launched[1] == 5, "rank 1 should report five actual workers")
