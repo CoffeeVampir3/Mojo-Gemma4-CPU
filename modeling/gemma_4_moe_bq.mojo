@@ -8,6 +8,8 @@ from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
 from std.sys.info import simd_width_of
 from simd_math.ops import sqrt
+from simd_math import has_amx_int8
+from butterquant.amx_tiles import prime_amx_environment
 from kernels.helpers import ArenaBases, Binding, prime_fp_environment
 from kernels.profiling import Profiler
 from kernels.moe_router import (
@@ -1088,6 +1090,9 @@ struct Gemma4[
         comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
 
         prime_fp_environment[Self.degree, Self.max_worker_count](self.pools)
+
+        comptime if has_amx_int8():
+            prime_amx_environment[Self.degree, Self.max_worker_count](self.pools)
 
         @parameter
         def bake_router_scale(p: UnsafePointer[BFloat16, MutAnyOrigin]):
