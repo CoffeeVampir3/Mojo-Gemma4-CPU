@@ -1,7 +1,7 @@
 Need linux. Threads stronger with linux.
 
 Get model (needs python or download it yourself here: https://huggingface.co/google/gemma-4-26B-A4B)
-Use script in checkpoint_downloader
+Use script in checkpoint_downloader (cd in, it's setup for use with uv. Uses HF hub)
 ```
 uv run download.py
 ```
@@ -9,7 +9,7 @@ uv run download.py
 Downloads to (relative to root)
 checkpoints/gemma-4-26B-A4B
 
-If you download it yourself, put it their.
+If you download it yourself, put it there.
 
 Run bf16 model:
 ```
