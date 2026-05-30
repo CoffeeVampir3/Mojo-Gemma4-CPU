@@ -23,7 +23,8 @@ from kernels.attention_dispatch_kernels import (
 from kernels.logsum_merge import MergeSegment
 from kernels.moe_router import (
     RouterCandidate, SparseRoute,
-    dispatch_router_expert, merge_router_candidates_expert, build_expert_schedules,
+    dispatch_router_expert, dispatch_merge_router_candidates,
+    dispatch_build_expert_schedules,
 )
 from kernels.moe_experts import (
     dispatch_phase1_gate_up, dispatch_phase2_down,
@@ -624,8 +625,6 @@ def dispatch_moe[
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
 
-    var per_expert_scale_ptr = body.router_pes.at(ctx.layer_base)
-
     var x_normed = scratch.binding[Gemma4FfnMoeScratch, "moe_x_normed"](ctx, plan)
     var cands = scratch.binding[Gemma4FfnMoeScratch, "moe_cands"](ctx, plan)
     var router_scaled = scratch.binding[Gemma4FfnMoeScratch, "moe_router_scaled"](ctx, plan)
@@ -646,8 +645,10 @@ def dispatch_moe[
       body.router_scale.binding(ctx),
       router_scaled, cands, experts_per_rank, seq_len, pools, prof)
 
-    merge_router_candidates_expert[C.TOP_K](
-        cands, nws, seq_len, per_expert_scale_ptr, route_idx, route_w)
+    dispatch_merge_router_candidates[
+        C.TOP_K, max_worker_count=max_worker_count,
+    ](cands, nws, body.router_pes.binding(ctx), route_idx, route_w,
+      seq_len, pools, prof)
 
     dispatch_rms_norm[
         hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
@@ -655,8 +656,10 @@ def dispatch_moe[
     ](x_input, x_normed,
       body.pre_ffn_norm_2.binding(ctx), seq_len, pools, prof)
 
-    build_expert_schedules[C.NUM_EXPERTS, C.TOP_K](
-        route_idx, route_w, expert_offset, routes, experts_per_rank, degree, seq_len)
+    dispatch_build_expert_schedules[
+        C.NUM_EXPERTS, C.TOP_K, max_worker_count=max_worker_count,
+    ](route_idx, route_w, expert_offset, routes,
+      experts_per_rank, seq_len, pools, prof)
 
     dispatch_phase1_gate_up[
         hidden=C.HIDDEN, gate_up_fused=C.MOE_GATE_UP_FUSED,
