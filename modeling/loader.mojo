@@ -1,5 +1,5 @@
 from std.pathlib import Path
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 
 from modeling.model_spec import WeightDesc
 from safetensors.parser import parse_safetensors_header, SafetensorsHeader, TensorMeta

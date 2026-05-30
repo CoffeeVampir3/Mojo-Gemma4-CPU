@@ -4,7 +4,7 @@ from std.memory import UnsafePointer
 from std.reflection import reflect
 from std.sys.info import size_of
 
-from kernels.helpers import RankView, Binding
+from kernels.helpers import Binding
 from modeling.slot import BindContext
 
 
@@ -103,7 +103,6 @@ trait ScratchIsland(ScratchPhaseSchema):
 struct ScratchPlan(Copyable, ImplicitlyCopyable):
     var offsets: InlineArray[Int, MAX_SCRATCH_SLOTS]
     var peak: Int
-    var count: Int
 
 
 def derive_scratch_plan[T: ScratchPhaseSchema](
@@ -134,8 +133,10 @@ def derive_scratch_plan[T: ScratchPhaseSchema](
             cur_first = first
             cur_last = last
         comptime if conforms_to(FT, ScratchBufferLike):
-            if cur_first < 0 or cur_last < cur_first:
-                print("scratch buffer declared without a valid phase")
+            debug_assert(
+                cur_first >= 0 and cur_last >= cur_first,
+                "scratch buffer declared without a valid phase",
+            )
             sizes[n] = resolve_scratch_bytes(
                 FT.BASE_ELEMS, FT.ELEMENT_SIZE, FT.SCALE, degree, workers)
             firsts[n] = cur_first
@@ -181,7 +182,7 @@ def derive_scratch_plan[T: ScratchPhaseSchema](
         if x + sizes[idx] > peak:
             peak = x + sizes[idx]
 
-    return ScratchPlan(offsets=field_offsets, peak=peak, count=n)
+    return ScratchPlan(offsets=field_offsets, peak=peak)
 
 
 def co_live_buffers_overlap[T: ScratchPhaseSchema](

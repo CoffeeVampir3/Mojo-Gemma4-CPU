@@ -1,6 +1,3 @@
-from std.memory import UnsafePointer
-
-
 trait Encoding:
     comptime DTYPE: DType
     comptime ELEMENT_BYTES: Int

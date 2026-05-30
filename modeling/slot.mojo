@@ -16,8 +16,10 @@ from quant.manifest import (
 from butterquant.weight import (
     ButterquantWeight, ButterquantRouter,
     quant_vnni_packed, quant_colsum_per_block, quant_k_block,
+    quant_has_colsum,
 )
 from butterquant.pack import PackColsumTask
+from butterquant.vnni import VNNI_N_STEP, VNNI_K_STEP, COLSUM_NARROW_WIDTH
 
 
 trait SlotLike:
@@ -29,9 +31,6 @@ trait SlotLike:
 
     @always_inline
     def set_offset(mut self, off: Int): ...
-
-    @always_inline
-    def get_offset(self) -> Int: ...
 
 
 trait SlotGroup(FieldwiseDefault):
@@ -87,10 +86,6 @@ struct Slot[
     @always_inline
     def set_offset(mut self, off: Int):
         self.offset = off
-
-    @always_inline
-    def get_offset(self) -> Int:
-        return self.offset
 
     @always_inline
     def at(self, base: Int) -> UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin]:
@@ -269,6 +264,9 @@ def emit_pack_tasks[T: AnyType](
         comptime FT = reflect[T].field_types()[i]
         comptime if conforms_to(FT, SlotLike):
             comptime if quant_vnni_packed[FT.QUANT]():
+                comptime assert quant_has_colsum[FT.QUANT](), (
+                    "VNNI packed slots require a colsum member for in-place "
+                    "pack/colsum initialization")
                 comptime per_block = quant_colsum_per_block[FT.QUANT]()
                 comptime block_pb = quant_k_block[FT.QUANT]()
                 var rows = FT.SHAPE.data_n(degree)
@@ -289,3 +287,40 @@ def emit_pack_tasks[T: AnyType](
         comptime if conforms_to(FT, SlotGroup):
             off = emit_pack_tasks[FT](region_base, degree, tasks, off)
     return off
+
+
+@always_inline
+def vnni_pack_slot_contract_ok[
+    shape: ShapeLike, quant: QuantRecipe,
+](degree: Int) -> Bool:
+    var rows = shape.data_n(degree)
+    var cols = shape.data_m(degree)
+    comptime per_block = quant_colsum_per_block[quant]()
+    comptime block_pb = quant_k_block[quant]()
+    var block_cols = block_pb if per_block else cols
+    return (
+        rows % VNNI_N_STEP == 0
+        and cols % VNNI_K_STEP == 0
+        and block_cols > 0
+        and cols % block_cols == 0
+        and block_cols >= COLSUM_NARROW_WIDTH
+        and block_cols % COLSUM_NARROW_WIDTH == 0
+    )
+
+
+def vnni_pack_contract_ok[T: AnyType](degree: Int) -> Bool:
+    """Reflectively validate every VNNI-packed slot in T, including nested
+    SlotGroups. This keeps model-specific plan builders from maintaining a
+    parallel hand-written list of packed weights."""
+    comptime for i in range(reflect[T].field_count()):
+        comptime FT = reflect[T].field_types()[i]
+        comptime if conforms_to(FT, SlotLike):
+            comptime if quant_vnni_packed[FT.QUANT]():
+                if not vnni_pack_slot_contract_ok[
+                    FT.SHAPE, FT.QUANT,
+                ](degree):
+                    return False
+        comptime if conforms_to(FT, SlotGroup):
+            if not vnni_pack_contract_ok[FT](degree):
+                return False
+    return True

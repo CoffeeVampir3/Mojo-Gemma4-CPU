@@ -1,3 +1,4 @@
+from std.os import abort
 from std.pathlib import Path
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
@@ -32,7 +33,7 @@ from kernels.profiling import Profiler
 from modeling.temporal_scratch import (
     ScratchBuffer, ScratchIsland, ScratchPhase, ScratchPhaseOrder, ScaleClass,
     TemporalLogitsView, TemporalScratchPool, ScratchPlan,
-    derive_scratch_plan, aggregate_scratch_peak,
+    derive_scratch_plan, aggregate_scratch_peak, co_live_buffers_overlap,
 )
 
 from modeling.model_spec import (
@@ -48,7 +49,7 @@ from modeling.gemma4_common import (
     Gemma4BaseConfig, LAYER_SCHEDULE, LayerKind,
 )
 from modeling.modeling_common import (
-    Repeated, ArenaLayout, BF16Bind,
+    Repeated, ArenaLayout,
 )
 from modeling.slot import (
     Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
@@ -345,12 +346,14 @@ def calculate_peak_scratch(degree: Int, max_workers: Int) -> Int:
 def build_gemma4_plan[
     max_seq_len: Int,
 ](degree: Int, max_workers: Int, mut descs: List[WeightDesc]) -> Gemma4Layout[max_seq_len]:
-    debug_assert(degree_contracts_ok(degree), "degree does not divide model dims")
-    debug_assert(max_workers > 0, "max_workers must be positive")
-    debug_assert(
-        max_workers <= C.SLIDING_WINDOW,
-        "full-attention partials are sized for max_workers <= SLIDING_WINDOW",
-    )
+    if not degree_contracts_ok(degree):
+        abort(t"gemma4: degree {degree} does not divide the model dimensions")
+    if max_workers <= 0:
+        abort(t"gemma4: max_workers must be positive, got {max_workers}")
+    if max_workers > C.SLIDING_WINDOW:
+        abort(
+            t"gemma4: full-attention partials require max_workers <= "
+            t"SLIDING_WINDOW ({C.SLIDING_WINDOW}), got {max_workers}")
 
     var sl_proto = SlidingLayerRefs()
     var sl_stride = stamp_offsets(sl_proto, degree)
@@ -765,7 +768,6 @@ struct Gemma4[
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
     var degree: Int
-    var max_workers: Int
     var sliding_plan: ScratchPlan
     var full_plan: ScratchPlan
     var ffn_plan: ScratchPlan
@@ -780,7 +782,6 @@ struct Gemma4[
         max_workers: Int,
     ):
         self.degree = degree
-        self.max_workers = max_workers
         self.arena_bases = List[Int]()
         for r in range(degree):
             self.arena_bases.append(Int(arenas[r].base.value()))
@@ -792,6 +793,26 @@ struct Gemma4[
         self.full_plan = derive_scratch_plan[Gemma4FullScratch](degree, max_workers)
         self.ffn_plan = derive_scratch_plan[Gemma4FfnMoeScratch](degree, max_workers)
         self.head_plan = derive_scratch_plan[Gemma4HeadScratch](degree, max_workers)
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4SlidingScratch](
+                self.sliding_plan, degree, max_workers),
+            "sliding scratch plan overlaps co-live buffers",
+        )
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4FullScratch](
+                self.full_plan, degree, max_workers),
+            "full scratch plan overlaps co-live buffers",
+        )
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4FfnMoeScratch](
+                self.ffn_plan, degree, max_workers),
+            "ffn scratch plan overlaps co-live buffers",
+        )
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4HeadScratch](
+                self.head_plan, degree, max_workers),
+            "head scratch plan overlaps co-live buffers",
+        )
         self.profiler = Profiler[Self.profile, Self.profile_slots]()
 
     def model_init(mut self):

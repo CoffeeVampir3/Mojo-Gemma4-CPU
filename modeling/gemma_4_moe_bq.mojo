@@ -1,3 +1,4 @@
+from std.os import abort
 from std.pathlib import Path
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
@@ -30,10 +31,12 @@ from butterquant import (
     PackColsumTask, dispatch_pack_colsum,
     bake_split_gain_in_place, ButterquantActivation, ButterquantBlockActivation,
 )
+from butterquant.vnni import VNNI_N_STEP, VNNI_K_STEP
+from butterquant.amx_tiles import prime_amx_environment
 from modeling.temporal_scratch import (
     ScratchBuffer, ScratchIsland, ScratchPhase, ScratchPhaseOrder, ScaleClass,
     TemporalScratchPool, TemporalLogitsView, ScratchPlan,
-    derive_scratch_plan, aggregate_scratch_peak,
+    derive_scratch_plan, aggregate_scratch_peak, co_live_buffers_overlap,
 )
 
 from modeling.model_spec import (
@@ -53,6 +56,7 @@ from modeling.modeling_common import (
 )
 from modeling.slot import (
     Slot, SlotGroup, BindContext, stamp_offsets, emit_descs, emit_pack_tasks,
+    vnni_pack_contract_ok,
 )
 from quant.recipe import (
     QuantRecipe, PerRowQuant, PerBlockQuant, SoftmaxRouterCenter,
@@ -475,12 +479,23 @@ def calculate_peak_scratch(degree: Int, max_workers: Int) -> Int:
 def build_gemma4_plan[
     max_seq_len: Int,
 ](degree: Int, max_workers: Int, mut descs: List[WeightDesc]) -> Gemma4Layout[max_seq_len]:
-    debug_assert(degree_contracts_ok(degree), "degree does not divide model dims")
-    debug_assert(max_workers > 0, "max_workers must be positive")
-    debug_assert(
-        max_workers <= C.SLIDING_WINDOW,
-        "full-attention partials are sized for max_workers <= SLIDING_WINDOW",
-    )
+    if not degree_contracts_ok(degree):
+        abort(t"gemma4: degree {degree} does not divide the model dimensions")
+    if not (
+        vnni_pack_contract_ok[SlidingLayerRefs](degree)
+        and vnni_pack_contract_ok[FullLayerRefs](degree)
+        and vnni_pack_contract_ok[TailRefs](degree)
+    ):
+        abort(
+            t"gemma4: degree {degree} breaks VNNI pack alignment; every packed "
+            t"weight's per-rank rows must be a multiple of {VNNI_N_STEP} and "
+            t"cols a multiple of {VNNI_K_STEP}")
+    if max_workers <= 0:
+        abort(t"gemma4: max_workers must be positive, got {max_workers}")
+    if max_workers > C.SLIDING_WINDOW:
+        abort(
+            t"gemma4: full-attention partials require max_workers <= "
+            t"SLIDING_WINDOW ({C.SLIDING_WINDOW}), got {max_workers}")
 
     var sl_proto = SlidingLayerRefs()
     var sl_stride = stamp_offsets(sl_proto, degree)
@@ -579,6 +594,11 @@ def dispatch_bq_sliding_attention_qkv[
     var num_q_heads = q_rows // head_dim
     var num_kv_heads = kv_rows // head_dim
     var partial_stride = flash_partial_stride(num_q_heads, head_dim)
+
+    debug_assert(
+        seq_len <= C.SLIDING_WINDOW,
+        "sliding attention chunk exceeds SLIDING_WINDOW",
+    )
 
     var attn_ctx = ctx.with_layer(
         layout.sliding.base(ctx.view.bases[0], layer_idx))
@@ -926,7 +946,6 @@ struct Gemma4[
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
     var degree: Int
-    var max_workers: Int
     var sliding_plan: ScratchPlan
     var full_plan: ScratchPlan
     var ffn_plan: ScratchPlan
@@ -941,7 +960,6 @@ struct Gemma4[
         max_workers: Int,
     ):
         self.degree = degree
-        self.max_workers = max_workers
         self.arena_bases = List[Int]()
         for r in range(degree):
             self.arena_bases.append(Int(arenas[r].base.value()))
@@ -953,6 +971,26 @@ struct Gemma4[
         self.full_plan = derive_scratch_plan[Gemma4FullScratch](degree, max_workers)
         self.ffn_plan = derive_scratch_plan[Gemma4FfnMoeScratch](degree, max_workers)
         self.head_plan = derive_scratch_plan[Gemma4HeadScratch](degree, max_workers)
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4SlidingScratch](
+                self.sliding_plan, degree, max_workers),
+            "sliding scratch plan overlaps co-live buffers",
+        )
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4FullScratch](
+                self.full_plan, degree, max_workers),
+            "full scratch plan overlaps co-live buffers",
+        )
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4FfnMoeScratch](
+                self.ffn_plan, degree, max_workers),
+            "ffn scratch plan overlaps co-live buffers",
+        )
+        debug_assert(
+            not co_live_buffers_overlap[Gemma4HeadScratch](
+                self.head_plan, degree, max_workers),
+            "head scratch plan overlaps co-live buffers",
+        )
         self.profiler = Profiler[Self.profile, Self.profile_slots]()
 
     def init_state(mut self):
@@ -984,6 +1022,7 @@ struct Gemma4[
         comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
 
         prime_fp_environment(self.pools)
+        prime_amx_environment(self.pools)
 
         @parameter
         def bake_router_scale(p: UnsafePointer[BFloat16, MutAnyOrigin]):

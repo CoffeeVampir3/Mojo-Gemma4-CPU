@@ -113,16 +113,16 @@ struct AmxPrimeKernel(BurstKernel):
 
 
 def prime_amx_environment[
-    P: BurstThreadPool, //, tp: Int, max_worker_count: Int = 128,
+    P: BurstThreadPool, //, max_worker_count: Int = 128,
 ](mut pools: List[P]):
     comptime if has_amx_int8():
         if not request_amx_xstate():
             abort("butterquant: AMX init failed; machine denied AMX tile xstate permission")
         prime_amx_worker()
         var buf = DispatchBuffer[AmxPrimeKernel, max_worker_count]()
-        for r in range(tp):
+        for r in range(len(pools)):
             var cap = min(max_worker_count, pools[r].get_capacity())
             for _ in range(cap):
                 buf.slot()[] = AmxPrimeKernel()
             buf.dispatch(pools[r])
-        join_all[tp](pools)
+        join_all(pools)

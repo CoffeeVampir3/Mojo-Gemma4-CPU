@@ -1,19 +1,17 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from kernels.attention_ops import (
-    LinearKV, RingKV, flash_partial_stride, full_local_kv_count,
-)
-from kernels.helpers import Binding, ArenaBases, fanout_dispatch_per_rank
-from kernels.logsum_merge import (
-    dispatch_merge_flash_partials, dispatch_merge_context_flash_partials,
-)
+from kernels.attention_ops import flash_partial_stride
+from kernels.helpers import Binding, RankView
+from kernels.logsum_merge import MergeSegment
 from kernels.profiling import Profiler
-from butterquant_kernels import BqFlashAttentionKernel
+from butterquant_kernels import (
+    dispatch_bq_sliding_attention, dispatch_bq_full_attention,
+)
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -39,150 +37,95 @@ comptime FULL_NUM_KV = 2
 comptime FULL_GQA_RATIO = FULL_GLOBAL_NUM_Q // FULL_NUM_KV
 comptime FULL_KV_STRIDE = 1024
 
+comptime SLIDING_PSTRIDE = flash_partial_stride(SLIDING_NUM_Q, SLIDING_HEAD_DIM)
+comptime FULL_PSTRIDE = flash_partial_stride(FULL_GLOBAL_NUM_Q, FULL_HEAD_DIM)
+
 comptime I8Ptr = UnsafePointer[Int8, MutAnyOrigin]
 comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
-def arena_bases[tp: Int](
+def arena_bases(
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
-) -> ArenaBases[tp]:
-    var bases = ArenaBases[tp].uninitialized()
-    for r in range(tp):
-        bases[r] = Int(arenas[r].base.value())
-    return bases
+) -> List[Int]:
+    var bases = List[Int](capacity=len(arenas))
+    for r in range(len(arenas)):
+        bases.append(Int(arenas[r].base.value()))
+    return bases^
 
 
-def arena_alloc[dtype: DType](
+def arena_alloc[T: AnyType](
     mut arena: NumaArena[alignment=ALIGNMENT], count: Int,
-) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-    var ptr = arena.alloc[Scalar[dtype]](count)
+) -> UnsafePointer[T, MutAnyOrigin]:
+    var ptr = arena.alloc[T](count)
     if not ptr:
         print("arena alloc failed for", count, "elements")
-        return UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
+        return UnsafePointer[T, MutAnyOrigin].unsafe_dangling()
     return ptr.value()
 
 
-def arena_alloc_all[dtype: DType, tp: Int](
+def arena_alloc_all[T: AnyType](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
-) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-    var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
-    for r in range(tp):
-        var ptr = arena_alloc[dtype](arenas[r], count)
+) -> UnsafePointer[T, MutAnyOrigin]:
+    var first = UnsafePointer[T, MutAnyOrigin].unsafe_dangling()
+    for r in range(len(arenas)):
+        var ptr = arena_alloc[T](arenas[r], count)
         if r == 0:
             first = ptr
     return first
 
 
-@always_inline
-def sliding_valid_len(pos: Int) -> Int:
-    if pos + 1 >= SLIDING_WINDOW:
-        return SLIDING_WINDOW
-    return pos + 1
-
-
-def dispatch_bq_sliding_attention[P: BurstThreadPool, //, tp: Int](
-    q: Binding[Int8, tp],
-    qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
-    k_cache: Binding[Int8, tp],
-    k_scale: Binding[Float32, tp],
-    v_cache: Binding[Int8, tp],
-    v_scale: Binding[Float32, tp],
-    output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+def run_bq_sliding_decode[P: BurstThreadPool, o: ImmutOrigin, //](
+    q: Binding[Int8, o],
+    qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
+    k_cache: Binding[Int8, o],
+    k_scale: Binding[Float32, o],
+    v_cache: Binding[Int8, o],
+    v_scale: Binding[Float32, o],
+    output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
     base_pos: Int,
     mut pools: List[P],
 ):
-    comptime pstride = flash_partial_stride[SLIDING_NUM_Q, SLIDING_HEAD_DIM]()
-    comptime DecodeK = BqFlashAttentionKernel[
-        RingKV[SLIDING_WINDOW], SLIDING_HEAD_DIM, SLIDING_NUM_Q,
-        SLIDING_NUM_KV, SLIDING_GQA_RATIO, SLIDING_KV_STRIDE, pstride,
-    ]
-
-    var valid_len = sliding_valid_len(base_pos)
-    if valid_len <= 0:
-        return
-    var start_pos = base_pos - valid_len + 1
-
-    @parameter
-    def make_decode(r: Int) -> DecodeK:
-        return DecodeK(
-            q[r], qi_bias[r], f_q[r], k_cache[r], k_scale[r],
-            v_cache[r], v_scale[r], partials[r], 0, start_pos, 0, 0,
-        )
-
-    @parameter
-    def total_for(r: Int) -> Int:
-        return valid_len
-
-    @parameter
-    def bytes_for(r: Int) -> Int:
-        return valid_len * SLIDING_KV_STRIDE * 2
-
     var prof = Profiler[False]()
-    var nws = fanout_dispatch_per_rank[
-        tp, make_decode, total_for, bytes_for,
+    dispatch_bq_sliding_attention[
+        head_dim=SLIDING_HEAD_DIM, max_q=SLIDING_NUM_Q,
+        gqa_ratio=SLIDING_GQA_RATIO,
+        window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
         max_worker_count=MAX_WORKERS,
-    ](pools, prof)
+    ](
+        q, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
+        output, partials,
+        SLIDING_NUM_Q, SLIDING_NUM_KV, SLIDING_PSTRIDE, SLIDING_KV_STRIDE,
+        base_pos, 1, pools, prof)
 
-    dispatch_merge_flash_partials[
-        head_dim=SLIDING_HEAD_DIM, num_q=SLIDING_NUM_Q,
-        partial_stride=pstride, tp=tp, max_worker_count=MAX_WORKERS,
-    ](output, partials, nws, pools, prof)
 
-
-def dispatch_bq_full_attention[P: BurstThreadPool, //, tp: Int](
-    q: Binding[Int8, tp],
-    qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
-    k_cache: Binding[Int8, tp],
-    k_scale: Binding[Float32, tp],
-    v_cache: Binding[Int8, tp],
-    v_scale: Binding[Float32, tp],
-    output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+def run_bq_full_decode[P: BurstThreadPool, o: ImmutOrigin, //](
+    q: Binding[Int8, o],
+    qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
+    k_cache: Binding[Int8, o],
+    k_scale: Binding[Float32, o],
+    v_cache: Binding[Int8, o],
+    v_scale: Binding[Float32, o],
+    output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
+    segments: Binding[MergeSegment, o],
     base_pos: Int,
     mut pools: List[P],
 ):
-    comptime assert FULL_GLOBAL_NUM_Q % tp == 0, "full Q heads must shard evenly"
-    comptime local_num_q = FULL_GLOBAL_NUM_Q // tp
-    comptime pstride = flash_partial_stride[FULL_GLOBAL_NUM_Q, FULL_HEAD_DIM]()
-    comptime DecodeK = BqFlashAttentionKernel[
-        LinearKV, FULL_HEAD_DIM, FULL_GLOBAL_NUM_Q, FULL_NUM_KV,
-        FULL_GQA_RATIO, FULL_KV_STRIDE, pstride,
-    ]
-
-    var valid_lens = InlineArray[Int, tp](uninitialized=True)
-    for rank in range(tp):
-        valid_lens[rank] = full_local_kv_count(rank, base_pos, tp)
-
-    @parameter
-    def make_decode(r: Int) -> DecodeK:
-        return DecodeK(
-            q[r], qi_bias[r], f_q[r], k_cache[r], k_scale[r],
-            v_cache[r], v_scale[r], partials[r], 0, 0, 0, 0,
-        )
-
-    @parameter
-    def total_for(r: Int) -> Int:
-        return valid_lens[r]
-
-    @parameter
-    def bytes_for(r: Int) -> Int:
-        return valid_lens[r] * FULL_KV_STRIDE * 2
-
     var prof = Profiler[False]()
-    var nws = fanout_dispatch_per_rank[
-        tp, make_decode, total_for, bytes_for,
-        max_worker_count=MAX_WORKERS,
-    ](pools, prof)
-
-    dispatch_merge_context_flash_partials[
+    var local_num_q = FULL_GLOBAL_NUM_Q // len(pools)
+    dispatch_bq_full_attention[
         head_dim=FULL_HEAD_DIM, num_q=FULL_GLOBAL_NUM_Q,
-        local_num_q=local_num_q,
-        partial_stride=pstride, tp=tp, max_worker_count=MAX_WORKERS,
-    ](output, partials, nws, pools, prof)
+        num_kv=FULL_NUM_KV, gqa_ratio=FULL_GQA_RATIO,
+        kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE,
+        max_worker_count=MAX_WORKERS,
+    ](
+        q, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
+        output, partials, segments,
+        local_num_q, base_pos, 1, pools, prof)
 
 
 def fill_i8(ptr: I8Ptr, count: Int, phase: Int):
@@ -191,8 +134,10 @@ def fill_i8(ptr: I8Ptr, count: Int, phase: Int):
         ptr[i] = Int8(v)
 
 
-def fill_i8_all[tp: Int](ptrs: Binding[Int8, tp], count: Int, phase: Int):
-    for r in range(tp):
+def fill_i8_all[o: ImmutOrigin](
+    ptrs: Binding[Int8, o], count: Int, phase: Int,
+):
+    for r in range(ptrs.degree()):
         fill_i8(ptrs[r], count, phase + r)
 
 
@@ -201,10 +146,10 @@ def fill_scales(ptr: F32Ptr, count: Int, base: Float32):
         ptr[i] = base + Float32((i * 13) % 23) * Float32(0.003)
 
 
-def fill_scales_all[tp: Int](
-    ptrs: Binding[Float32, tp], count: Int, base: Float32,
+def fill_scales_all[o: ImmutOrigin](
+    ptrs: Binding[Float32, o], count: Int, base: Float32,
 ):
-    for r in range(tp):
+    for r in range(ptrs.degree()):
         fill_scales(ptrs[r], count, base + Float32(r) * Float32(0.002))
 
 
@@ -223,11 +168,11 @@ def fill_q_aux[head_dim: Int, num_q: Int](
         f_q[h] = (Float32(0.22) + Float32(h % 5) * Float32(0.015)) * inv_sqrt
 
 
-def fill_q_aux_all[head_dim: Int, num_q: Int, tp: Int](
-    q: Binding[Int8, tp], qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
+def fill_q_aux_all[head_dim: Int, num_q: Int, o: ImmutOrigin](
+    q: Binding[Int8, o], qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
 ):
-    for r in range(tp):
+    for r in range(q.degree()):
         fill_q_aux[head_dim, num_q](q[r], qi_bias[r], f_q[r])
 
 
@@ -252,53 +197,54 @@ def has_nan(ptr: BF16Ptr, count: Int) -> Bool:
     return False
 
 
-def section_validation[P: BurstThreadPool, //, tp: Int](
+def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
-    sliding_q: Binding[Int8, tp],
-    sliding_qi_bias: Binding[Float32, tp],
-    sliding_f_q: Binding[Float32, tp],
-    sliding_k: Binding[Int8, tp],
-    sliding_ks: Binding[Float32, tp],
-    sliding_v: Binding[Int8, tp],
-    sliding_vs: Binding[Float32, tp],
-    sliding_output: Binding[BFloat16, tp],
-    sliding_partials: Binding[Float32, tp],
-    full_q: Binding[Int8, tp],
-    full_qi_bias: Binding[Float32, tp],
-    full_f_q: Binding[Float32, tp],
-    full_k: Binding[Int8, tp],
-    full_ks: Binding[Float32, tp],
-    full_v: Binding[Int8, tp],
-    full_vs: Binding[Float32, tp],
-    full_output: Binding[BFloat16, tp],
-    full_partials: Binding[Float32, tp],
+    sliding_q: Binding[Int8, o],
+    sliding_qi_bias: Binding[Float32, o],
+    sliding_f_q: Binding[Float32, o],
+    sliding_k: Binding[Int8, o],
+    sliding_ks: Binding[Float32, o],
+    sliding_v: Binding[Int8, o],
+    sliding_vs: Binding[Float32, o],
+    sliding_output: Binding[BFloat16, o],
+    sliding_partials: Binding[Float32, o],
+    full_q: Binding[Int8, o],
+    full_qi_bias: Binding[Float32, o],
+    full_f_q: Binding[Float32, o],
+    full_k: Binding[Int8, o],
+    full_ks: Binding[Float32, o],
+    full_v: Binding[Int8, o],
+    full_vs: Binding[Float32, o],
+    full_output: Binding[BFloat16, o],
+    full_partials: Binding[Float32, o],
+    full_segments: Binding[MergeSegment, o],
 ):
     print("\n=== Validation ===")
-    comptime full_local_num_q = FULL_GLOBAL_NUM_Q // tp
+    var full_local_num_q = FULL_GLOBAL_NUM_Q // len(pools)
 
-    dispatch_bq_sliding_attention[tp=tp](
+    run_bq_sliding_decode(
         sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
         sliding_output, sliding_partials, 0, pools)
     check_single_token("sliding seq=1", sliding_output[0], sliding_v[0], sliding_vs[0])
 
-    dispatch_bq_full_attention[tp=tp](
+    run_bq_full_decode(
         full_q, full_qi_bias, full_f_q,
         full_k, full_ks, full_v, full_vs,
-        full_output, full_partials, 0, pools)
+        full_output, full_partials, full_segments, 0, pools)
     check_single_token("full seq=1", full_output[0], full_v[0], full_vs[0])
 
-    dispatch_bq_sliding_attention[tp=tp](
+    run_bq_sliding_decode(
         sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
         sliding_output, sliding_partials, 63, pools)
     var sliding_bad = has_nan(
         sliding_output[0], SLIDING_NUM_Q * SLIDING_HEAD_DIM)
 
-    dispatch_bq_full_attention[tp=tp](
+    run_bq_full_decode(
         full_q, full_qi_bias, full_f_q,
         full_k, full_ks, full_v, full_vs,
-        full_output, full_partials, 63, pools)
+        full_output, full_partials, full_segments, 63, pools)
     var full_bad = has_nan(
         full_output[0], full_local_num_q * FULL_HEAD_DIM)
 
@@ -306,17 +252,17 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     print("  full seq=64 ", "FAIL: NaN detected" if full_bad else "OK (no NaN)")
 
 
-def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
+def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
-    q: Binding[Int8, tp],
-    qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
-    k: Binding[Int8, tp],
-    ks: Binding[Float32, tp],
-    v: Binding[Int8, tp],
-    vs: Binding[Float32, tp],
-    output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+    q: Binding[Int8, o],
+    qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
+    k: Binding[Int8, o],
+    ks: Binding[Float32, o],
+    v: Binding[Int8, o],
+    vs: Binding[Float32, o],
+    output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
 ):
     print("\n=== Sliding decode sweep (BQ kernel + merge) ===")
     var sizes = InlineArray[Int, NUM_CTX_SIZES](fill=0)
@@ -330,17 +276,17 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
             continue
         var pos = vl - 1
         for _ in range(WARMUP):
-            dispatch_bq_sliding_attention[tp=tp](
+            run_bq_sliding_decode(
                 q, qi_bias, f_q, k, ks, v, vs, output, partials, pos, pools)
             keep(output[0][0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_bq_sliding_attention[tp=tp](
+            run_bq_sliding_decode(
                 q, qi_bias, f_q, k, ks, v, vs, output, partials, pos, pools)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
         keep(output[0][0])
 
@@ -350,17 +296,18 @@ def section_sliding_sweep[P: BurstThreadPool, //, tp: Int](
         print_row(String(t"seq={vl}"), ks_stats, ws, kv_bytes)
 
 
-def section_full_sweep[P: BurstThreadPool, //, tp: Int](
+def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
-    q: Binding[Int8, tp],
-    qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
-    k: Binding[Int8, tp],
-    ks: Binding[Float32, tp],
-    v: Binding[Int8, tp],
-    vs: Binding[Float32, tp],
-    output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+    q: Binding[Int8, o],
+    qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
+    k: Binding[Int8, o],
+    ks: Binding[Float32, o],
+    v: Binding[Int8, o],
+    vs: Binding[Float32, o],
+    output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
+    segments: Binding[MergeSegment, o],
 ):
     print("\n=== Full decode sweep (BQ kernel + context merge) ===")
     var sizes = InlineArray[Int, NUM_CTX_SIZES](fill=0)
@@ -374,17 +321,19 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
             continue
         var pos = vl - 1
         for _ in range(WARMUP):
-            dispatch_bq_full_attention[tp=tp](
-                q, qi_bias, f_q, k, ks, v, vs, output, partials, pos, pools)
+            run_bq_full_decode(
+                q, qi_bias, f_q, k, ks, v, vs,
+                output, partials, segments, pos, pools)
             keep(output[0][0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_bq_full_attention[tp=tp](
-                q, qi_bias, f_q, k, ks, v, vs, output, partials, pos, pools)
+            run_bq_full_decode(
+                q, qi_bias, f_q, k, ks, v, vs,
+                output, partials, segments, pos, pools)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
         keep(output[0][0])
 
@@ -394,98 +343,100 @@ def section_full_sweep[P: BurstThreadPool, //, tp: Int](
         print_row(String(t"seq={vl}"), ks_stats, ws, kv_bytes)
 
 
-def run_all[P: BurstThreadPool, //, tp: Int](
-    mut pools: List[P],
+def run_all[P: BurstThreadPool, //](
+    var pools: List[P],
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
-    comptime assert FULL_GLOBAL_NUM_Q % tp == 0, "full Q heads must divide tensor-parallel degree"
-    comptime assert MAX_SEQ % tp == 0, "MAX_SEQ must divide tensor-parallel degree"
-    var bases = arena_bases[tp](arenas)
+    var tp = len(pools)
+    if FULL_GLOBAL_NUM_Q % tp != 0:
+        print("full Q heads must divide tensor-parallel degree")
+        return
+    if MAX_SEQ % tp != 0:
+        print("MAX_SEQ must divide tensor-parallel degree")
+        return
+    var full_local_num_q = FULL_GLOBAL_NUM_Q // tp
+    var bases = arena_bases(arenas)
+    var view = RankView(Span(bases))
 
-    comptime sliding_pstride = flash_partial_stride[
-        SLIDING_NUM_Q, SLIDING_HEAD_DIM,
-    ]()
-    comptime full_local_num_q = FULL_GLOBAL_NUM_Q // tp
-    comptime full_pstride = flash_partial_stride[
-        FULL_GLOBAL_NUM_Q, FULL_HEAD_DIM,
-    ]()
-
-    var sliding_q_ptr = arena_alloc_all[DType.int8, tp](
+    var sliding_q_ptr = arena_alloc_all[Int8](
         arenas, SLIDING_NUM_Q * SLIDING_HEAD_DIM)
-    var sliding_qi_bias_ptr = arena_alloc_all[DType.float32, tp](
+    var sliding_qi_bias_ptr = arena_alloc_all[Float32](
         arenas, SLIDING_NUM_Q)
-    var sliding_f_q_ptr = arena_alloc_all[DType.float32, tp](
+    var sliding_f_q_ptr = arena_alloc_all[Float32](
         arenas, SLIDING_NUM_Q)
-    var sliding_k_ptr = arena_alloc_all[DType.int8, tp](
+    var sliding_k_ptr = arena_alloc_all[Int8](
         arenas, SLIDING_WINDOW * SLIDING_KV_STRIDE)
-    var sliding_ks_ptr = arena_alloc_all[DType.float32, tp](
+    var sliding_ks_ptr = arena_alloc_all[Float32](
         arenas, SLIDING_WINDOW * SLIDING_NUM_KV)
-    var sliding_v_ptr = arena_alloc_all[DType.int8, tp](
+    var sliding_v_ptr = arena_alloc_all[Int8](
         arenas, SLIDING_WINDOW * SLIDING_KV_STRIDE)
-    var sliding_vs_ptr = arena_alloc_all[DType.float32, tp](
+    var sliding_vs_ptr = arena_alloc_all[Float32](
         arenas, SLIDING_WINDOW * SLIDING_NUM_KV)
-    var sliding_output_ptr = arena_alloc_all[DType.bfloat16, tp](
+    var sliding_output_ptr = arena_alloc_all[BFloat16](
         arenas, SLIDING_NUM_Q * SLIDING_HEAD_DIM)
-    var sliding_partials_ptr = arena_alloc_all[DType.float32, tp](
-        arenas, MAX_WORKERS * sliding_pstride)
+    var sliding_partials_ptr = arena_alloc_all[Float32](
+        arenas, MAX_WORKERS * SLIDING_PSTRIDE)
 
-    var full_q_ptr = arena_alloc_all[DType.int8, tp](
+    var full_q_ptr = arena_alloc_all[Int8](
         arenas, FULL_GLOBAL_NUM_Q * FULL_HEAD_DIM)
-    var full_qi_bias_ptr = arena_alloc_all[DType.float32, tp](
+    var full_qi_bias_ptr = arena_alloc_all[Float32](
         arenas, FULL_GLOBAL_NUM_Q)
-    var full_f_q_ptr = arena_alloc_all[DType.float32, tp](
+    var full_f_q_ptr = arena_alloc_all[Float32](
         arenas, FULL_GLOBAL_NUM_Q)
-    var full_k_ptr = arena_alloc_all[DType.int8, tp](
+    var full_k_ptr = arena_alloc_all[Int8](
         arenas, MAX_SEQ * FULL_KV_STRIDE)
-    var full_ks_ptr = arena_alloc_all[DType.float32, tp](
+    var full_ks_ptr = arena_alloc_all[Float32](
         arenas, MAX_SEQ * FULL_NUM_KV)
-    var full_v_ptr = arena_alloc_all[DType.int8, tp](
+    var full_v_ptr = arena_alloc_all[Int8](
         arenas, MAX_SEQ * FULL_KV_STRIDE)
-    var full_vs_ptr = arena_alloc_all[DType.float32, tp](
+    var full_vs_ptr = arena_alloc_all[Float32](
         arenas, MAX_SEQ * FULL_NUM_KV)
-    var full_output_ptr = arena_alloc_all[DType.bfloat16, tp](
+    var full_output_ptr = arena_alloc_all[BFloat16](
         arenas, full_local_num_q * FULL_HEAD_DIM)
-    var full_partials_ptr = arena_alloc_all[DType.float32, tp](
-        arenas, MAX_WORKERS * full_pstride)
+    var full_partials_ptr = arena_alloc_all[Float32](
+        arenas, MAX_WORKERS * FULL_PSTRIDE)
+    var full_segments_ptr = arena_alloc_all[MergeSegment](
+        arenas, MAX_WORKERS * tp)
 
-    var sliding_q = Binding[Int8, tp](sliding_q_ptr, bases)
-    var sliding_qi_bias = Binding[Float32, tp](sliding_qi_bias_ptr, bases)
-    var sliding_f_q = Binding[Float32, tp](sliding_f_q_ptr, bases)
-    var sliding_k = Binding[Int8, tp](sliding_k_ptr, bases)
-    var sliding_ks = Binding[Float32, tp](sliding_ks_ptr, bases)
-    var sliding_v = Binding[Int8, tp](sliding_v_ptr, bases)
-    var sliding_vs = Binding[Float32, tp](sliding_vs_ptr, bases)
-    var sliding_output = Binding[BFloat16, tp](sliding_output_ptr, bases)
-    var sliding_partials = Binding[Float32, tp](sliding_partials_ptr, bases)
+    var sliding_q = view.bind(sliding_q_ptr)
+    var sliding_qi_bias = view.bind(sliding_qi_bias_ptr)
+    var sliding_f_q = view.bind(sliding_f_q_ptr)
+    var sliding_k = view.bind(sliding_k_ptr)
+    var sliding_ks = view.bind(sliding_ks_ptr)
+    var sliding_v = view.bind(sliding_v_ptr)
+    var sliding_vs = view.bind(sliding_vs_ptr)
+    var sliding_output = view.bind(sliding_output_ptr)
+    var sliding_partials = view.bind(sliding_partials_ptr)
 
-    var full_q = Binding[Int8, tp](full_q_ptr, bases)
-    var full_qi_bias = Binding[Float32, tp](full_qi_bias_ptr, bases)
-    var full_f_q = Binding[Float32, tp](full_f_q_ptr, bases)
-    var full_k = Binding[Int8, tp](full_k_ptr, bases)
-    var full_ks = Binding[Float32, tp](full_ks_ptr, bases)
-    var full_v = Binding[Int8, tp](full_v_ptr, bases)
-    var full_vs = Binding[Float32, tp](full_vs_ptr, bases)
-    var full_output = Binding[BFloat16, tp](full_output_ptr, bases)
-    var full_partials = Binding[Float32, tp](full_partials_ptr, bases)
+    var full_q = view.bind(full_q_ptr)
+    var full_qi_bias = view.bind(full_qi_bias_ptr)
+    var full_f_q = view.bind(full_f_q_ptr)
+    var full_k = view.bind(full_k_ptr)
+    var full_ks = view.bind(full_ks_ptr)
+    var full_v = view.bind(full_v_ptr)
+    var full_vs = view.bind(full_vs_ptr)
+    var full_output = view.bind(full_output_ptr)
+    var full_partials = view.bind(full_partials_ptr)
+    var full_segments = view.bind(full_segments_ptr)
 
-    fill_i8_all[tp](sliding_q, SLIDING_NUM_Q * SLIDING_HEAD_DIM, 1)
-    fill_i8_all[tp](sliding_k, SLIDING_WINDOW * SLIDING_KV_STRIDE, 2)
-    fill_i8_all[tp](sliding_v, SLIDING_WINDOW * SLIDING_KV_STRIDE, 3)
-    fill_scales_all[tp](
+    fill_i8_all(sliding_q, SLIDING_NUM_Q * SLIDING_HEAD_DIM, 1)
+    fill_i8_all(sliding_k, SLIDING_WINDOW * SLIDING_KV_STRIDE, 2)
+    fill_i8_all(sliding_v, SLIDING_WINDOW * SLIDING_KV_STRIDE, 3)
+    fill_scales_all(
         sliding_ks, SLIDING_WINDOW * SLIDING_NUM_KV, Float32(0.18))
-    fill_scales_all[tp](
+    fill_scales_all(
         sliding_vs, SLIDING_WINDOW * SLIDING_NUM_KV, Float32(0.20))
-    fill_q_aux_all[SLIDING_HEAD_DIM, SLIDING_NUM_Q, tp](
+    fill_q_aux_all[SLIDING_HEAD_DIM, SLIDING_NUM_Q](
         sliding_q, sliding_qi_bias, sliding_f_q)
 
-    fill_i8_all[tp](full_q, FULL_GLOBAL_NUM_Q * FULL_HEAD_DIM, 4)
-    fill_i8_all[tp](full_k, MAX_SEQ * FULL_KV_STRIDE, 5)
-    fill_i8_all[tp](full_v, MAX_SEQ * FULL_KV_STRIDE, 6)
-    fill_scales_all[tp](
+    fill_i8_all(full_q, FULL_GLOBAL_NUM_Q * FULL_HEAD_DIM, 4)
+    fill_i8_all(full_k, MAX_SEQ * FULL_KV_STRIDE, 5)
+    fill_i8_all(full_v, MAX_SEQ * FULL_KV_STRIDE, 6)
+    fill_scales_all(
         full_ks, MAX_SEQ * FULL_NUM_KV, Float32(0.16))
-    fill_scales_all[tp](
+    fill_scales_all(
         full_vs, MAX_SEQ * FULL_NUM_KV, Float32(0.19))
-    fill_q_aux_all[FULL_HEAD_DIM, FULL_GLOBAL_NUM_Q, tp](
+    fill_q_aux_all[FULL_HEAD_DIM, FULL_GLOBAL_NUM_Q](
         full_q, full_qi_bias, full_f_q)
 
     for r in range(tp):
@@ -503,24 +454,24 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         t"num_kv={FULL_NUM_KV} gqa={FULL_GQA_RATIO} max_seq={MAX_SEQ}"
     )
 
-    section_validation[tp=tp](
+    section_validation(
         pools,
         sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
         sliding_output, sliding_partials,
         full_q, full_qi_bias, full_f_q,
         full_k, full_ks, full_v, full_vs,
-        full_output, full_partials,
+        full_output, full_partials, full_segments,
     )
-    section_sliding_sweep[tp=tp](
+    section_sliding_sweep(
         pools, sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
         sliding_output, sliding_partials,
     )
-    section_full_sweep[tp=tp](
+    section_full_sweep(
         pools, full_q, full_qi_bias, full_f_q,
         full_k, full_ks, full_v, full_vs,
-        full_output, full_partials,
+        full_output, full_partials, full_segments,
     )
 
 
@@ -542,9 +493,9 @@ def main():
 
     @parameter
     def dispatch_bq_attention_tp[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        run_all[tp=degree](selected_pools, arenas)
+        run_all(selected_pools^, arenas)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_bq_attention_tp,

@@ -11,7 +11,9 @@ from butterquant.runtime import (
     prepare_norm_activation_per_row, prepare_block_activation,
 )
 from butterquant.gemm import gemm_i8_per_row, gemm_i8_per_block
+from butterquant.amx_gemm import amx_gemm_linear_store, AMX_MIN_ROWS
 from butterquant.vnni import VNNI_N_STEP
+from simd_math import has_amx_int8
 from butterquant.types import F32Ptr, I8Ptr
 from butterquant.weight import (
     ButterquantWeight, ButterquantActivation, ButterquantBlockActivation,
@@ -98,6 +100,12 @@ struct BqLinearKernel[K: Int, MR: Int, numer: Int = 1, denom: Int = 1](
     def execute(mut self):
         var my_start = self.start * Self.numer // Self.denom
         var my_end = self.end * Self.numer // Self.denom
+        comptime if has_amx_int8():
+            if self.m >= AMX_MIN_ROWS:
+                amx_gemm_linear_store[Self.K, DType.bfloat16](
+                    self.act, self.m, self.n_rows, Self.K, self.act_scale,
+                    self.weight, self.wsc, self.output, my_start, my_end)
+                return
         gemm_i8_per_row[Self.K, Self.MR, DType.bfloat16](
             self.act, self.m, self.n_rows, self.act_scale, self.weight, self.wsc,
             self.colsum, self.output, my_start, my_end)
@@ -213,6 +221,12 @@ struct BqBlockLinearKernel[N: Int, block: Int, MR: Int](
     var end: Int
 
     def execute(mut self):
+        comptime if has_amx_int8():
+            if self.m >= AMX_MIN_ROWS:
+                amx_gemm_linear_store[Self.block, DType.bfloat16](
+                    self.act, self.m, Self.N, self.k_dim, self.act_scale,
+                    self.weight, self.wsc, self.output, self.start, self.end)
+                return
         gemm_i8_per_block[Self.N, Self.block, Self.MR, DType.bfloat16](
             self.act, self.m, self.k_dim, self.act_scale, self.weight, self.wsc,
             self.colsum, self.output, self.start, self.end)
