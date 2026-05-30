@@ -51,13 +51,12 @@ def rope_head_to[half: Int, pair_stride: Int, head_dim: Int](
 struct RopeCacheWriteKernel[
     half: Int,
     pair_stride: Int,
-    num_q: Int,
-    num_kv: Int,
     head_dim: Int,
-    kv_cache_stride: Int,
     slot_mask: Int,
-    cache_degree: Int,
 ](RangePartitionedKernel):
+    """The KV cache slot stride equals the per-token KV write size
+    (`num_kv * head_dim`) in every Gemma4 cache layout, so it is derived rather
+    than threaded separately."""
     var q: BF16Ptr
     var k_src: BF16Ptr
     var v_src: BF16Ptr
@@ -66,35 +65,38 @@ struct RopeCacheWriteKernel[
     var cos_table: F32Ptr
     var sin_table: F32Ptr
     var base_pos: Int
+    var num_q: Int
+    var num_kv: Int
+    var cache_degree: Int
     var rank: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        comptime q_stride = Self.num_q * Self.head_dim
-        comptime kv_stride = Self.num_kv * Self.head_dim
+        var q_stride = self.num_q * Self.head_dim
+        var kv_stride = self.num_kv * Self.head_dim
         for tok in range(self.start, self.end):
             var pos = self.base_pos + tok
             var cos_row = self.cos_table + pos * Self.half
             var sin_row = self.sin_table + pos * Self.half
 
             var q_tok = self.q + tok * q_stride
-            for h in range(Self.num_q):
+            for h in range(self.num_q):
                 rope_head[Self.half, Self.pair_stride](
                     q_tok + h * Self.head_dim, cos_row, sin_row)
 
-            if pos % Self.cache_degree == self.rank:
-                var slot = (pos // Self.cache_degree) & Self.slot_mask
+            if pos % self.cache_degree == self.rank:
+                var slot = (pos // self.cache_degree) & Self.slot_mask
                 var k_tok = self.k_src + tok * kv_stride
-                var k_dst = self.k_cache + slot * Self.kv_cache_stride
-                for h in range(Self.num_kv):
+                var k_dst = self.k_cache + slot * kv_stride
+                for h in range(self.num_kv):
                     rope_head_to[Self.half, Self.pair_stride, Self.head_dim](
                         k_tok + h * Self.head_dim,
                         k_dst + h * Self.head_dim,
                         cos_row, sin_row)
 
                 var v_tok = self.v_src + tok * kv_stride
-                var v_dst = self.v_cache + slot * Self.kv_cache_stride
+                var v_dst = self.v_cache + slot * kv_stride
                 memcpy(dest=v_dst, src=v_tok, count=kv_stride)
 
     @always_inline
@@ -104,36 +106,38 @@ struct RopeCacheWriteKernel[
 
 
 def dispatch_rope_cache_write[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
-    half: Int, pair_stride: Int,
-    num_q: Int, num_kv: Int, head_dim: Int,
-    kv_cache_stride: Int, slot_mask: Int,
-    cache_degree: Int, tp: Int, max_worker_count: Int = 128,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    half: Int, pair_stride: Int, head_dim: Int,
+    slot_mask: Int,
+    max_worker_count: Int = 128,
 ](
-    q: Binding[BFloat16, tp],
-    k_src: Binding[BFloat16, tp],
-    v_src: Binding[BFloat16, tp],
-    k_cache: Binding[BFloat16, tp],
-    v_cache: Binding[BFloat16, tp],
-    cos_table: Binding[Float32, tp],
-    sin_table: Binding[Float32, tp],
+    q: Binding[BFloat16, o],
+    k_src: Binding[BFloat16, o],
+    v_src: Binding[BFloat16, o],
+    k_cache: Binding[BFloat16, o],
+    v_cache: Binding[BFloat16, o],
+    cos_table: Binding[Float32, o],
+    sin_table: Binding[Float32, o],
+    num_q: Int, num_kv: Int, cache_degree: Int,
     base_pos: Int, seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime K = RopeCacheWriteKernel[
-        half, pair_stride, num_q, num_kv, head_dim,
-        kv_cache_stride, slot_mask, cache_degree]
-    comptime row_bytes = (num_q + 2 * num_kv) * head_dim * 2
+        half, pair_stride, head_dim, slot_mask]
+    var row_bytes = (num_q + 2 * num_kv) * head_dim * 2
+    var nq = num_q
+    var nkv = num_kv
+    var cd = cache_degree
 
     @parameter
     def make(r: Int) -> K:
         return K(q[r], k_src[r], v_src[r],
                  k_cache[r], v_cache[r],
                  cos_table[r], sin_table[r],
-                 base_pos, r % cache_degree, 0, 0)
+                 base_pos, nq, nkv, cd, r % cd, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="rope_cache_write"](
+    fanout_dispatch[make, max_worker_count=max_worker_count, label="rope_cache_write"](
         pools, prof, seq_len, seq_len * row_bytes,
         inline_threshold_bytes=ROPE_INLINE_TOKENS * row_bytes)
 

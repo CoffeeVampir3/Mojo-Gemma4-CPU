@@ -247,6 +247,21 @@ def pick_port_unroll[width: Int, cols: Int]() -> Int:
 
 
 @always_inline
+def runtime_pick_port_unroll(width: Int, cols: Int) -> Int:
+    """Runtime counterpart of `pick_port_unroll`.
+
+    The returned value is still one of the same specialization keys; callers
+    branch on it and dispatch to the corresponding comptime kernel."""
+    if cols % (8 * width) == 0:
+        return 8
+    elif cols % (4 * width) == 0:
+        return 4
+    elif cols % (2 * width) == 0:
+        return 2
+    return 1
+
+
+@always_inline
 def tree_merge_accs[T: DType, width: Int, port_unroll: Int, //](
     mut accs: InlineArray[SIMD[T, width], port_unroll],
 ) -> SIMD[T, width]:

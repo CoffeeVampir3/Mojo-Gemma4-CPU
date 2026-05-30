@@ -115,13 +115,13 @@ struct NormResidualAddTokenKernel[
 
 
 def dispatch_rms_norm[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
-    tp: Int, scaled: Bool = True, max_worker_count: Int = 128,
+    scaled: Bool = True, max_worker_count: Int = 128,
 ](
-    src: Binding[BFloat16, tp],
-    dst: Binding[BFloat16, tp],
-    weight: Binding[BFloat16, tp],
+    src: Binding[BFloat16, o],
+    dst: Binding[BFloat16, o],
+    weight: Binding[BFloat16, o],
     count: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
@@ -132,7 +132,7 @@ def dispatch_rms_norm[
     def make(r: Int) -> K:
         return K(src[r], dst[r], weight[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="rms_norm"](
+    fanout_dispatch[make, max_worker_count=max_worker_count, label="rms_norm"](
         pools, prof, count, count * hidden * 2,
         inline_threshold_bytes=NORM_INLINE_TOKENS * hidden * 2)
 
@@ -140,17 +140,19 @@ def dispatch_rms_norm[
 @fieldwise_init
 struct ScaledNormKernel[
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
-    scaled: Bool, numer: Int, denom: Int,
+    scaled: Bool,
 ](RangePartitionedKernel):
     var src: BF16Ptr
     var dst: BF16Ptr
     var weight: BF16Ptr
+    var numer: Int
+    var denom: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        var my_start = self.start * Self.numer // Self.denom
-        var my_end = self.end * Self.numer // Self.denom
+        var my_start = self.start * self.numer // self.denom
+        var my_end = self.end * self.numer // self.denom
         for tok in range(my_start, my_end):
             rms_norm_row[Self.hidden, Self.sqrt_n, Self.n_eps, Self.scaled](
                 self.src + tok * Self.hidden,
@@ -164,44 +166,48 @@ struct ScaledNormKernel[
 
 
 def dispatch_rms_norm_qkv_heads[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     head_dim: Int, sqrt_n: Float32, n_eps: Float32,
-    num_q: Int, num_kv: Int, tp: Int, max_worker_count: Int = 128,
+    max_worker_count: Int = 128,
 ](
-    q_src: Binding[BFloat16, tp],
-    q_dst: Binding[BFloat16, tp],
-    k_src: Binding[BFloat16, tp],
-    k_dst: Binding[BFloat16, tp],
-    v_src: Binding[BFloat16, tp],
-    v_dst: Binding[BFloat16, tp],
-    q_weight: Binding[BFloat16, tp],
-    k_weight: Binding[BFloat16, tp],
+    q_src: Binding[BFloat16, o],
+    q_dst: Binding[BFloat16, o],
+    k_src: Binding[BFloat16, o],
+    k_dst: Binding[BFloat16, o],
+    v_src: Binding[BFloat16, o],
+    v_dst: Binding[BFloat16, o],
+    q_weight: Binding[BFloat16, o],
+    k_weight: Binding[BFloat16, o],
+    num_q: Int, num_kv: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     if seq_len <= 0:
         return
-    comptime heads_per_token = num_q + num_kv + num_kv
-    comptime VK = ScaledNormKernel[head_dim, sqrt_n, n_eps, False, num_kv, heads_per_token]
-    comptime QK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_q, heads_per_token]
-    comptime KK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True, num_kv, heads_per_token]
+    var heads_per_token = num_q + num_kv + num_kv
+    comptime VK = ScaledNormKernel[head_dim, sqrt_n, n_eps, False]
+    comptime QK = ScaledNormKernel[head_dim, sqrt_n, n_eps, True]
     comptime VQChain = Chain[VK, QK]
-    comptime VQKChain = Chain[VQChain, KK]
+    comptime VQKChain = Chain[VQChain, QK]
+
+    var hpt = heads_per_token
+    var nq = num_q
+    var nkv = num_kv
 
     @parameter
     def make(r: Int) -> VQKChain:
         return VQKChain(
             VQChain(
-                VK(v_src[r], v_dst[r], k_weight[r], 0, 0),
-                QK(q_src[r], q_dst[r], q_weight[r], 0, 0),
+                VK(v_src[r], v_dst[r], k_weight[r], nkv, hpt, 0, 0),
+                QK(q_src[r], q_dst[r], q_weight[r], nq, hpt, 0, 0),
             ),
-            KK(k_src[r], k_dst[r], k_weight[r], 0, 0),
+            QK(k_src[r], k_dst[r], k_weight[r], nkv, hpt, 0, 0),
         )
 
     var total = seq_len * heads_per_token
     fanout_dispatch[
-        tp, make,
+        make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="rms_norm_qkv_heads",
@@ -210,14 +216,14 @@ def dispatch_rms_norm_qkv_heads[
 
 
 def fused_norm_residual_add[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
-    tp: Int, max_worker_count: Int = 128,
+    max_worker_count: Int = 128,
 ](
-    src: Binding[BFloat16, tp],
-    residual: Binding[BFloat16, tp],
-    dst: Binding[BFloat16, tp],
-    weight: Binding[BFloat16, tp],
+    src: Binding[BFloat16, o],
+    residual: Binding[BFloat16, o],
+    dst: Binding[BFloat16, o],
+    weight: Binding[BFloat16, o],
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
@@ -228,6 +234,6 @@ def fused_norm_residual_add[
     def make(r: Int) -> K:
         return K(src[r], residual[r], dst[r], weight[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="norm_residual_add"](
+    fanout_dispatch[make, max_worker_count=max_worker_count, label="norm_residual_add"](
         pools, prof, seq_len, seq_len * hidden * 4,
         inline_threshold_bytes=NORM_INLINE_TOKENS * hidden * 4)

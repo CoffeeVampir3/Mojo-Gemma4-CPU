@@ -48,15 +48,19 @@ def insert_candidate[top_k: Int](
             return
 
 
-def build_expert_schedules[tp: Int, experts_per_rank: Int, top_k: Int](
-    route_idx: Binding[Int32, tp],
-    route_w: Binding[Float32, tp],
-    expert_offset: Binding[Int32, tp],
-    routes: Binding[SparseRoute, tp],
+def build_expert_schedules[
+    o: ImmutOrigin, //, max_experts: Int, top_k: Int,
+](
+    route_idx: Binding[Int32, o],
+    route_w: Binding[Float32, o],
+    expert_offset: Binding[Int32, o],
+    routes: Binding[SparseRoute, o],
+    experts_per_rank: Int,
+    tp: Int,
     seq_len: Int,
 ):
     for r in range(tp):
-        var counts = InlineArray[Int32, experts_per_rank](fill=Int32(0))
+        var counts = InlineArray[Int32, max_experts](fill=Int32(0))
         var first = r * experts_per_rank
         var last = first + experts_per_rank
         var idx_r = route_idx[r]
@@ -71,7 +75,7 @@ def build_expert_schedules[tp: Int, experts_per_rank: Int, top_k: Int](
                     counts[e - first] += Int32(1)
 
         var running = Int32(0)
-        var write_offsets = InlineArray[Int32, experts_per_rank](
+        var write_offsets = InlineArray[Int32, max_experts](
             uninitialized=True)
         for e in range(experts_per_rank):
             offsets_r[e] = running
@@ -93,7 +97,7 @@ def build_expert_schedules[tp: Int, experts_per_rank: Int, top_k: Int](
 @fieldwise_init
 struct RouterExpertKernel[
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
-    experts_per_rank: Int, top_k: Int,
+    top_k: Int,
 ](WorkerRangePartitionedKernel):
     var x: BF16Ptr
     var router_proj: BF16Ptr
@@ -149,54 +153,55 @@ def router_workers(data_bytes: Int, capacity: Int) -> Int:
 
 
 def dispatch_router_expert[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     hidden: Int, sqrt_n: Float32, n_eps: Float32,
-    experts_per_rank: Int, top_k: Int, tp: Int,
+    top_k: Int,
     max_worker_count: Int = 128,
 ](
-    x: Binding[BFloat16, tp],
-    router_proj: Binding[BFloat16, tp],
-    router_scale: Binding[BFloat16, tp],
-    scaled_scratch: Binding[Float32, tp],
-    cands_out: Binding[RouterCandidate, tp],
+    x: Binding[BFloat16, o],
+    router_proj: Binding[BFloat16, o],
+    router_scale: Binding[BFloat16, o],
+    scaled_scratch: Binding[Float32, o],
+    cands_out: Binding[RouterCandidate, o],
+    experts_per_rank: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
-) -> InlineArray[Int, tp]:
-    comptime K = RouterExpertKernel[
-        hidden, sqrt_n, n_eps, experts_per_rank, top_k,
-    ]
+) -> List[Int]:
+    comptime K = RouterExpertKernel[hidden, sqrt_n, n_eps, top_k]
+    var epr = experts_per_rank
 
     @parameter
     def make(r: Int) -> K:
         return K(x[r], router_proj[r], router_scale[r],
                  scaled_scratch[r], cands_out[r],
-                 r * experts_per_rank, seq_len, 0, 0, 0)
+                 r * epr, seq_len, 0, 0, 0)
 
     @parameter
     def total_for(r: Int) -> Int:
-        return experts_per_rank
+        return epr
 
     @parameter
     def data_bytes_for(r: Int) -> Int:
-        return experts_per_rank * hidden * 2
+        return epr * hidden * 2
 
     return fanout_dispatch_per_rank[
-        tp, make, total_for, data_bytes_for,
+        make, total_for, data_bytes_for,
         max_worker_count=max_worker_count,
         worker_policy=router_workers,
         label="router_expert",
     ](pools, prof)
 
 
-def merge_router_candidates_expert[tp: Int, top_k: Int](
-    cands_per_rank: Binding[RouterCandidate, tp],
-    nws: InlineArray[Int, tp],
+def merge_router_candidates_expert[o: ImmutOrigin, //, top_k: Int](
+    cands_per_rank: Binding[RouterCandidate, o],
+    nws: List[Int],
     seq_len: Int,
     per_expert_scale: BF16Ptr,
-    route_idx_per_rank: Binding[Int32, tp],
-    route_w_per_rank: Binding[Float32, tp],
+    route_idx_per_rank: Binding[Int32, o],
+    route_w_per_rank: Binding[Float32, o],
 ):
+    var tp = len(nws)
     comptime sentinel = Float32(-1.0e30)
     for tok in range(seq_len):
         var merged = InlineArray[RouterCandidate, top_k](

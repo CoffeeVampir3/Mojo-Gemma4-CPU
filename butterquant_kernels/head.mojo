@@ -17,15 +17,15 @@ from quant.recipe import QuantRecipe
 
 
 def dispatch_bq_head_prep[
-    tp: Int, //,
+    o: ImmutOrigin, //,
     hidden: Int, block: Int, sqrt_n: Float32, n_eps: Float32,
 ](
-    src: Binding[BFloat16, tp],
-    gamma: Binding[BFloat16, tp],
-    dst: ButterquantActivation[tp],
-    row_workspace: Binding[Float32, tp],
+    src: Binding[BFloat16, o],
+    gamma: Binding[BFloat16, o],
+    dst: ButterquantActivation[o],
+    row_workspace: Binding[Float32, o],
 ):
-    for r in range(tp):
+    for r in range(src.degree()):
         prepare_head_activation[hidden, block, sqrt_n, n_eps](
             src[r], gamma[r], dst.data[r], dst.scale[r],
             row_workspace[r])
@@ -33,7 +33,7 @@ def dispatch_bq_head_prep[
 
 @fieldwise_init
 struct BqHeadGemvKernel[
-    rows: Int, cols: Int, block: Int, cap: Float64,
+    cols: Int, block: Int, cap: Float64,
 ](RangePartitionedKernel):
     var x_i8: I8Ptr
     var sa: F32Ptr
@@ -61,25 +61,26 @@ struct BqHeadGemvKernel[
 
 
 def dispatch_bq_head_gemv[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    P: BurstThreadPool, quant: QuantRecipe, o: ImmutOrigin,
     Profile: Bool, N: Int, //,
-    cap: Float64,
+    hidden: Int, cap: Float64,
     max_worker_count: Int = 128,
 ](
-    act: ButterquantActivation[tp],
-    weight: ButterquantWeight[quant, n, m, tp],
-    output: Binding[BFloat16, tp],
+    act: ButterquantActivation[o],
+    weight: ButterquantWeight[quant, o],
+    output: Binding[BFloat16, o],
+    n_rows: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_per_block[quant](), "head GEMV consumes a per-block weight scale"
-    comptime K = BqHeadGemvKernel[n, m, quant_k_block[quant](), cap]
+    comptime K = BqHeadGemvKernel[hidden, quant_k_block[quant](), cap]
 
     @parameter
     def make(r: Int) -> K:
         return K(act.data[r], act.scale[r], weight.data[r], weight.scale[r],
                  output[r], 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_head_gemv"](
-        pools, prof, n, n * m,
-        inline_threshold_bytes=GEMV_INLINE_ROWS * m)
+    fanout_dispatch[make, max_worker_count=max_worker_count, label="bq_head_gemv"](
+        pools, prof, n_rows, n_rows * hidden,
+        inline_threshold_bytes=GEMV_INLINE_ROWS * hidden)

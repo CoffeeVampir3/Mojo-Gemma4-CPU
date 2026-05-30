@@ -61,13 +61,13 @@ def prepare_norm_activation_per_row[
 
 @always_inline
 def prepare_block_activation[
-    cols: Int, block: Int, apply_fwht: Bool,
+    block: Int, apply_fwht: Bool,
 ](
-    src: BF16Ptr, x_i8: I8Ptr, sa: F32Ptr, row_workspace: F32Ptr,
+    src: BF16Ptr, x_i8: I8Ptr, sa: F32Ptr, row_workspace: F32Ptr, cols: Int,
 ):
-    comptime assert cols % WF == 0, (
+    debug_assert(cols % WF == 0,
         "cols must be a multiple of the f32 SIMD width")
-    comptime assert cols % block == 0, "cols must be block-aligned"
+    debug_assert(cols % block == 0, "cols must be block-aligned")
 
     var k = 0
     while k + WF <= cols:

@@ -1,12 +1,3 @@
-from std.memory import UnsafePointer
-
-from kernels.helpers import Binding
-
-
-comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
-comptime BF16Bind[tp: Int] = Binding[BFloat16, tp]
-
-
 @fieldwise_init
 struct ArenaLayout(Copyable, ImplicitlyCopyable):
     """Common arena metadata shared by every model topology.

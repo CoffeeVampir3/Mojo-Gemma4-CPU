@@ -350,13 +350,13 @@ struct Profiler[Profile: Bool, N: Int = 64](Copyable, Movable):
 
 @always_inline
 def compute_end_across[
-    P: BurstThreadPool, //, tp: Int,
+    P: BurstThreadPool, //,
 ](mut pools: List[P]) -> Int:
     """Max worker completion timestamp across all ranks from the last
     dispatch. Call after join. perf_counter_ns is monotonic and shared
     across cores, so this is comparable to the dispatcher's own clock."""
     var m = 0
-    for r in range(tp):
+    for r in range(len(pools)):
         var ts = pools[r].last_worker_timestamp()
         if ts > m:
             m = ts
@@ -388,12 +388,12 @@ struct DispatchSpan[Profile: Bool](Copyable, ImplicitlyCopyable):
 
     @always_inline
     def finish[
-        P: BurstThreadPool, N: Int, //, tp: Int,
+        P: BurstThreadPool, N: Int, //,
     ](self, mut prof: Profiler[Self.Profile, N], mut pools: List[P],
       label: StaticString):
         comptime if Self.Profile:
             var t2 = Int(perf_counter_ns())
-            var compute_end = compute_end_across[tp](pools)
+            var compute_end = compute_end_across(pools)
             if compute_end < self.ts[1]:
                 compute_end = self.ts[1]
             if compute_end > t2:

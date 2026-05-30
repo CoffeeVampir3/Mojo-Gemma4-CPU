@@ -76,9 +76,10 @@ def accumulate_tiles[
 
 
 @always_inline
-def accumulate_n_step[width: Int, PR: Int, K: Int](
+def accumulate_n_step[width: Int, PR: Int](
     act: I8Ptr,
     m_panel: Int,
+    k_stride: Int,
     wpacked: I8Ptr,
     packed_base: Int,
     k_base: Int,
@@ -87,7 +88,7 @@ def accumulate_n_step[width: Int, PR: Int, K: Int](
 ):
     @parameter
     def row_ptr(r: Int) -> I8Ptr:
-        return act + (m_panel + r) * K
+        return act + (m_panel + r) * k_stride
 
     accumulate_tiles[width, PR, row_ptr](
         wpacked, packed_base, k_base, k_len, acc)
@@ -111,9 +112,10 @@ def accumulate_n_step_gathered[width: Int, PR: Int](
 
 
 @always_inline
-def gemm_i8_per_row_panel[N: Int, K: Int, PR: Int, Out: DType](
+def gemm_i8_per_row_panel[K: Int, PR: Int, Out: DType](
     act: I8Ptr,
     m_panel: Int,
+    n_rows: Int,
     act_scale: F32Ptr,
     wpacked: I8Ptr,
     wsc: F32Ptr,
@@ -125,8 +127,8 @@ def gemm_i8_per_row_panel[N: Int, K: Int, PR: Int, Out: DType](
     comptime acc_count = VNNI_N_STEP // width
     var iacc = InlineArray[SIMD[DType.int32, width], PR * acc_count](
         fill=SIMD[DType.int32, width](0))
-    accumulate_n_step[width, PR, K](
-        act, m_panel, wpacked, ns * K, 0, K, iacc)
+    accumulate_n_step[width, PR](
+        act, m_panel, K, wpacked, ns * K, 0, K, iacc)
 
     var inv127 = Float32(1.0) / Float32(127.0)
     comptime for r in range(PR):
@@ -137,12 +139,13 @@ def gemm_i8_per_row_panel[N: Int, K: Int, PR: Int, Out: DType](
             var corrected = vnni_colsum_correct[width](
                 iacc[r * acc_count + a], cs)
             var res = corrected * ad * (wsc + n_base).load[width=width]()
-            store_out[Out, width](res, dst + (m_panel + r) * N + n_base)
+            store_out[Out, width](res, dst + (m_panel + r) * n_rows + n_base)
 
 
-def gemm_i8_per_row[N: Int, K: Int, MR: Int, Out: DType](
+def gemm_i8_per_row[K: Int, MR: Int, Out: DType](
     act: I8Ptr,
     m: Int,
+    n_rows: Int,
     act_scale: F32Ptr,
     wpacked: I8Ptr,
     wsc: F32Ptr,
@@ -155,22 +158,23 @@ def gemm_i8_per_row[N: Int, K: Int, MR: Int, Out: DType](
     var m_panel = 0
     while m_panel + PR <= m:
         for t in range(start_tile, end_tile):
-            gemm_i8_per_row_panel[N, K, PR, Out](
-                act, m_panel, act_scale, wpacked, wsc, colsum, dst,
+            gemm_i8_per_row_panel[K, PR, Out](
+                act, m_panel, n_rows, act_scale, wpacked, wsc, colsum, dst,
                 t * VNNI_N_STEP)
         m_panel += PR
     while m_panel < m:
         for t in range(start_tile, end_tile):
-            gemm_i8_per_row_panel[N, K, 1, Out](
-                act, m_panel, act_scale, wpacked, wsc, colsum, dst,
+            gemm_i8_per_row_panel[K, 1, Out](
+                act, m_panel, n_rows, act_scale, wpacked, wsc, colsum, dst,
                 t * VNNI_N_STEP)
         m_panel += 1
 
 
 @always_inline
-def gemm_i8_per_block_panel[N: Int, K: Int, block: Int, PR: Int, Out: DType](
+def gemm_i8_per_block_panel[N: Int, block: Int, PR: Int, Out: DType](
     act: I8Ptr,
     m_panel: Int,
+    k_dim: Int,
     act_scale: F32Ptr,
     wpacked: I8Ptr,
     wsc: F32Ptr,
@@ -180,9 +184,9 @@ def gemm_i8_per_block_panel[N: Int, K: Int, block: Int, PR: Int, Out: DType](
 ):
     comptime width = simd_width_of[DType.int32]()
     comptime acc_count = VNNI_N_STEP // width
-    comptime nb = K // block
     comptime inv127 = Float32(1.0) / Float32(127.0)
     comptime blk_bytes = block * VNNI_N_STEP
+    var nb = k_dim // block
 
     var facc = InlineArray[SIMD[DType.float32, width], PR * acc_count](
         fill=SIMD[DType.float32, width](0))
@@ -190,8 +194,8 @@ def gemm_i8_per_block_panel[N: Int, K: Int, block: Int, PR: Int, Out: DType](
     for b in range(nb):
         var iacc = InlineArray[SIMD[DType.int32, width], PR * acc_count](
             fill=SIMD[DType.int32, width](0))
-        accumulate_n_step[width, PR, K](
-            act, m_panel, wpacked, ns * K + b * blk_bytes, b * block, block,
+        accumulate_n_step[width, PR](
+            act, m_panel, k_dim, wpacked, ns * k_dim + b * blk_bytes, b * block, block,
             iacc)
         comptime for r in range(PR):
             var adv = SIMD[DType.float32, width](
@@ -211,9 +215,10 @@ def gemm_i8_per_block_panel[N: Int, K: Int, block: Int, PR: Int, Out: DType](
             store_out[Out, width](res, dst + (m_panel + r) * N + n_base)
 
 
-def gemm_i8_per_block[N: Int, K: Int, block: Int, MR: Int, Out: DType](
+def gemm_i8_per_block[N: Int, block: Int, MR: Int, Out: DType](
     act: I8Ptr,
     m: Int,
+    k_dim: Int,
     act_scale: F32Ptr,
     wpacked: I8Ptr,
     wsc: F32Ptr,
@@ -226,13 +231,13 @@ def gemm_i8_per_block[N: Int, K: Int, block: Int, MR: Int, Out: DType](
     var m_panel = 0
     while m_panel + PR <= m:
         for t in range(start_tile, end_tile):
-            gemm_i8_per_block_panel[N, K, block, PR, Out](
-                act, m_panel, act_scale, wpacked, wsc, colsum, dst,
+            gemm_i8_per_block_panel[N, block, PR, Out](
+                act, m_panel, k_dim, act_scale, wpacked, wsc, colsum, dst,
                 t * VNNI_N_STEP)
         m_panel += PR
     while m_panel < m:
         for t in range(start_tile, end_tile):
-            gemm_i8_per_block_panel[N, K, block, 1, Out](
-                act, m_panel, act_scale, wpacked, wsc, colsum, dst,
+            gemm_i8_per_block_panel[N, block, 1, Out](
+                act, m_panel, k_dim, act_scale, wpacked, wsc, colsum, dst,
                 t * VNNI_N_STEP)
         m_panel += 1

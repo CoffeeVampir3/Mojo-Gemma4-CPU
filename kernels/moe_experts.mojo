@@ -56,7 +56,7 @@ def emit_gate_up_panel[
 
 @fieldwise_init
 struct Phase1GateUpKernel[
-    hidden: Int, gate_up_fused: Int, intermediate: Int, experts_per_rank: Int,
+    hidden: Int, gate_up_fused: Int, intermediate: Int,
     tile_j: Int = 64, MR: Int = 4,
 ](WorkerRangePartitionedKernel):
     """Column-partitioned gate/up projection. Each worker owns an
@@ -74,6 +74,7 @@ struct Phase1GateUpKernel[
     var experts_gate_up: BF16Ptr
     var gate_scratch: F32Ptr
     var hidden_bucket: BF16Ptr
+    var experts_per_rank: Int
     var worker_id: Int
     var col_start: Int
     var col_end: Int
@@ -102,7 +103,7 @@ struct Phase1GateUpKernel[
         var gate_part = worker_base
         var up_part = worker_base + Self.MR * Self.tile_j
 
-        for expert in range(Self.experts_per_rank):
+        for expert in range(self.experts_per_rank):
             var rec_lo = Int(self.expert_offset[expert])
             var rec_hi = Int(self.expert_offset[expert + 1])
             var n_tok = rec_hi - rec_lo
@@ -162,33 +163,34 @@ struct Phase1GateUpKernel[
 
 
 def dispatch_phase1_gate_up[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     hidden: Int, gate_up_fused: Int, intermediate: Int,
-    experts_per_rank: Int, tp: Int,
     tile_j: Int = 64, MR: Int = 4, max_worker_count: Int = 128,
 ](
-    x_normed: Binding[BFloat16, tp],
-    expert_offset: Binding[Int32, tp],
-    routes: Binding[SparseRoute, tp],
-    experts_gate_up: Binding[BFloat16, tp],
-    gate_scratch: Binding[Float32, tp],
-    hidden_bucket: Binding[BFloat16, tp],
+    x_normed: Binding[BFloat16, o],
+    expert_offset: Binding[Int32, o],
+    routes: Binding[SparseRoute, o],
+    experts_gate_up: Binding[BFloat16, o],
+    gate_scratch: Binding[Float32, o],
+    hidden_bucket: Binding[BFloat16, o],
+    experts_per_rank: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime K = Phase1GateUpKernel[
-        hidden, gate_up_fused, intermediate, experts_per_rank, tile_j, MR,
+        hidden, gate_up_fused, intermediate, tile_j, MR,
     ]
     comptime n_strides = intermediate // W
+    var epr = experts_per_rank
 
     @parameter
     def make(r: Int) -> K:
         return K(x_normed[r], expert_offset[r], routes[r],
                  experts_gate_up[r], gate_scratch[r], hidden_bucket[r],
-                 0, 0, 0)
+                 epr, 0, 0, 0)
 
     fanout_dispatch[
-        tp, make,
+        make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="phase1_gate_up",
@@ -226,7 +228,7 @@ def emit_down_panel[
 
 @fieldwise_init
 struct Phase2DownKernel[
-    hidden: Int, intermediate: Int, experts_per_rank: Int,
+    hidden: Int, intermediate: Int,
 ](RangePartitionedKernel):
     comptime TOK_TILE = 64
     comptime MR = 4
@@ -238,6 +240,7 @@ struct Phase2DownKernel[
     var experts_down: BF16Ptr
     var moe_accum: F32Ptr
     var moe_partial: BF16Ptr
+    var experts_per_rank: Int
     var seq_len: Int
     var col_start: Int
     var col_end: Int
@@ -259,7 +262,7 @@ struct Phase2DownKernel[
                 (acc_row + m)[] = Float32(0)
                 m += 1
 
-        for e in range(Self.experts_per_rank):
+        for e in range(self.experts_per_rank):
             var rec_lo = Int(self.expert_offset[e])
             var rec_hi = Int(self.expert_offset[e + 1])
             var n_tok_total = rec_hi - rec_lo
@@ -317,31 +320,33 @@ struct Phase2DownKernel[
 
 
 def dispatch_phase2_down[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
-    hidden: Int, intermediate: Int, experts_per_rank: Int, tp: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    hidden: Int, intermediate: Int,
     max_worker_count: Int = 128,
 ](
-    expert_offset: Binding[Int32, tp],
-    routes: Binding[SparseRoute, tp],
-    hidden_bucket: Binding[BFloat16, tp],
-    experts_down: Binding[BFloat16, tp],
-    moe_accum: Binding[Float32, tp],
-    moe_partial: Binding[BFloat16, tp],
+    expert_offset: Binding[Int32, o],
+    routes: Binding[SparseRoute, o],
+    hidden_bucket: Binding[BFloat16, o],
+    experts_down: Binding[BFloat16, o],
+    moe_accum: Binding[Float32, o],
+    moe_partial: Binding[BFloat16, o],
+    experts_per_rank: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
-    comptime K = Phase2DownKernel[hidden, intermediate, experts_per_rank]
+    comptime K = Phase2DownKernel[hidden, intermediate]
     comptime hidden_strides = hidden // W
+    var epr = experts_per_rank
 
     @parameter
     def make(r: Int) -> K:
         return K(expert_offset[r], routes[r], hidden_bucket[r],
                  experts_down[r], moe_accum[r], moe_partial[r],
-                 seq_len, 0, 0)
+                 epr, seq_len, 0, 0)
 
     fanout_dispatch[
-        tp, make,
+        make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="phase2_down",

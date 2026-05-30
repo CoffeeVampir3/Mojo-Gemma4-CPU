@@ -1,5 +1,5 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
@@ -9,7 +9,7 @@ from kernels.logsum_merge import dispatch_merge_flash_partials
 from kernels.attention_ops import flash_partial_stride
 from kernels.helpers import (
     OutputPartitionedKernel, DispatchBuffer, tile_dispatch,
-    Binding, ArenaBases,
+    Binding, RankView,
 )
 from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
@@ -59,20 +59,20 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
-def arena_bases[tp: Int](
+def arena_bases(
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
-) -> ArenaBases[tp]:
-    var bases = ArenaBases[tp].uninitialized()
-    for r in range(tp):
-        bases[r] = Int(arenas[r].base.value())
-    return bases
+) -> List[Int]:
+    var bases = List[Int](capacity=len(arenas))
+    for r in range(len(arenas)):
+        bases.append(Int(arenas[r].base.value()))
+    return bases^
 
 
-def arena_alloc_all[dtype: DType, tp: Int](
+def arena_alloc_all[dtype: DType](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
-    for r in range(tp):
+    for r in range(len(arenas)):
         var ptr = arena_alloc[dtype](arenas[r], count)
         if r == 0:
             first = ptr
@@ -93,33 +93,38 @@ def fill_partials[head_dim: Int, num_q: Int](
             (sp + l_off + h)[] = Float32(1.0)
 
 
-def fill_partials_all[head_dim: Int, num_q: Int, tp: Int](
-    ptrs: Binding[Float32, tp],
+def fill_partials_all[head_dim: Int, num_q: Int, o: ImmutOrigin](
+    ptrs: Binding[Float32, o],
     stride: Int, num_sources: Int,
 ):
-    for r in range(tp):
+    for r in range(ptrs.degree()):
         fill_partials[head_dim, num_q](ptrs[r], stride, num_sources)
 
 
-def source_counts[tp: Int](num_sources: Int) -> InlineArray[Int, tp]:
-    return InlineArray[Int, tp](fill=num_sources)
+def source_counts(tp: Int, num_sources: Int) -> List[Int]:
+    var out = List[Int](capacity=tp)
+    for _ in range(tp):
+        out.append(num_sources)
+    return out^
 
 
 def run_config[
-    P: BurstThreadPool, //, head_dim: Int, num_q: Int, tp: Int,
+    P: BurstThreadPool, //, head_dim: Int, num_q: Int,
 ](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
     mut pools: List[P],
 ):
-    comptime stride = flash_partial_stride[num_q, head_dim]()
-    var bases = arena_bases[tp](arenas)
-    var partials = arena_alloc_all[DType.float32, tp](arenas, MAX_SOURCES * stride)
-    var output = arena_alloc_all[DType.bfloat16, tp](arenas, num_q * head_dim)
+    var tp = len(pools)
+    comptime stride = flash_partial_stride(num_q, head_dim)
+    var bases = arena_bases(arenas)
+    var view = RankView(Span(bases))
+    var partials = arena_alloc_all[DType.float32](arenas, MAX_SOURCES * stride)
+    var output = arena_alloc_all[DType.bfloat16](arenas, num_q * head_dim)
     var scratch = arena_alloc[DType.float32](arenas[0], pools[0].get_capacity())
+    var partial_bind = view.bind(partials)
+    var output_bind = view.bind(output)
 
-    fill_partials_all[head_dim, num_q, tp](
-        Binding[Float32, tp](partials, bases),
-        stride, MAX_SOURCES)
+    fill_partials_all[head_dim, num_q](partial_bind, stride, MAX_SOURCES)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 
@@ -140,20 +145,18 @@ def run_config[
 
         warm_pool(scratch, pools[0])
         for _ in range(WARMUP):
-            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
-                Binding[BFloat16, tp](output, bases),
-                Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools, prof,
+            dispatch_merge_flash_partials[head_dim](
+                output_bind, partial_bind,
+                source_counts(tp, ns), num_q, stride, pools, prof,
                 inline_max_bytes=FORCE_INLINE)
             keep(output[0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
-                Binding[BFloat16, tp](output, bases),
-                Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools, prof,
+            dispatch_merge_flash_partials[head_dim](
+                output_bind, partial_bind,
+                source_counts(tp, ns), num_q, stride, pools, prof,
                 inline_max_bytes=FORCE_INLINE)
             var t1 = now_ns()
             samples.push(t1 - t0, t1 - t0)
@@ -165,23 +168,21 @@ def run_config[
 
         warm_pool(scratch, pools[0])
         for _ in range(WARMUP):
-            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
-                Binding[BFloat16, tp](output, bases),
-                Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools, prof,
+            dispatch_merge_flash_partials[head_dim](
+                output_bind, partial_bind,
+                source_counts(tp, ns), num_q, stride, pools, prof,
                 inline_max_bytes=0)
             keep(output[0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_merge_flash_partials[head_dim, num_q, stride, tp=tp](
-                Binding[BFloat16, tp](output, bases),
-                Binding[Float32, tp](partials, bases),
-                source_counts[tp](ns), pools, prof,
+            dispatch_merge_flash_partials[head_dim](
+                output_bind, partial_bind,
+                source_counts(tp, ns), num_q, stride, pools, prof,
                 inline_max_bytes=0)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
         keep(output[0])
 
@@ -190,12 +191,12 @@ def run_config[
         print_row(String(t"sources={ns} dispatched"), dks, dws, data_bytes)
 
 
-def run_all[P: BurstThreadPool, //, tp: Int](
+def run_all[P: BurstThreadPool, //](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
     mut pools: List[P],
 ):
-    run_config[head_dim=256, num_q=8, tp=tp](arenas, pools)
-    run_config[head_dim=512, num_q=16, tp=tp](arenas, pools)
+    run_config[head_dim=256, num_q=8](arenas, pools)
+    run_config[head_dim=512, num_q=16](arenas, pools)
 
 
 def main():
@@ -216,9 +217,9 @@ def main():
 
     @parameter
     def dispatch_logsum_merge_tp[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        run_all[tp=degree](arenas, selected_pools)
+        run_all(arenas, selected_pools)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_logsum_merge_tp,

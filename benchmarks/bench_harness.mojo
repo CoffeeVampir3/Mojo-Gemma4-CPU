@@ -26,7 +26,10 @@ struct SampleBuffer:
     @always_inline
     def push(mut self, kernel_ns: Int, wall_ns: Int):
         if self.n < self.cap:
-            self.kernel_ns[self.n] = Int64(kernel_ns)
+            var kns = kernel_ns
+            if kns <= 0 or kns > wall_ns:
+                kns = wall_ns
+            self.kernel_ns[self.n] = Int64(kns)
             self.wall_ns[self.n] = Int64(wall_ns)
             self.n += 1
 
@@ -130,11 +133,11 @@ def print_row(
         print(wall_line)
 
 
-def max_last_ts[P: BurstThreadPool, //, tp: Int](
+def max_last_ts[P: BurstThreadPool, //](
     mut pools: List[P],
 ) -> Int:
     var hi = 0
-    for r in range(tp):
+    for r in range(len(pools)):
         var ts = pools[r].last_worker_timestamp()
         if ts > hi:
             hi = ts

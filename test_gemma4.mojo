@@ -69,8 +69,8 @@ def print_prompt(prompt: String, read token_ids: List[Int]):
     print()
 
 
-def greedy_next_token[degree: Int](
-    read view: TemporalLogitsView[VOCAB, degree],
+def greedy_next_token(
+    read view: TemporalLogitsView[VOCAB],
 ) -> Int:
     comptime width = simd_width_of[DType.float32]()
     var best_val: Float32 = -1e30
@@ -90,7 +90,7 @@ def greedy_next_token[degree: Int](
 
 
 def load_and_run[
-    P: BurstThreadPool, //, degree: Int,
+    P: BurstThreadPool, //,
 ](
     topo: NumaTopology,
     var pools: List[P],
@@ -98,7 +98,7 @@ def load_and_run[
     read token_ids: List[Int],
 ):
     var t0 = perf_counter_ns()
-    var model_opt = Gemma4[degree=degree, profile=True, Pool=P].load(
+    var model_opt = Gemma4[profile=True, Pool=P].load(
         Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         return
@@ -120,7 +120,7 @@ def load_and_run[
     var decode_start = perf_counter_ns()
 
     while len(generated) < MAX_NEW_TOKENS:
-        var logits: TemporalLogitsView[VOCAB, degree]
+        var logits: TemporalLogitsView[VOCAB]
         if pos == 0:
             var t1 = perf_counter_ns()
             logits = model.forward(Span(tok_buf), 0)
@@ -134,8 +134,7 @@ def load_and_run[
             logits = model.forward(Span(step_buf), pos)
             pos += 1
 
-        next_id = greedy_next_token[degree](logits)
-        logits^.release()
+        next_id = greedy_next_token(logits)
         generated.append(next_id)
 
         if next_id == EOS_TOKEN_ID:
@@ -184,9 +183,9 @@ The decline of the aqueduct network paralleled the broader collapse of Roman adm
 
     @parameter
     def dispatch_gemma4_tp[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        load_and_run[degree=degree](topo, selected_pools^, tok, token_ids)
+        load_and_run(topo, selected_pools^, tok, token_ids)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_gemma4_tp,

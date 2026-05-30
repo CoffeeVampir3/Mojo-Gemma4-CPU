@@ -1,26 +1,19 @@
-from std.collections import InlineArray
 from std.math import min
 from std.memory import Span
 
 from numa import NumaArena
 from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
-    ArenaBases, WorkerRangePartitionedKernel, fanout_dispatch, saturate_workers,
+    WorkerRangePartitionedKernel, fanout_dispatch, saturate_workers,
 )
 from kernels.profiling import Profiler
-from modeling.model_spec import ShapeLike
 
 from butterquant.vnni import (
-    L2_TARGET, VNNI_N_STEP, VNNI_K_STEP, PtrU8, PtrF32, pack_and_colsum_vnni,
+    L2_TARGET, PtrU8, PtrF32, pack_and_colsum_vnni,
 )
 
 
 comptime PACK_SCRATCH_ALIGN = 64
-
-
-comptime VnniPackable[S: ShapeLike]: Bool = (
-    S.DATA_N % VNNI_N_STEP == 0 and S.DATA_M % VNNI_K_STEP == 0
-)
 
 
 @fieldwise_init
@@ -64,23 +57,24 @@ struct PackColsumKernel[tasks_origin: ImmutOrigin](WorkerRangePartitionedKernel)
 
 
 def dispatch_pack_colsum[
-    P: BurstThreadPool, Profile: Bool, N: Int, //, tp: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, //,
     max_worker_count: Int = 128,
 ](
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
-    arena_bases: ArenaBases[tp],
-    nodes: InlineArray[Int, tp],
+    arena_bases: List[Int],
+    nodes: List[Int],
     tasks: List[PackColsumTask],
 ):
     var num_tasks = len(tasks)
     if num_tasks == 0:
         return
+    var degree = len(pools)
     var view = Span(tasks)
     comptime K = PackColsumKernel[origin_of(tasks)]
 
-    var scratch = List[NumaArena[alignment=PACK_SCRATCH_ALIGN]](capacity=tp)
-    for r in range(tp):
+    var scratch = List[NumaArena[alignment=PACK_SCRATCH_ALIGN]](capacity=degree)
+    for r in range(degree):
         var cap = min(max_worker_count, pools[r].get_capacity())
         scratch.append(
             NumaArena[alignment=PACK_SCRATCH_ALIGN](nodes[r], cap * L2_TARGET))
@@ -96,7 +90,7 @@ def dispatch_pack_colsum[
             worker_id=0, start=0, end=0)
 
     fanout_dispatch[
-        tp, proto_for,
+        proto_for,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="pack_colsum",

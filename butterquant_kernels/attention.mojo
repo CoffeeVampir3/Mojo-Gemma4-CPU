@@ -13,6 +13,7 @@ from kernels.attention_ops import (
 from kernels.attention_dispatch_kernels import (
     dispatch_flash_sliding, dispatch_flash_full,
 )
+from kernels.logsum_merge import MergeSegment
 from kernels.dispatch_heuristics import ROPE_INLINE_TOKENS
 from kernels.profiling import Profiler
 
@@ -29,18 +30,19 @@ def vnni_score_dot[head_dim: Int](k_i8: I8Ptr, q_i8: I8Ptr) -> Int32:
 
 @always_inline
 def bq_process_kv_tile[
-    num_q: Int, //,
-    KV: KVSlot, head_dim: Int, gqa_ratio: Int, kv_stride: Int, num_kv: Int,
+    max_q: Int, //,
+    KV: KVSlot, head_dim: Int, gqa_ratio: Int,
 ](
-    read q_ptrs: InlineArray[I8Ptr, num_q],
-    read qi_bias: InlineArray[Float32, num_q],
-    read f_q: InlineArray[Float32, num_q],
+    read q_ptrs: InlineArray[I8Ptr, max_q],
+    read qi_bias: InlineArray[Float32, max_q],
+    read f_q: InlineArray[Float32, max_q],
     k_base: I8Ptr, v_base: I8Ptr,
     k_scale: F32Ptr, v_scale: F32Ptr,
     start_pos: Int, pos: Int, tile_len: Int,
-    mut m: InlineArray[Float32, num_q],
-    mut l: InlineArray[Float32, num_q],
-    read acc_ptrs: InlineArray[F32Ptr, num_q],
+    mut m: InlineArray[Float32, max_q],
+    mut l: InlineArray[Float32, max_q],
+    read acc_ptrs: InlineArray[F32Ptr, max_q],
+    num_q: Int, num_kv: Int, kv_stride: Int,
 ):
     comptime inv127 = Float32(1.0) / Float32(127.0)
     comptime inv127sq = inv127 * inv127
@@ -49,8 +51,8 @@ def bq_process_kv_tile[
     for t in range(tile_len):
         slots[t] = KV.slot(start_pos, pos + t)
 
-    comptime for q_idx in range(num_q):
-        comptime kv_h = q_idx // gqa_ratio
+    for q_idx in range(num_q):
+        var kv_h = q_idx // gqa_ratio
 
         var scores = SIMD[DType.float32, TILE](-1e30)
         for t in range(tile_len):
@@ -80,8 +82,7 @@ def bq_process_kv_tile[
 @fieldwise_init
 struct BqFlashAttentionKernel[
     KV: KVSlot,
-    head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int, kv_stride: Int,
-    partial_stride: Int,
+    head_dim: Int, max_q: Int, gqa_ratio: Int,
 ](WorkerRangePartitionedKernel):
     var q: I8Ptr
     var qi_bias: F32Ptr
@@ -91,43 +92,47 @@ struct BqFlashAttentionKernel[
     var v_base: I8Ptr
     var v_scale: F32Ptr
     var partials: F32Ptr
+    var num_q: Int
+    var num_kv: Int
+    var kv_stride: Int
+    var partial_stride: Int
     var worker_id: Int
     var start_pos: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        var my_partial = self.partials + self.worker_id * Self.partial_stride
-        comptime m_off = Self.num_q * Self.head_dim
-        comptime l_off = m_off + Self.num_q
+        var my_partial = self.partials + self.worker_id * self.partial_stride
+        var m_off = self.num_q * Self.head_dim
+        var l_off = m_off + self.num_q
 
-        var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
-        var q_ptrs = InlineArray[I8Ptr, Self.num_q](uninitialized=True)
-        var qb = InlineArray[Float32, Self.num_q](uninitialized=True)
-        var fq = InlineArray[Float32, Self.num_q](uninitialized=True)
-        var m = InlineArray[Float32, Self.num_q](fill=Float32(-1e30))
-        var l = InlineArray[Float32, Self.num_q](fill=Float32(0))
+        var acc_ptrs = InlineArray[F32Ptr, Self.max_q](uninitialized=True)
+        var q_ptrs = InlineArray[I8Ptr, Self.max_q](uninitialized=True)
+        var qb = InlineArray[Float32, Self.max_q](uninitialized=True)
+        var fq = InlineArray[Float32, Self.max_q](uninitialized=True)
+        var m = InlineArray[Float32, Self.max_q](fill=Float32(-1e30))
+        var l = InlineArray[Float32, Self.max_q](fill=Float32(0))
 
-        comptime for h in range(Self.num_q):
+        for h in range(self.num_q):
             acc_ptrs[h] = my_partial + h * Self.head_dim
             q_ptrs[h] = self.q + h * Self.head_dim
             qb[h] = self.qi_bias[h]
             fq[h] = self.f_q[h]
 
-        zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs)
+        zero_accumulators[Self.max_q, Self.head_dim](acc_ptrs, self.num_q)
 
         var pos = self.start
         while pos < self.end:
             var tile_len = min(TILE, self.end - pos)
             bq_process_kv_tile[
-                Self.KV, Self.head_dim, Self.gqa_ratio, Self.kv_stride,
-                Self.num_kv,
+                Self.KV, Self.head_dim, Self.gqa_ratio,
             ](q_ptrs, qb, fq, self.k_base, self.v_base,
               self.k_scale, self.v_scale,
-              self.start_pos, pos, tile_len, m, l, acc_ptrs)
+              self.start_pos, pos, tile_len, m, l, acc_ptrs,
+              self.num_q, self.num_kv, self.kv_stride)
             pos += TILE
 
-        comptime for h in range(Self.num_q):
+        for h in range(self.num_q):
             (my_partial + m_off + h)[] = m[h]
             (my_partial + l_off + h)[] = l[h]
 
@@ -140,8 +145,8 @@ struct BqFlashAttentionKernel[
 
 @fieldwise_init
 struct BqFlashPrefillSlidingKernel[
-    head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, cache_size: Int, partial_stride: Int,
+    head_dim: Int, max_q: Int, gqa_ratio: Int,
+    window: Int, cache_size: Int,
 ](WorkerRangePartitionedKernel):
     var q: I8Ptr
     var qi_bias: F32Ptr
@@ -152,18 +157,22 @@ struct BqFlashPrefillSlidingKernel[
     var v_scale: F32Ptr
     var output: BF16Ptr
     var partials: F32Ptr
+    var num_q: Int
+    var num_kv: Int
+    var kv_stride: Int
+    var partial_stride: Int
     var base_pos: Int
     var worker_id: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        comptime q_stride = Self.num_q * Self.head_dim
+        var q_stride = self.num_q * Self.head_dim
 
-        var scratch = self.partials + self.worker_id * Self.partial_stride
-        var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
-        var q_ptrs = InlineArray[I8Ptr, Self.num_q](uninitialized=True)
-        comptime for h in range(Self.num_q):
+        var scratch = self.partials + self.worker_id * self.partial_stride
+        var acc_ptrs = InlineArray[F32Ptr, Self.max_q](uninitialized=True)
+        var q_ptrs = InlineArray[I8Ptr, Self.max_q](uninitialized=True)
+        for h in range(self.num_q):
             acc_ptrs[h] = scratch + h * Self.head_dim
 
         for t in range(self.start, self.end):
@@ -173,29 +182,29 @@ struct BqFlashPrefillSlidingKernel[
 
             var q_tok = self.q + t * q_stride
             var out_tok = self.output + t * q_stride
-            var qb = InlineArray[Float32, Self.num_q](uninitialized=True)
-            var fq = InlineArray[Float32, Self.num_q](uninitialized=True)
-            var m = InlineArray[Float32, Self.num_q](fill=Float32(-1e30))
-            var l = InlineArray[Float32, Self.num_q](fill=Float32(0))
-            comptime for h in range(Self.num_q):
+            var qb = InlineArray[Float32, Self.max_q](uninitialized=True)
+            var fq = InlineArray[Float32, Self.max_q](uninitialized=True)
+            var m = InlineArray[Float32, Self.max_q](fill=Float32(-1e30))
+            var l = InlineArray[Float32, Self.max_q](fill=Float32(0))
+            for h in range(self.num_q):
                 q_ptrs[h] = q_tok + h * Self.head_dim
-                qb[h] = self.qi_bias[t * Self.num_q + h]
-                fq[h] = self.f_q[t * Self.num_q + h]
+                qb[h] = self.qi_bias[t * self.num_q + h]
+                fq[h] = self.f_q[t * self.num_q + h]
 
-            zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs)
+            zero_accumulators[Self.max_q, Self.head_dim](acc_ptrs, self.num_q)
 
             var pos = lo
             while pos < hi:
                 var tile_len = min(TILE, hi - pos)
                 bq_process_kv_tile[
                     RingKV[Self.cache_size], Self.head_dim, Self.gqa_ratio,
-                    Self.kv_stride, Self.num_kv,
                 ](q_ptrs, qb, fq, self.k_base, self.v_base,
                   self.k_scale, self.v_scale,
-                  0, pos, tile_len, m, l, acc_ptrs)
+                  0, pos, tile_len, m, l, acc_ptrs,
+                  self.num_q, self.num_kv, self.kv_stride)
                 pos += TILE
 
-            comptime for h in range(Self.num_q):
+            for h in range(self.num_q):
                 if l[h] > 0:
                     var inv_l = SIMD[DType.float32, W](Float32(1.0) / l[h])
                     for j in range(0, Self.head_dim, W):
@@ -216,7 +225,7 @@ struct BqFlashPrefillSlidingKernel[
 @fieldwise_init
 struct BqFlashPrefillFullKernel[
     head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
-    kv_stride: Int, degree: Int, partial_stride: Int,
+    partial_stride: Int,
 ](RangePartitionedKernel):
     var q: I8Ptr
     var qi_bias: F32Ptr
@@ -226,6 +235,8 @@ struct BqFlashPrefillFullKernel[
     var v_base: I8Ptr
     var v_scale: F32Ptr
     var partials: F32Ptr
+    var kv_stride: Int
+    var degree: Int
     var base_pos: Int
     var rank: Int
     var start: Int
@@ -242,7 +253,7 @@ struct BqFlashPrefillFullKernel[
         for t in range(self.start, self.end):
             var abs_pos = self.base_pos + t
             var local_kv_count = full_local_kv_count(
-                self.rank, abs_pos, Self.degree)
+                self.rank, abs_pos, self.degree)
 
             var partial_tok = self.partials + t * Self.partial_stride
             var q_tok = self.q + t * q_stride
@@ -257,17 +268,17 @@ struct BqFlashPrefillFullKernel[
                 qb[h] = self.qi_bias[t * Self.num_q + h]
                 fq[h] = self.f_q[t * Self.num_q + h]
 
-            zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs)
+            zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs, Self.num_q)
 
             var pos = 0
             while pos < local_kv_count:
                 var tile_len = min(TILE, local_kv_count - pos)
                 bq_process_kv_tile[
                     LinearKV, Self.head_dim, Self.gqa_ratio,
-                    Self.kv_stride, Self.num_kv,
                 ](q_ptrs, qb, fq, self.k_base, self.v_base,
                   self.k_scale, self.v_scale,
-                  0, pos, tile_len, m, l, acc_ptrs)
+                  0, pos, tile_len, m, l, acc_ptrs,
+                  Self.num_q, Self.num_kv, self.kv_stride)
                 pos += TILE
 
             comptime for h in range(Self.num_q):
@@ -281,20 +292,21 @@ struct BqFlashPrefillFullKernel[
 
 
 def dispatch_bq_sliding_attention[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
-    head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
-    kv_stride: Int, window: Int, cache_size: Int, partial_stride: Int, tp: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    head_dim: Int, max_q: Int, gqa_ratio: Int,
+    window: Int, cache_size: Int,
     max_worker_count: Int = 128,
 ](
-    q: Binding[Int8, tp],
-    qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
-    k_base: Binding[Int8, tp],
-    k_scale: Binding[Float32, tp],
-    v_base: Binding[Int8, tp],
-    v_scale: Binding[Float32, tp],
-    output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+    q: Binding[Int8, o],
+    qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
+    k_base: Binding[Int8, o],
+    k_scale: Binding[Float32, o],
+    v_base: Binding[Int8, o],
+    v_scale: Binding[Float32, o],
+    output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
+    num_q: Int, num_kv: Int, partial_stride: Int, kv_stride: Int,
     base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
@@ -302,84 +314,94 @@ def dispatch_bq_sliding_attention[
 ):
     comptime DecodeK = BqFlashAttentionKernel[
         RingKV[cache_size],
-        head_dim, num_q, num_kv, gqa_ratio, kv_stride, partial_stride,
+        head_dim, max_q, gqa_ratio,
     ]
     comptime PrefillK = BqFlashPrefillSlidingKernel[
-        head_dim, num_q, num_kv, gqa_ratio, kv_stride, window, cache_size,
-        partial_stride,
+        head_dim, max_q, gqa_ratio, window, cache_size,
     ]
+    var nq = num_q
+    var nkv = num_kv
+    var ps = partial_stride
+    var ks = kv_stride
+    var bp = base_pos
 
     @parameter
     def make_decode(r: Int, start_pos: Int) -> DecodeK:
         return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
                        v_base[r], v_scale[r], partials[r],
-                       0, start_pos, 0, 0)
+                       nq, nkv, ks, ps, 0, start_pos, 0, 0)
 
     @parameter
     def make_prefill(r: Int) -> PrefillK:
         return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
                         v_base[r], v_scale[r], output[r], partials[r],
-                        base_pos, 0, 0, 0)
+                        nq, nkv, ks, ps, bp, 0, 0, 0)
 
     dispatch_flash_sliding[
-        head_dim, num_q, partial_stride, kv_stride, window, tp, 1,
+        head_dim, window, 1,
         make_decode, make_prefill,
         "sliding_attention.decode", "sliding_attention.prefill",
         max_worker_count=max_worker_count,
-    ](output, partials, base_pos, seq_len, pools, prof)
+    ](output, partials, num_q, partial_stride, kv_stride, base_pos, seq_len,
+      pools, prof)
 
 
 def dispatch_bq_full_attention[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
-    head_dim: Int, num_q: Int, num_kv: Int, local_num_q: Int, gqa_ratio: Int,
-    kv_stride: Int, partial_stride: Int, tp: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
+    kv_stride: Int, partial_stride: Int,
     max_worker_count: Int = 128,
 ](
-    q: Binding[Int8, tp],
-    qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
-    k_base: Binding[Int8, tp],
-    k_scale: Binding[Float32, tp],
-    v_base: Binding[Int8, tp],
-    v_scale: Binding[Float32, tp],
-    q_local_output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+    q: Binding[Int8, o],
+    qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
+    k_base: Binding[Int8, o],
+    k_scale: Binding[Float32, o],
+    v_base: Binding[Int8, o],
+    v_scale: Binding[Float32, o],
+    q_local_output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
+    segment_scratch: Binding[MergeSegment, o],
+    local_num_q: Int,
     base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime DecodeK = BqFlashAttentionKernel[
-        LinearKV, head_dim, num_q, num_kv, gqa_ratio, kv_stride,
-        partial_stride,
+        LinearKV, head_dim, num_q, gqa_ratio,
     ]
     comptime PrefillK = BqFlashPrefillFullKernel[
-        head_dim, num_q, num_kv, gqa_ratio, kv_stride, tp, partial_stride,
+        head_dim, num_q, num_kv, gqa_ratio, partial_stride,
     ]
+    var bp = base_pos
+    var degree = len(pools)
 
     @parameter
     def make_decode(r: Int) -> DecodeK:
         return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
-                       v_base[r], v_scale[r], partials[r], 0, 0, 0, 0)
+                       v_base[r], v_scale[r], partials[r],
+                       num_q, num_kv, kv_stride, partial_stride, 0, 0, 0, 0)
 
     @parameter
     def make_prefill(r: Int) -> PrefillK:
         return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
                         v_base[r], v_scale[r], partials[r],
-                        base_pos, r, 0, 0)
+                        kv_stride, degree, bp, r, 0, 0)
 
     dispatch_flash_full[
-        head_dim, num_q, local_num_q, partial_stride, kv_stride, tp, 1,
+        head_dim, kv_stride, 1,
         make_decode, make_prefill,
         "full_attention.decode", "full_attention.prefill",
         max_worker_count=max_worker_count,
-    ](q_local_output, partials, base_pos, seq_len, pools, prof)
+    ](q_local_output, partials, segment_scratch,
+      num_q, local_num_q, partial_stride, base_pos, seq_len, pools, prof)
 
 
 @fieldwise_init
 struct BqAttnPrepKernel[
-    head_dim: Int, num_q: Int, num_kv: Int, rope_half: Int, pair_stride: Int,
-    slot_mask: Int, cache_degree: Int, sqrt_n: Float32, n_eps: Float32,
+    head_dim: Int, rope_half: Int, pair_stride: Int,
+    slot_mask: Int, sqrt_n: Float32, n_eps: Float32,
 ](RangePartitionedKernel):
     var q_src: BF16Ptr
     var k_src: BF16Ptr
@@ -395,14 +417,17 @@ struct BqAttnPrepKernel[
     var v_scale: F32Ptr
     var cos_table: F32Ptr
     var sin_table: F32Ptr
+    var num_q: Int
+    var num_kv: Int
+    var cache_degree: Int
     var base_pos: Int
     var rank: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        comptime q_stride = Self.num_q * Self.head_dim
-        comptime kv_stride = Self.num_kv * Self.head_dim
+        var q_stride = self.num_q * Self.head_dim
+        var kv_stride = self.num_kv * Self.head_dim
         for tok in range(self.start, self.end):
             var pos = self.base_pos + tok
             var cos_row = self.cos_table + pos * Self.rope_half
@@ -410,24 +435,24 @@ struct BqAttnPrepKernel[
 
             var q_tok = self.q_src + tok * q_stride
             var qi_tok = self.q_i8 + tok * q_stride
-            for h in range(Self.num_q):
+            for h in range(self.num_q):
                 var res = prep_head_qk_i8[
                     Self.head_dim, Self.rope_half, Self.pair_stride,
                     Self.sqrt_n, Self.n_eps,
                 ](q_tok + h * Self.head_dim, self.q_norm, cos_row, sin_row,
                   qi_tok + h * Self.head_dim)
-                (self.qi_bias + tok * Self.num_q + h)[] = Float32(res[1]) * 128.0
-                (self.f_q + tok * Self.num_q + h)[] = res[0]
+                (self.qi_bias + tok * self.num_q + h)[] = Float32(res[1]) * 128.0
+                (self.f_q + tok * self.num_q + h)[] = res[0]
 
-            if pos % Self.cache_degree == self.rank:
-                var slot = (pos // Self.cache_degree) & Self.slot_mask
+            if pos % self.cache_degree == self.rank:
+                var slot = (pos // self.cache_degree) & Self.slot_mask
                 var k_tok = self.k_src + tok * kv_stride
                 var v_tok = self.v_src + tok * kv_stride
                 var k_dst = self.k_cache + slot * kv_stride
                 var v_dst = self.v_cache + slot * kv_stride
-                var ks_dst = self.k_scale + slot * Self.num_kv
-                var vs_dst = self.v_scale + slot * Self.num_kv
-                for h in range(Self.num_kv):
+                var ks_dst = self.k_scale + slot * self.num_kv
+                var vs_dst = self.v_scale + slot * self.num_kv
+                for h in range(self.num_kv):
                     var sk = prep_head_qk_i8[
                         Self.head_dim, Self.rope_half, Self.pair_stride,
                         Self.sqrt_n, Self.n_eps,
@@ -446,33 +471,33 @@ struct BqAttnPrepKernel[
 
 
 def dispatch_bq_attn_prep[
-    P: BurstThreadPool, Profile: Bool, N: Int, //,
-    head_dim: Int, num_q: Int, num_kv: Int, rope_half: Int, pair_stride: Int,
-    slot_mask: Int, cache_degree: Int, sqrt_n: Float32, n_eps: Float32, tp: Int,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    head_dim: Int, rope_half: Int, pair_stride: Int,
+    slot_mask: Int, sqrt_n: Float32, n_eps: Float32,
     max_worker_count: Int = 128,
 ](
-    q_src: Binding[BFloat16, tp],
-    k_src: Binding[BFloat16, tp],
-    v_src: Binding[BFloat16, tp],
-    q_norm: Binding[BFloat16, tp],
-    k_norm: Binding[BFloat16, tp],
-    q_i8: Binding[Int8, tp],
-    qi_bias: Binding[Float32, tp],
-    f_q: Binding[Float32, tp],
-    k_cache: Binding[Int8, tp],
-    k_scale: Binding[Float32, tp],
-    v_cache: Binding[Int8, tp],
-    v_scale: Binding[Float32, tp],
-    cos_table: Binding[Float32, tp],
-    sin_table: Binding[Float32, tp],
+    q_src: Binding[BFloat16, o],
+    k_src: Binding[BFloat16, o],
+    v_src: Binding[BFloat16, o],
+    q_norm: Binding[BFloat16, o],
+    k_norm: Binding[BFloat16, o],
+    q_i8: Binding[Int8, o],
+    qi_bias: Binding[Float32, o],
+    f_q: Binding[Float32, o],
+    k_cache: Binding[Int8, o],
+    k_scale: Binding[Float32, o],
+    v_cache: Binding[Int8, o],
+    v_scale: Binding[Float32, o],
+    cos_table: Binding[Float32, o],
+    sin_table: Binding[Float32, o],
+    num_q: Int, num_kv: Int, cache_degree: Int,
     base_pos: Int, seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime K = BqAttnPrepKernel[
-        head_dim, num_q, num_kv, rope_half, pair_stride,
-        slot_mask, cache_degree, sqrt_n, n_eps]
-    comptime row_bytes = (num_q + 2 * num_kv) * head_dim * 6
+        head_dim, rope_half, pair_stride, slot_mask, sqrt_n, n_eps]
+    var row_bytes = (num_q + 2 * num_kv) * head_dim * 6
 
     @parameter
     def make(r: Int) -> K:
@@ -480,8 +505,9 @@ def dispatch_bq_attn_prep[
                  q_i8[r], qi_bias[r], f_q[r],
                  k_cache[r], k_scale[r], v_cache[r], v_scale[r],
                  cos_table[r], sin_table[r],
+                 num_q, num_kv, cache_degree,
                  base_pos, r % cache_degree, 0, 0)
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_attn_prep"](
+    fanout_dispatch[make, max_worker_count=max_worker_count, label="bq_attn_prep"](
         pools, prof, seq_len, seq_len * row_bytes,
         inline_threshold_bytes=ROPE_INLINE_TOKENS * row_bytes)

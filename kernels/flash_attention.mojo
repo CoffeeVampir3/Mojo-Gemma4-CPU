@@ -10,44 +10,47 @@ from .attention_ops import KVSlot, TILE, process_kv_tile, zero_accumulators
 @fieldwise_init
 struct FlashAttentionKernel[
     KV: KVSlot,
-    head_dim: Int, num_q: Int, gqa_ratio: Int, kv_stride: Int,
-    partial_stride: Int,
+    head_dim: Int, max_q: Int, gqa_ratio: Int,
 ](WorkerRangePartitionedKernel):
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
     var partials: F32Ptr
+    var num_q: Int
+    var partial_stride: Int
+    var kv_stride: Int
     var worker_id: Int
     var start_pos: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
-        var my_partial = self.partials + self.worker_id * Self.partial_stride
-        comptime m_off = Self.num_q * Self.head_dim
-        comptime l_off = m_off + Self.num_q
+        var my_partial = self.partials + self.worker_id * self.partial_stride
+        var m_off = self.num_q * Self.head_dim
+        var l_off = m_off + self.num_q
 
-        var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
-        var q_ptrs = InlineArray[BF16Ptr, Self.num_q](uninitialized=True)
-        var m = InlineArray[Float32, Self.num_q](fill=Float32(-1e30))
-        var l = InlineArray[Float32, Self.num_q](fill=Float32(0))
+        var acc_ptrs = InlineArray[F32Ptr, Self.max_q](uninitialized=True)
+        var q_ptrs = InlineArray[BF16Ptr, Self.max_q](uninitialized=True)
+        var m = InlineArray[Float32, Self.max_q](fill=Float32(-1e30))
+        var l = InlineArray[Float32, Self.max_q](fill=Float32(0))
 
-        comptime for h in range(Self.num_q):
+        for h in range(self.num_q):
             acc_ptrs[h] = my_partial + h * Self.head_dim
             q_ptrs[h] = self.q + h * Self.head_dim
 
-        zero_accumulators[Self.num_q, Self.head_dim](acc_ptrs)
+        zero_accumulators[Self.max_q, Self.head_dim](acc_ptrs, self.num_q)
 
         var pos = self.start
         while pos < self.end:
             var tile_len = min(TILE, self.end - pos)
             process_kv_tile[
-                Self.KV, Self.head_dim, Self.gqa_ratio, Self.kv_stride,
+                Self.KV, Self.head_dim, Self.gqa_ratio,
             ](q_ptrs, self.k_base, self.v_base,
-              self.start_pos, pos, tile_len, m, l, acc_ptrs)
+              self.start_pos, pos, tile_len, m, l, acc_ptrs,
+              self.num_q, self.kv_stride)
             pos += TILE
 
-        comptime for h in range(Self.num_q):
+        for h in range(self.num_q):
             (my_partial + m_off + h)[] = m[h]
             (my_partial + l_off + h)[] = l[h]
 

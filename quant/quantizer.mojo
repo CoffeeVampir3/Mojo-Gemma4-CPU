@@ -567,7 +567,7 @@ struct Quantizer(Movable):
         var local = String(FT.NAME)
 
         var offs = InlineArray[Int, 5](fill=-1)
-        comptime MANIFEST = quant_manifest[FT.ENCODING, FT.SHAPE, FT.QUANT]()
+        comptime MANIFEST = quant_manifest[FT.ENCODING, FT.SHAPE, FT.QUANT](1)
         comptime for i in range(MANIFEST.count):
             comptime MEMBER = MANIFEST.members[i]
             comptime if MEMBER.role != QuantRole.COLSUM:
@@ -765,23 +765,40 @@ struct Quantizer(Movable):
     def execute[P: BurstThreadPool, //](
         mut self, topo: NumaTopology, var pools: List[P],
     ) -> Bool:
-        """Run the plan across the caller's `pools`, one job per pool. The
+        """Run the plan across the caller's `pools`, one job per pool worker. The
         caller is responsible for constructing pools — typically via
         `with_topological_rank_dispatch` so isolation mode and pinning match
-        the rest of the system. Slots are bin-packed across pools; each pool
-        receives one QuantShardKernel that opens its own io_uring on the
-        worker thread and writes to preassigned, disjoint regions of the
-        output file."""
-        var n = len(pools)
-        if n <= 0:
+        the rest of the system. Slots are bin-packed across workers; each
+        worker opens its own io_uring and writes to preassigned, disjoint
+        regions of the output file."""
+        var num_ranks = len(pools)
+        if num_ranks <= 0:
             print("quant: empty pool list")
             return False
-        if n > len(topo):
+        if num_ranks > len(topo):
             var rl = len(topo)
-            print(t"quant: pool count {n} exceeds topology rank length {rl}")
+            print(t"quant: pool count {num_ranks} exceeds topology rank length {rl}")
             return False
 
-        var buckets = partition_slots(self.slots, n)
+        var workers_per_rank = List[Int](capacity=num_ranks)
+        var worker_rank = List[Int]()
+        var worker_idx = List[Int]()
+        for r in range(num_ranks):
+            var cap = pools[r].get_capacity()
+            if cap <= 0:
+                print(t"quant: pool {r} has no workers")
+                return False
+            workers_per_rank.append(cap)
+            for w in range(cap):
+                worker_rank.append(r)
+                worker_idx.append(w)
+
+        var num_workers = len(worker_rank)
+        if num_workers <= 0:
+            print("quant: empty worker list")
+            return False
+
+        var buckets = partition_slots(self.slots, num_workers)
         var scratch_layout = QuantScratchLayout.build(self.scratch_cap)
         var scratch_bytes = scratch_layout.total_bytes
         if scratch_bytes <= 0:
@@ -790,25 +807,27 @@ struct Quantizer(Movable):
 
         var scratch_arenas = List[
             NumaArena[alignment=QUANT_SCRATCH_ALIGNMENT]
-        ](capacity=n)
-        var scratches = List[QuantScratch](capacity=n)
-        for w in range(n):
+        ](capacity=num_ranks)
+        var scratches = List[QuantScratch](capacity=num_workers)
+        for r in range(num_ranks):
+            var rank_scratch_bytes = scratch_bytes * workers_per_rank[r]
             scratch_arenas.append(
                 NumaArena[alignment=QUANT_SCRATCH_ALIGNMENT](
-                    topo.node(w), scratch_bytes))
-            if not scratch_arenas[w]:
-                var node = topo.node(w)
+                    topo.node(r), rank_scratch_bytes))
+            if not scratch_arenas[r]:
+                var node = topo.node(r)
                 print(t"quant: scratch arena allocation failed on node {node}")
                 return False
-            var base = scratch_arenas[w].alloc[UInt8](scratch_bytes)
-            if not base:
-                print(t"quant: scratch arena exhausted for rank {w}")
-                return False
-            scratches.append(QuantScratch(base.value(), scratch_layout))
-            _ = scratch_arenas[w].prefault(0, scratch_arenas[w].used())
+            for _ in range(workers_per_rank[r]):
+                var base = scratch_arenas[r].alloc[UInt8](scratch_bytes)
+                if not base:
+                    print(t"quant: scratch arena exhausted for rank {r}")
+                    return False
+                scratches.append(QuantScratch(base.value(), scratch_layout))
+            _ = scratch_arenas[r].prefault(0, scratch_arenas[r].used())
 
-        var kernels = List[QuantShardKernel](capacity=n)
-        for w in range(n):
+        var kernels = List[QuantShardKernel](capacity=num_workers)
+        for w in range(num_workers):
             kernels.append(QuantShardKernel(
                 fds=as_mut_any_span(self.fds),
                 output_fd_idx=self.output_fd_idx,
@@ -816,23 +835,30 @@ struct Quantizer(Movable):
                 slots=as_mut_any_span(buckets[w]),
                 data_start=self.data_start,
                 scratch=scratches[w],
-                rank=w,
+                rank=worker_rank[w],
+                worker_idx=worker_idx[w],
             ))
 
         var pool_base = pools.unsafe_ptr()
-        for w in range(n):
+        var worker_start = 0
+        for r in range(num_ranks):
+            var jobs = workers_per_rank[r]
             var kernel_span = Span[QuantShardKernel, MutAnyOrigin](
                 ptr=UnsafePointer[QuantShardKernel, MutAnyOrigin](
-                    unsafe_from_address=Int(UnsafePointer(to=kernels[w]))),
-                length=1)
-            (pool_base + w)[].dispatch(kernel_span, 1)
-        for w in range(n):
-            (pool_base + w)[].join()
+                    unsafe_from_address=Int(UnsafePointer(to=kernels[worker_start]))),
+                length=jobs)
+            (pool_base + r)[].dispatch(kernel_span, jobs)
+            worker_start += jobs
+        for r in range(num_ranks):
+            (pool_base + r)[].join()
 
         _ = kernels^
         _ = scratches^
         _ = scratch_arenas^
         _ = buckets
+        _ = worker_rank^
+        _ = worker_idx^
+        _ = workers_per_rank^
         _ = pools^
         return True
 
@@ -1251,13 +1277,14 @@ struct QuantShardKernel(BurstKernel):
     var data_start: Int
     var scratch: QuantScratch
     var rank: Int
+    var worker_idx: Int
 
     def execute(mut self):
         var sys = linux.linux_sys()
         var worker = QuantWorker(
             fds=self.fds, output_fd_idx=self.output_fd_idx,
             headers=self.headers, data_start=self.data_start,
-            scratch=self.scratch, rank=self.rank, worker_idx=0,
+            scratch=self.scratch, rank=self.rank, worker_idx=self.worker_idx,
         )
         if not worker:
             print("quant worker: setup failed")

@@ -1,12 +1,12 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from kernels.helpers import (
-    DispatchBuffer, recommended_workers, Binding, ArenaBases,
+    DispatchBuffer, Binding, RankView,
 )
 from kernels.rmsnorm import (
     rms_reduce_row, rms_normalize_row, rms_norm_row,
@@ -43,20 +43,20 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
-def arena_bases[tp: Int](
+def arena_bases(
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
-) -> ArenaBases[tp]:
-    var bases = ArenaBases[tp].uninitialized()
-    for r in range(tp):
-        bases[r] = Int(arenas[r].base.value())
-    return bases
+) -> List[Int]:
+    var bases = List[Int](capacity=len(arenas))
+    for r in range(len(arenas)):
+        bases.append(Int(arenas[r].base.value()))
+    return bases^
 
 
-def arena_alloc_all[dtype: DType, tp: Int](
+def arena_alloc_all[dtype: DType](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
-    for r in range(tp):
+    for r in range(len(arenas)):
         var ptr = arena_alloc[dtype](arenas[r], count)
         if r == 0:
             first = ptr
@@ -73,17 +73,17 @@ def fill_ones(ptr: BF16Ptr, count: Int):
         ptr[i] = BFloat16(Float32(1.0) + Float32(i % 64) * 0.001)
 
 
-def fill_norm_input_all[tp: Int](
-    ptrs: Binding[BFloat16, tp], count: Int,
+def fill_norm_input_all[o: ImmutOrigin](
+    ptrs: Binding[BFloat16, o], count: Int,
 ):
-    for r in range(tp):
+    for r in range(ptrs.degree()):
         fill_norm_input(ptrs[r], count)
 
 
-def fill_ones_all[tp: Int](
-    ptrs: Binding[BFloat16, tp], count: Int,
+def fill_ones_all[o: ImmutOrigin](
+    ptrs: Binding[BFloat16, o], count: Int,
 ):
-    for r in range(tp):
+    for r in range(ptrs.degree()):
         fill_ones(ptrs[r], count)
 
 
@@ -208,11 +208,16 @@ def section_dispatch_overhead[P: BurstThreadPool](
     print_row("1w dispatch", ks_disp, ws_disp, 0)
 
 
-def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: List[P], src: BF16Ptr, dst: BF16Ptr, weight: BF16Ptr,
-    bases: ArenaBases[tp],
+def section_seq_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
+    mut pools: List[P],
+    src: Binding[BFloat16, o],
+    dst: Binding[BFloat16, o],
+    weight: Binding[BFloat16, o],
 ):
     print("\n=== Standalone norm: seq_len sweep ===")
+    var src0 = src[0]
+    var dst0 = dst[0]
+    var weight0 = weight[0]
 
     comptime NUM_SIZES = 9
     var sizes = InlineArray[Int, NUM_SIZES](fill=0)
@@ -235,49 +240,49 @@ def section_seq_sweep[P: BurstThreadPool, //, tp: Int](
         for _ in range(WARMUP):
             for tok in range(seq):
                 rms_norm_row[HIDDEN, SQRT_N, N_EPS](
-                    src + tok * HIDDEN, dst + tok * HIDDEN, weight)
+                    src0 + tok * HIDDEN, dst0 + tok * HIDDEN, weight0)
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
             for tok in range(seq):
                 rms_norm_row[HIDDEN, SQRT_N, N_EPS](
-                    src + tok * HIDDEN, dst + tok * HIDDEN, weight)
+                    src0 + tok * HIDDEN, dst0 + tok * HIDDEN, weight0)
             var t1 = now_ns()
             samples.push(t1 - t0, t1 - t0)
-        keep(dst[0])
+        keep(dst0[0])
         var ks_in = compute_stats(samples.kernel_ns, samples.n)
         var ws_in = compute_stats(samples.wall_ns, samples.n)
         print_row(String(t"seq={seq} inline"), ks_in, ws_in, seq * HIDDEN * 2)
 
         for _ in range(WARMUP):
-            dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
-                Binding[BFloat16, tp](src, bases),
-                Binding[BFloat16, tp](dst, bases),
-                Binding[BFloat16, tp](weight, bases),
-                seq, pools, prof)
+            dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
+                src, dst, weight, seq, pools, prof)
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp](
-                Binding[BFloat16, tp](src, bases),
-                Binding[BFloat16, tp](dst, bases),
-                Binding[BFloat16, tp](weight, bases),
-                seq, pools, prof)
+            dispatch_rms_norm[hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS](
+                src, dst, weight, seq, pools, prof)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
-        keep(dst[0])
+        keep(dst0[0])
         var ks_d = compute_stats(samples.kernel_ns, samples.n)
         var ws_d = compute_stats(samples.wall_ns, samples.n)
         print_row(String(t"seq={seq} dispatch"), ks_d, ws_d, seq * HIDDEN * 2)
 
 
-def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
-    mut pools: List[P], partial: BF16Ptr, residual: BF16Ptr,
-    res_dst: BF16Ptr, weight: BF16Ptr,
-    bases: ArenaBases[tp],
+def section_fused_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
+    mut pools: List[P],
+    partial: Binding[BFloat16, o],
+    residual: Binding[BFloat16, o],
+    res_dst: Binding[BFloat16, o],
+    weight: Binding[BFloat16, o],
 ):
     print("\n=== Norm+residual add: seq_len sweep ===")
+    var partial0 = partial[0]
+    var residual0 = residual[0]
+    var res_dst0 = res_dst[0]
+    var weight0 = weight[0]
 
     comptime NUM_SIZES = 9
     var sizes = InlineArray[Int, NUM_SIZES](fill=0)
@@ -300,71 +305,67 @@ def section_fused_sweep[P: BurstThreadPool, //, tp: Int](
         for _ in range(WARMUP):
             for tok in range(seq):
                 norm_residual_add_row[HIDDEN, SQRT_N, N_EPS](
-                    partial + tok * HIDDEN, residual + tok * HIDDEN,
-                    res_dst + tok * HIDDEN, weight)
+                    partial0 + tok * HIDDEN, residual0 + tok * HIDDEN,
+                    res_dst0 + tok * HIDDEN, weight0)
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
             for tok in range(seq):
                 norm_residual_add_row[HIDDEN, SQRT_N, N_EPS](
-                    partial + tok * HIDDEN, residual + tok * HIDDEN,
-                    res_dst + tok * HIDDEN, weight)
+                    partial0 + tok * HIDDEN, residual0 + tok * HIDDEN,
+                    res_dst0 + tok * HIDDEN, weight0)
             var t1 = now_ns()
             samples.push(t1 - t0, t1 - t0)
-        keep(res_dst[0])
+        keep(res_dst0[0])
         var ks_in = compute_stats(samples.kernel_ns, samples.n)
         var ws_in = compute_stats(samples.wall_ns, samples.n)
         print_row(String(t"seq={seq} inline"), ks_in, ws_in, seq * HIDDEN * 4)
 
         for _ in range(WARMUP):
             fused_norm_residual_add[
-                hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp,
-            ](
-                Binding[BFloat16, tp](partial, bases),
-                Binding[BFloat16, tp](residual, bases),
-                Binding[BFloat16, tp](res_dst, bases),
-                Binding[BFloat16, tp](weight, bases),
-                seq, pools, prof)
+                hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS,
+            ](partial, residual, res_dst, weight, seq, pools, prof)
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
             fused_norm_residual_add[
-                hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS, tp=tp,
-            ](
-                Binding[BFloat16, tp](partial, bases),
-                Binding[BFloat16, tp](residual, bases),
-                Binding[BFloat16, tp](res_dst, bases),
-                Binding[BFloat16, tp](weight, bases),
-                seq, pools, prof)
+                hidden=HIDDEN, sqrt_n=SQRT_N, n_eps=N_EPS,
+            ](partial, residual, res_dst, weight, seq, pools, prof)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
-        keep(res_dst[0])
+        keep(res_dst0[0])
         var ks_d = compute_stats(samples.kernel_ns, samples.n)
         var ws_d = compute_stats(samples.wall_ns, samples.n)
         print_row(String(t"seq={seq} dispatch"), ks_d, ws_d, seq * HIDDEN * 4)
 
 
-def run_all[P: BurstThreadPool, //, tp: Int](
+def run_all[P: BurstThreadPool, //](
     mut pools: List[P],
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
+    var tp = len(pools)
     comptime MAX_TOKENS = 256
-    var bases = arena_bases[tp](arenas)
-    var src = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
-    var dst = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
-    var weight = arena_alloc_all[DType.bfloat16, tp](arenas, HIDDEN)
-    var partial = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
-    var residual = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
-    var res_dst = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_TOKENS * HIDDEN)
+    var bases = arena_bases(arenas)
+    var view = RankView(Span(bases))
+    var src_ptr = arena_alloc_all[DType.bfloat16](arenas, MAX_TOKENS * HIDDEN)
+    var dst_ptr = arena_alloc_all[DType.bfloat16](arenas, MAX_TOKENS * HIDDEN)
+    var weight_ptr = arena_alloc_all[DType.bfloat16](arenas, HIDDEN)
+    var partial_ptr = arena_alloc_all[DType.bfloat16](arenas, MAX_TOKENS * HIDDEN)
+    var residual_ptr = arena_alloc_all[DType.bfloat16](arenas, MAX_TOKENS * HIDDEN)
+    var res_dst_ptr = arena_alloc_all[DType.bfloat16](arenas, MAX_TOKENS * HIDDEN)
 
-    fill_norm_input_all[tp](
-        Binding[BFloat16, tp](src, bases), MAX_TOKENS * HIDDEN)
-    fill_norm_input_all[tp](
-        Binding[BFloat16, tp](partial, bases), MAX_TOKENS * HIDDEN)
-    fill_norm_input_all[tp](
-        Binding[BFloat16, tp](residual, bases), MAX_TOKENS * HIDDEN)
-    fill_ones_all[tp](Binding[BFloat16, tp](weight, bases), HIDDEN)
+    var src = view.bind(src_ptr)
+    var dst = view.bind(dst_ptr)
+    var weight = view.bind(weight_ptr)
+    var partial = view.bind(partial_ptr)
+    var residual = view.bind(residual_ptr)
+    var res_dst = view.bind(res_dst_ptr)
+
+    fill_norm_input_all(src, MAX_TOKENS * HIDDEN)
+    fill_norm_input_all(partial, MAX_TOKENS * HIDDEN)
+    fill_norm_input_all(residual, MAX_TOKENS * HIDDEN)
+    fill_ones_all(weight, HIDDEN)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 
@@ -374,11 +375,11 @@ def run_all[P: BurstThreadPool, //, tp: Int](
     print(t"hidden: {HIDDEN} ({hidden_bytes} bytes bf16)")
     print(t"sqrt(N): {SQRT_N}, N*eps: {N_EPS}")
 
-    section_row_primitives(src, dst, weight)
-    section_fused_primitives(partial, residual, res_dst, weight)
-    section_dispatch_overhead(pools[0], src, dst, weight)
-    section_seq_sweep[tp=tp](pools, src, dst, weight, bases)
-    section_fused_sweep[tp=tp](pools, partial, residual, res_dst, weight, bases)
+    section_row_primitives(src_ptr, dst_ptr, weight_ptr)
+    section_fused_primitives(partial_ptr, residual_ptr, res_dst_ptr, weight_ptr)
+    section_dispatch_overhead(pools[0], src_ptr, dst_ptr, weight_ptr)
+    section_seq_sweep(pools, src, dst, weight)
+    section_fused_sweep(pools, partial, residual, res_dst, weight)
 
 
 def main():
@@ -399,9 +400,9 @@ def main():
 
     @parameter
     def dispatch_rmsnorm_tp[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        run_all[tp=degree](selected_pools, arenas)
+        run_all(selected_pools, arenas)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_rmsnorm_tp,
