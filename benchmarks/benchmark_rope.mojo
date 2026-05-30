@@ -1,11 +1,11 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from kernels.helpers import Binding, ArenaBases
+from kernels.helpers import Binding, RankView
 from kernels.rope import (
     rope_head, dispatch_rope_cache_write,
     init_rope_table, init_rope_table_partial_strided,
@@ -46,20 +46,20 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
-def arena_bases[tp: Int](
+def arena_bases(
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
-) -> ArenaBases[tp]:
-    var bases = ArenaBases[tp].uninitialized()
-    for r in range(tp):
-        bases[r] = Int(arenas[r].base.value())
-    return bases
+) -> List[Int]:
+    var bases = List[Int](capacity=len(arenas))
+    for r in range(len(arenas)):
+        bases.append(Int(arenas[r].base.value()))
+    return bases^
 
 
-def arena_alloc_all[dtype: DType, tp: Int](
+def arena_alloc_all[dtype: DType](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
-    for r in range(tp):
+    for r in range(len(arenas)):
         var ptr = arena_alloc[dtype](arenas[r], count)
         if r == 0:
             first = ptr
@@ -71,31 +71,29 @@ def fill_pattern(ptr: BF16Ptr, count: Int):
         ptr[i] = BFloat16(Float32((i % 127) - 63) * 0.01)
 
 
-def fill_pattern_all[tp: Int](
-    ptrs: Binding[BFloat16, tp], count: Int,
+def fill_pattern_all[o: ImmutOrigin](
+    ptrs: Binding[BFloat16, o], count: Int,
 ):
-    for r in range(tp):
+    for r in range(ptrs.degree()):
         fill_pattern(ptrs[r], count)
 
 
-def init_sliding_tables_all[tp: Int](
-    cos_sl: F32Ptr, sin_sl: F32Ptr, bases: ArenaBases[tp],
+def init_sliding_tables_all[o: ImmutOrigin](
+    cos_sl: Binding[Float32, o],
+    sin_sl: Binding[Float32, o],
 ):
-    var cos = Binding[Float32, tp](cos_sl, bases)
-    var sin = Binding[Float32, tp](sin_sl, bases)
-    for r in range(tp):
-        init_rope_table[HALF_SLIDING, MAX_POS](cos[r], sin[r], 10000.0)
+    for r in range(cos_sl.degree()):
+        init_rope_table[HALF_SLIDING, MAX_POS](
+            cos_sl[r], sin_sl[r], 10000.0)
 
 
-def init_full_tables_all[tp: Int](
-    cos_fl: F32Ptr, sin_fl: F32Ptr, bases: ArenaBases[tp],
+def init_full_tables_all[o: ImmutOrigin](
+    cos_fl: Binding[Float32, o],
+    sin_fl: Binding[Float32, o],
 ):
-    comptime LOCAL_ROWS = MAX_POS // tp
-    var cos = Binding[Float32, tp](cos_fl, bases)
-    var sin = Binding[Float32, tp](sin_fl, bases)
-    for r in range(tp):
-        init_rope_table_partial_strided[HALF_FULL, LOCAL_ROWS](
-            cos[r], sin[r], 1000000.0, HEAD_DIM_FULL, r, tp)
+    for r in range(cos_fl.degree()):
+        init_rope_table_partial_strided[HALF_FULL, MAX_POS](
+            cos_fl[r], sin_fl[r], 1000000.0, HEAD_DIM_FULL, 0, 1)
 
 
 def section_head_primitive(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr,
@@ -171,35 +169,32 @@ def section_token_scaling(data: BF16Ptr, cos_sl: F32Ptr, sin_sl: F32Ptr):
 
 
 def section_sliding_cache_write[
-    P: BurstThreadPool, //, tp: Int,
+    P: BurstThreadPool, o: ImmutOrigin, //,
 ](
     mut pools: List[P],
-    q: BF16Ptr, k_src: BF16Ptr, v_src: BF16Ptr,
-    k_cache: BF16Ptr, v_cache: BF16Ptr,
-    cos_sl: F32Ptr, sin_sl: F32Ptr,
-    bases: ArenaBases[tp],
+    qs: Binding[BFloat16, o],
+    ks: Binding[BFloat16, o],
+    vs: Binding[BFloat16, o],
+    kc: Binding[BFloat16, o],
+    vc: Binding[BFloat16, o],
+    cos: Binding[Float32, o],
+    sin: Binding[Float32, o],
 ):
-    comptime Q_ROWS = Q_DIM_SLIDING // tp
-    comptime KV_ROWS = KV_DIM_SLIDING // tp
-    comptime NUM_Q = Q_ROWS // HEAD_DIM_SLIDING
-    comptime NUM_KV = KV_ROWS // HEAD_DIM_SLIDING
+    var tp = len(pools)
+    var q_rows = Q_DIM_SLIDING // tp
+    var kv_rows = KV_DIM_SLIDING // tp
+    var num_q = q_rows // HEAD_DIM_SLIDING
+    var num_kv = kv_rows // HEAD_DIM_SLIDING
     comptime POS = 513
-    var qs = Binding[BFloat16, tp](q, bases)
-    var ks = Binding[BFloat16, tp](k_src, bases)
-    var vs = Binding[BFloat16, tp](v_src, bases)
-    var kc = Binding[BFloat16, tp](k_cache, bases)
-    var vc = Binding[BFloat16, tp](v_cache, bases)
-    var cos = Binding[Float32, tp](cos_sl, bases)
-    var sin = Binding[Float32, tp](sin_sl, bases)
     var prof = Profiler[False]()
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
             half=HALF_SLIDING, pair_stride=HEAD_DIM_SLIDING // 2,
-            num_q=NUM_Q, num_kv=NUM_KV,
-            head_dim=HEAD_DIM_SLIDING, kv_cache_stride=KV_ROWS,
-            slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
+            head_dim=HEAD_DIM_SLIDING,
+            slot_mask=SLIDING_WINDOW - 1,
+        ](qs, ks, vs, kc, vc, cos, sin,
+          num_q, num_kv, 1, POS, 1, pools, prof)
 
     var samples = SampleBuffer(SAMPLES)
     samples.clear()
@@ -207,57 +202,45 @@ def section_sliding_cache_write[
         var t0 = now_ns()
         dispatch_rope_cache_write[
             half=HALF_SLIDING, pair_stride=HEAD_DIM_SLIDING // 2,
-            num_q=NUM_Q, num_kv=NUM_KV,
-            head_dim=HEAD_DIM_SLIDING, kv_cache_stride=KV_ROWS,
-            slot_mask=SLIDING_WINDOW - 1, cache_degree=1, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
+            head_dim=HEAD_DIM_SLIDING,
+            slot_mask=SLIDING_WINDOW - 1,
+        ](qs, ks, vs, kc, vc, cos, sin,
+          num_q, num_kv, 1, POS, 1, pools, prof)
         var t1 = now_ns()
-        var t_done = max_last_ts[tp=tp](pools)
+        var t_done = max_last_ts(pools)
         samples.push(t_done - t0, t1 - t0)
-    keep(q[0])
+    keep(qs[0][0])
 
     var ks_stats = compute_stats(samples.kernel_ns, samples.n)
     var ws_stats = compute_stats(samples.wall_ns, samples.n)
-    var sl_bytes = (Q_DIM_SLIDING // tp + 2 * (KV_DIM_SLIDING // tp)) * 2
+    var sl_bytes = (q_rows + 2 * kv_rows) * 2
     print_row("sliding", ks_stats, ws_stats, sl_bytes)
 
 
 def section_full_cache_write[
-    P: BurstThreadPool, //, tp: Int,
+    P: BurstThreadPool, o: ImmutOrigin, //,
 ](
     mut pools: List[P],
-    q: BF16Ptr, k_src: BF16Ptr, v_src: BF16Ptr,
-    k_cache: BF16Ptr, v_cache: BF16Ptr,
-    cos_fl: F32Ptr, sin_fl: F32Ptr,
-    bases: ArenaBases[tp],
+    qs: Binding[BFloat16, o],
+    ks: Binding[BFloat16, o],
+    vs: Binding[BFloat16, o],
+    kc: Binding[BFloat16, o],
+    vc: Binding[BFloat16, o],
+    cos: Binding[Float32, o],
+    sin: Binding[Float32, o],
 ):
-    comptime Q_ROWS = Q_DIM_FULL // tp
-    comptime NUM_Q = Q_ROWS // HEAD_DIM_FULL
+    var tp = len(pools)
+    comptime NUM_Q = Q_DIM_FULL // HEAD_DIM_FULL
     comptime NUM_KV = KV_DIM_FULL // HEAD_DIM_FULL
     comptime POS = 513
-    var owner = POS % tp
-    var owner_bases = ArenaBases[tp].uninitialized()
-    for r in range(tp):
-        owner_bases[r] = bases[owner]
-    var full_cos = Binding[Float32, tp](cos_fl, bases)[owner]
-    var full_sin = Binding[Float32, tp](sin_fl, bases)[owner]
-
-    var qs = Binding[BFloat16, tp](q, bases)
-    var ks = Binding[BFloat16, tp](k_src, bases)
-    var vs = Binding[BFloat16, tp](v_src, bases)
-    var kc = Binding[BFloat16, tp](k_cache, bases)
-    var vc = Binding[BFloat16, tp](v_cache, bases)
-    var cos = Binding[Float32, tp](full_cos, owner_bases)
-    var sin = Binding[Float32, tp](full_sin, owner_bases)
     var prof = Profiler[False]()
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
             half=HALF_FULL, pair_stride=HEAD_DIM_FULL // 2,
-            num_q=NUM_Q, num_kv=NUM_KV,
-            head_dim=HEAD_DIM_FULL, kv_cache_stride=KV_DIM_FULL,
-            slot_mask=-1, cache_degree=tp, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
+            head_dim=HEAD_DIM_FULL, slot_mask=-1,
+        ](qs, ks, vs, kc, vc, cos, sin,
+          NUM_Q, NUM_KV, tp, POS, 1, pools, prof)
 
     var samples = SampleBuffer(SAMPLES)
     samples.clear()
@@ -265,92 +248,110 @@ def section_full_cache_write[
         var t0 = now_ns()
         dispatch_rope_cache_write[
             half=HALF_FULL, pair_stride=HEAD_DIM_FULL // 2,
-            num_q=NUM_Q, num_kv=NUM_KV,
-            head_dim=HEAD_DIM_FULL, kv_cache_stride=KV_DIM_FULL,
-            slot_mask=-1, cache_degree=tp, tp=tp,
-        ](qs, ks, vs, kc, vc, cos, sin, POS, 1, pools, prof)
+            head_dim=HEAD_DIM_FULL, slot_mask=-1,
+        ](qs, ks, vs, kc, vc, cos, sin,
+          NUM_Q, NUM_KV, tp, POS, 1, pools, prof)
         var t1 = now_ns()
-        var t_done = max_last_ts[tp=tp](pools)
+        var t_done = max_last_ts(pools)
         samples.push(t_done - t0, t1 - t0)
-    keep(q[0])
+    keep(qs[0][0])
 
     var ks_stats = compute_stats(samples.kernel_ns, samples.n)
     var ws_stats = compute_stats(samples.wall_ns, samples.n)
-    var fl_bytes = (Q_DIM_FULL // tp + 2 * KV_DIM_FULL) * 2
+    var fl_bytes = (Q_DIM_FULL + 2 * KV_DIM_FULL) * 2
     print_row("full", ks_stats, ws_stats, fl_bytes)
 
 
-def section_model_cache_write[P: BurstThreadPool, //, tp: Int](
+def section_model_cache_write[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
-    sliding_q: BF16Ptr, sliding_k: BF16Ptr, sliding_v: BF16Ptr,
-    sliding_k_cache: BF16Ptr, sliding_v_cache: BF16Ptr,
-    full_q: BF16Ptr, full_k: BF16Ptr, full_v: BF16Ptr,
-    full_k_cache: BF16Ptr, full_v_cache: BF16Ptr,
-    cos_sl: F32Ptr, sin_sl: F32Ptr, cos_fl: F32Ptr, sin_fl: F32Ptr,
-    bases: ArenaBases[tp],
+    sliding_q: Binding[BFloat16, o],
+    sliding_k: Binding[BFloat16, o],
+    sliding_v: Binding[BFloat16, o],
+    sliding_k_cache: Binding[BFloat16, o],
+    sliding_v_cache: Binding[BFloat16, o],
+    full_q: Binding[BFloat16, o],
+    full_k: Binding[BFloat16, o],
+    full_v: Binding[BFloat16, o],
+    full_k_cache: Binding[BFloat16, o],
+    full_v_cache: Binding[BFloat16, o],
+    cos_sl: Binding[Float32, o],
+    sin_sl: Binding[Float32, o],
+    cos_fl: Binding[Float32, o],
+    sin_fl: Binding[Float32, o],
 ):
+    var tp = len(pools)
     print(t"\n=== dispatch_rope_cache_write model path (seq_len=1, TP={tp}) ===")
 
-    section_sliding_cache_write[tp=tp](
+    section_sliding_cache_write(
         pools, sliding_q, sliding_k, sliding_v,
-        sliding_k_cache, sliding_v_cache, cos_sl, sin_sl, bases)
-    section_full_cache_write[tp=tp](
+        sliding_k_cache, sliding_v_cache, cos_sl, sin_sl)
+    section_full_cache_write(
         pools, full_q, full_k, full_v,
-        full_k_cache, full_v_cache, cos_fl, sin_fl, bases)
+        full_k_cache, full_v_cache, cos_fl, sin_fl)
 
 
-def run_all[P: BurstThreadPool, //, tp: Int](
+def run_all[P: BurstThreadPool, //](
     mut pools: List[P],
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
+    var tp = len(pools)
     comptime MAX_SEQ = 128
     comptime MAX_HEADS = 16
     comptime MAX_DATA = MAX_SEQ * MAX_HEADS * HEAD_DIM_FULL
-    comptime SL_Q_ROWS = Q_DIM_SLIDING // tp
-    comptime SL_KV_ROWS = KV_DIM_SLIDING // tp
-    comptime FL_Q_ROWS = Q_DIM_FULL // tp
-    comptime FL_ROPE_ROWS = MAX_POS // tp
+    var sl_q_rows = Q_DIM_SLIDING // tp
+    var sl_kv_rows = KV_DIM_SLIDING // tp
 
-    var bases = arena_bases[tp](arenas)
-    var data = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_DATA)
-    var cos_sl = arena_alloc_all[DType.float32, tp](
+    var bases = arena_bases(arenas)
+    var view = RankView(Span(bases))
+    var data = arena_alloc_all[DType.bfloat16](arenas, MAX_DATA)
+    var cos_sl = arena_alloc_all[DType.float32](
         arenas, MAX_POS * HALF_SLIDING)
-    var sin_sl = arena_alloc_all[DType.float32, tp](
+    var sin_sl = arena_alloc_all[DType.float32](
         arenas, MAX_POS * HALF_SLIDING)
-    var cos_fl = arena_alloc_all[DType.float32, tp](arenas, FL_ROPE_ROWS * HALF_FULL)
-    var sin_fl = arena_alloc_all[DType.float32, tp](arenas, FL_ROPE_ROWS * HALF_FULL)
+    var cos_fl = arena_alloc_all[DType.float32](arenas, MAX_POS * HALF_FULL)
+    var sin_fl = arena_alloc_all[DType.float32](arenas, MAX_POS * HALF_FULL)
 
-    var sliding_q = arena_alloc_all[DType.bfloat16, tp](arenas, SL_Q_ROWS)
-    var sliding_k = arena_alloc_all[DType.bfloat16, tp](arenas, SL_KV_ROWS)
-    var sliding_v = arena_alloc_all[DType.bfloat16, tp](arenas, SL_KV_ROWS)
-    var sliding_k_cache = arena_alloc_all[DType.bfloat16, tp](
-        arenas, SLIDING_WINDOW * SL_KV_ROWS)
-    var sliding_v_cache = arena_alloc_all[DType.bfloat16, tp](
-        arenas, SLIDING_WINDOW * SL_KV_ROWS)
+    var sliding_q = arena_alloc_all[DType.bfloat16](arenas, sl_q_rows)
+    var sliding_k = arena_alloc_all[DType.bfloat16](arenas, sl_kv_rows)
+    var sliding_v = arena_alloc_all[DType.bfloat16](arenas, sl_kv_rows)
+    var sliding_k_cache = arena_alloc_all[DType.bfloat16](
+        arenas, SLIDING_WINDOW * sl_kv_rows)
+    var sliding_v_cache = arena_alloc_all[DType.bfloat16](
+        arenas, SLIDING_WINDOW * sl_kv_rows)
 
-    var full_q = arena_alloc_all[DType.bfloat16, tp](arenas, FL_Q_ROWS)
-    var full_k = arena_alloc_all[DType.bfloat16, tp](arenas, KV_DIM_FULL)
-    var full_v = arena_alloc_all[DType.bfloat16, tp](arenas, KV_DIM_FULL)
-    var full_k_cache = arena_alloc_all[DType.bfloat16, tp](
+    var full_q = arena_alloc_all[DType.bfloat16](arenas, Q_DIM_FULL)
+    var full_k = arena_alloc_all[DType.bfloat16](arenas, KV_DIM_FULL)
+    var full_v = arena_alloc_all[DType.bfloat16](arenas, KV_DIM_FULL)
+    var full_k_cache = arena_alloc_all[DType.bfloat16](
         arenas, MAX_POS * KV_DIM_FULL)
-    var full_v_cache = arena_alloc_all[DType.bfloat16, tp](
+    var full_v_cache = arena_alloc_all[DType.bfloat16](
         arenas, MAX_POS * KV_DIM_FULL)
 
-    fill_pattern_all[tp](Binding[BFloat16, tp](data, bases), MAX_DATA)
-    fill_pattern_all[tp](
-        Binding[BFloat16, tp](sliding_q, bases), SL_Q_ROWS)
-    fill_pattern_all[tp](
-        Binding[BFloat16, tp](sliding_k, bases), SL_KV_ROWS)
-    fill_pattern_all[tp](
-        Binding[BFloat16, tp](sliding_v, bases), SL_KV_ROWS)
-    fill_pattern_all[tp](
-        Binding[BFloat16, tp](full_q, bases), FL_Q_ROWS)
-    fill_pattern_all[tp](
-        Binding[BFloat16, tp](full_k, bases), KV_DIM_FULL)
-    fill_pattern_all[tp](
-        Binding[BFloat16, tp](full_v, bases), KV_DIM_FULL)
-    init_sliding_tables_all[tp](cos_sl, sin_sl, bases)
-    init_full_tables_all[tp](cos_fl, sin_fl, bases)
+    var data_b = view.bind(data)
+    var cos_sl_b = view.bind(cos_sl)
+    var sin_sl_b = view.bind(sin_sl)
+    var cos_fl_b = view.bind(cos_fl)
+    var sin_fl_b = view.bind(sin_fl)
+    var sliding_q_b = view.bind(sliding_q)
+    var sliding_k_b = view.bind(sliding_k)
+    var sliding_v_b = view.bind(sliding_v)
+    var sliding_k_cache_b = view.bind(sliding_k_cache)
+    var sliding_v_cache_b = view.bind(sliding_v_cache)
+    var full_q_b = view.bind(full_q)
+    var full_k_b = view.bind(full_k)
+    var full_v_b = view.bind(full_v)
+    var full_k_cache_b = view.bind(full_k_cache)
+    var full_v_cache_b = view.bind(full_v_cache)
+
+    fill_pattern_all(data_b, MAX_DATA)
+    fill_pattern_all(sliding_q_b, sl_q_rows)
+    fill_pattern_all(sliding_k_b, sl_kv_rows)
+    fill_pattern_all(sliding_v_b, sl_kv_rows)
+    fill_pattern_all(full_q_b, Q_DIM_FULL)
+    fill_pattern_all(full_k_b, KV_DIM_FULL)
+    fill_pattern_all(full_v_b, KV_DIM_FULL)
+    init_sliding_tables_all(cos_sl_b, sin_sl_b)
+    init_full_tables_all(cos_fl_b, sin_fl_b)
 
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
@@ -362,11 +363,12 @@ def run_all[P: BurstThreadPool, //, tp: Int](
 
     section_head_primitive(data, cos_sl, sin_sl, cos_fl, sin_fl)
     section_token_scaling(data, cos_sl, sin_sl)
-    section_model_cache_write[tp=tp](
+    section_model_cache_write(
         pools,
-        sliding_q, sliding_k, sliding_v, sliding_k_cache, sliding_v_cache,
-        full_q, full_k, full_v, full_k_cache, full_v_cache,
-        cos_sl, sin_sl, cos_fl, sin_fl, bases)
+        sliding_q_b, sliding_k_b, sliding_v_b,
+        sliding_k_cache_b, sliding_v_cache_b,
+        full_q_b, full_k_b, full_v_b, full_k_cache_b, full_v_cache_b,
+        cos_sl_b, sin_sl_b, cos_fl_b, sin_fl_b)
 
 
 def main():
@@ -387,9 +389,9 @@ def main():
 
     @parameter
     def dispatch_rope_tp[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        run_all[tp=degree](selected_pools, arenas)
+        run_all(selected_pools, arenas)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_rope_tp,

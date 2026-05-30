@@ -160,19 +160,16 @@ struct FlashPrefillFullKernel[
 
 
 @fieldwise_init
-struct PrefillMergeConfig[head_dim: Int, o: ImmutOrigin]:
+struct PrefillMergeConfig[head_dim: Int, o: ImmutOrigin](TrivialRegisterPassable):
     var output: Binding[BFloat16, Self.o]
     var partials: Binding[Float32, Self.o]
 
 
 @fieldwise_init
 struct PrefillMergeKernel[
-    head_dim: Int, o: ImmutOrigin, cfg_origin: Origin,
+    head_dim: Int, o: ImmutOrigin,
 ](WorkerRangePartitionedKernel):
-    var config: UnsafePointer[
-        PrefillMergeConfig[Self.head_dim, Self.o],
-        Self.cfg_origin,
-    ]
+    var config: PrefillMergeConfig[Self.head_dim, Self.o]
     var q_rank: Int
     var segment_scratch: UnsafePointer[MergeSegment, MutAnyOrigin]
     var num_q: Int
@@ -184,7 +181,7 @@ struct PrefillMergeKernel[
 
     def execute(mut self):
         var out_stride = self.local_num_q * Self.head_dim
-        var tp = self.config[].partials.degree()
+        var tp = self.config.partials.degree()
         var segs = self.segment_scratch + self.worker_id * tp
         var seg_span = Span(ptr=segs, length=tp)
 
@@ -195,10 +192,10 @@ struct PrefillMergeKernel[
 
             for r in range(tp):
                 segs[r] = MergeSegment(
-                    self.config[].partials[r] + t * self.partial_stride,
+                    self.config.partials[r] + t * self.partial_stride,
                     self.partial_stride, 1)
 
-            var dst = self.config[].output[self.q_rank] \
+            var dst = self.config.output[self.q_rank] \
                       + t * out_stride + local_h * Self.head_dim
             write_finalized_head[Self.head_dim](
                 dst, seg_span, self.num_q, global_h)
@@ -229,16 +226,14 @@ def dispatch_merge_flash_prefill_partials[
         return
 
     var cfg = PrefillMergeConfig[head_dim, o](output, partials)
-    var config = UnsafePointer(to=cfg).as_immutable()
-    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
-    comptime K = PrefillMergeKernel[head_dim, o, cfg_ro]
+    comptime K = PrefillMergeKernel[head_dim, o]
     var nq = num_q
     var lnq = local_num_q
     var ps = partial_stride
 
     @parameter
     def make(q_rank: Int) -> K:
-        return K(config, q_rank, segment_scratch[q_rank], nq, lnq, ps, 0, 0, 0)
+        return K(cfg, q_rank, segment_scratch[q_rank], nq, lnq, ps, 0, 0, 0)
 
     var total_units = seq_len * local_num_q
     var data_bytes = total_units * len(pools) * (head_dim + 2) * 4

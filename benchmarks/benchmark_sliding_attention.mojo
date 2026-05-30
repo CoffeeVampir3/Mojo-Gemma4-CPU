@@ -1,5 +1,5 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
@@ -7,7 +7,7 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 from kernels.attention_ops import flash_partial_stride
 from kernels.attention_dispatch_kernels import dispatch_sliding_attention
-from kernels.helpers import Binding, ArenaBases
+from kernels.helpers import Binding, RankView
 from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -26,7 +26,7 @@ comptime GQA_RATIO = 2
 comptime KV_STRIDE = 512
 comptime WINDOW = 4096
 comptime MAX_WORKERS = 128
-comptime PSTRIDE = flash_partial_stride[NUM_Q, HEAD_DIM]()
+comptime PSTRIDE = flash_partial_stride(NUM_Q, HEAD_DIM)
 
 comptime NUM_CTX_SIZES = 8
 
@@ -34,13 +34,13 @@ comptime BF16Ptr = UnsafePointer[BFloat16, MutAnyOrigin]
 comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 
 
-def arena_bases[tp: Int](
+def arena_bases(
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
-) -> ArenaBases[tp]:
-    var bases = ArenaBases[tp].uninitialized()
-    for r in range(tp):
-        bases[r] = Int(arenas[r].base.value())
-    return bases
+) -> List[Int]:
+    var bases = List[Int](capacity=len(arenas))
+    for r in range(len(arenas)):
+        bases.append(Int(arenas[r].base.value()))
+    return bases^
 
 
 def arena_alloc[dtype: DType](
@@ -53,11 +53,11 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
-def arena_alloc_all[dtype: DType, tp: Int](
+def arena_alloc_all[dtype: DType](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
-    for r in range(tp):
+    for r in range(len(arenas)):
         var ptr = arena_alloc[dtype](arenas[r], count)
         if r == 0:
             first = ptr
@@ -69,20 +69,20 @@ def fill_pattern(ptr: BF16Ptr, count: Int):
         ptr[i] = BFloat16(Float32((i % 127) - 63) * 0.01)
 
 
-def fill_pattern_all[tp: Int](
-    ptrs: Binding[BFloat16, tp], count: Int,
+def fill_pattern_all[o: ImmutOrigin](
+    ptrs: Binding[BFloat16, o], count: Int,
 ):
-    for r in range(tp):
+    for r in range(ptrs.degree()):
         fill_pattern(ptrs[r], count)
 
 
-def section_context_sweep[P: BurstThreadPool, //, tp: Int](
+def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
-    q: Binding[BFloat16, tp],
-    k_cache: Binding[BFloat16, tp],
-    v_cache: Binding[BFloat16, tp],
-    output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+    q: Binding[BFloat16, o],
+    k_cache: Binding[BFloat16, o],
+    v_cache: Binding[BFloat16, o],
+    output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
 ):
     print("\n=== Context sweep (dispatch_sliding_attention) ===")
 
@@ -101,24 +101,24 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
 
         for _ in range(WARMUP):
             dispatch_sliding_attention[
-                head_dim=HEAD_DIM, num_q=NUM_Q,
-                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
+                head_dim=HEAD_DIM, max_q=NUM_Q,
+                gqa_ratio=GQA_RATIO,
                 window=WINDOW, cache_size=WINDOW,
-                partial_stride=PSTRIDE, tp=tp,
-            ](q, k_cache, v_cache, output, partials, pos, 1, pools, prof)
+            ](q, k_cache, v_cache, output, partials,
+              NUM_Q, PSTRIDE, KV_STRIDE, pos, 1, pools, prof)
             keep(output[0][0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
             dispatch_sliding_attention[
-                head_dim=HEAD_DIM, num_q=NUM_Q,
-                gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
+                head_dim=HEAD_DIM, max_q=NUM_Q,
+                gqa_ratio=GQA_RATIO,
                 window=WINDOW, cache_size=WINDOW,
-                partial_stride=PSTRIDE, tp=tp,
-            ](q, k_cache, v_cache, output, partials, pos, 1, pools, prof)
+            ](q, k_cache, v_cache, output, partials,
+              NUM_Q, PSTRIDE, KV_STRIDE, pos, 1, pools, prof)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
         keep(output[0][0])
 
@@ -128,13 +128,13 @@ def section_context_sweep[P: BurstThreadPool, //, tp: Int](
         print_row(String(t"seq={vl}"), ks, ws, kv_bytes)
 
 
-def section_validation[P: BurstThreadPool, //, tp: Int](
+def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
-    q: Binding[BFloat16, tp],
-    k_cache: Binding[BFloat16, tp],
-    v_cache: Binding[BFloat16, tp],
-    output: Binding[BFloat16, tp],
-    partials: Binding[Float32, tp],
+    q: Binding[BFloat16, o],
+    k_cache: Binding[BFloat16, o],
+    v_cache: Binding[BFloat16, o],
+    output: Binding[BFloat16, o],
+    partials: Binding[Float32, o],
 ):
     print("\n=== Validation (valid_len=64) ===")
     comptime VL = 64
@@ -142,11 +142,11 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     var prof = Profiler[False]()
 
     dispatch_sliding_attention[
-        head_dim=HEAD_DIM, num_q=NUM_Q,
-        gqa_ratio=GQA_RATIO, kv_stride=KV_STRIDE,
+        head_dim=HEAD_DIM, max_q=NUM_Q,
+        gqa_ratio=GQA_RATIO,
         window=WINDOW, cache_size=WINDOW,
-        partial_stride=PSTRIDE, tp=tp,
-    ](q, k_cache, v_cache, output, partials, pos, 1, pools, prof)
+    ](q, k_cache, v_cache, output, partials,
+      NUM_Q, PSTRIDE, KV_STRIDE, pos, 1, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()
@@ -163,28 +163,30 @@ def section_validation[P: BurstThreadPool, //, tp: Int](
     print("  ", "OK (no NaN)" if ok else "FAIL: NaN detected")
 
 
-def run_all[P: BurstThreadPool, //, tp: Int](
+def run_all[P: BurstThreadPool, //](
     mut pools: List[P],
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
-    var bases = arena_bases[tp](arenas)
+    var tp = len(pools)
+    var bases = arena_bases(arenas)
+    var view = RankView(Span(bases))
 
-    var q_ptr = arena_alloc_all[DType.bfloat16, tp](arenas, NUM_Q * HEAD_DIM)
-    var k_cache_ptr = arena_alloc_all[DType.bfloat16, tp](arenas, WINDOW * KV_STRIDE)
-    var v_cache_ptr = arena_alloc_all[DType.bfloat16, tp](arenas, WINDOW * KV_STRIDE)
-    var output_ptr = arena_alloc_all[DType.bfloat16, tp](arenas, NUM_Q * HEAD_DIM)
-    var partials_ptr = arena_alloc_all[DType.float32, tp](
+    var q_ptr = arena_alloc_all[DType.bfloat16](arenas, NUM_Q * HEAD_DIM)
+    var k_cache_ptr = arena_alloc_all[DType.bfloat16](arenas, WINDOW * KV_STRIDE)
+    var v_cache_ptr = arena_alloc_all[DType.bfloat16](arenas, WINDOW * KV_STRIDE)
+    var output_ptr = arena_alloc_all[DType.bfloat16](arenas, NUM_Q * HEAD_DIM)
+    var partials_ptr = arena_alloc_all[DType.float32](
         arenas, MAX_WORKERS * PSTRIDE)
 
-    var q = Binding[BFloat16, tp](q_ptr, bases)
-    var k_cache = Binding[BFloat16, tp](k_cache_ptr, bases)
-    var v_cache = Binding[BFloat16, tp](v_cache_ptr, bases)
-    var output = Binding[BFloat16, tp](output_ptr, bases)
-    var partials = Binding[Float32, tp](partials_ptr, bases)
+    var q = view.bind(q_ptr)
+    var k_cache = view.bind(k_cache_ptr)
+    var v_cache = view.bind(v_cache_ptr)
+    var output = view.bind(output_ptr)
+    var partials = view.bind(partials_ptr)
 
-    fill_pattern_all[tp](q, NUM_Q * HEAD_DIM)
-    fill_pattern_all[tp](k_cache, WINDOW * KV_STRIDE)
-    fill_pattern_all[tp](v_cache, WINDOW * KV_STRIDE)
+    fill_pattern_all(q, NUM_Q * HEAD_DIM)
+    fill_pattern_all(k_cache, WINDOW * KV_STRIDE)
+    fill_pattern_all(v_cache, WINDOW * KV_STRIDE)
 
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
@@ -196,8 +198,8 @@ def run_all[P: BurstThreadPool, //, tp: Int](
         t"gqa={GQA_RATIO} window={WINDOW}"
     )
 
-    section_validation[tp=tp](pools, q, k_cache, v_cache, output, partials)
-    section_context_sweep[tp=tp](pools, q, k_cache, v_cache, output, partials)
+    section_validation(pools, q, k_cache, v_cache, output, partials)
+    section_context_sweep(pools, q, k_cache, v_cache, output, partials)
 
 
 def main():
@@ -218,9 +220,9 @@ def main():
 
     @parameter
     def dispatch_sliding_attention_tp[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        run_all[tp=degree](selected_pools, arenas)
+        run_all(selected_pools, arenas)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_sliding_attention_tp,

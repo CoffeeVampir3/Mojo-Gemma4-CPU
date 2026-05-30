@@ -14,7 +14,6 @@ from .dot_products import (
 from .profiling import Profiler
 
 
-# ── row-sharded path: contraction `cols` comptime (= HIDDEN), output `rows` runtime ──
 @always_inline
 def gemm_row_panel[
     panel: Int, //,
@@ -112,7 +111,6 @@ def dispatch_gemm[
         inline_threshold_bytes=GEMV_INLINE_ROWS * cols * 2)
 
 
-# ── column-sharded path: output `rows` comptime (= HIDDEN), contraction `cols` runtime ──
 @always_inline
 def gemm_col_panel[
     panel: Int, //,
@@ -252,7 +250,6 @@ def dispatch_gemm_cols[
         ](x, weight, output, cols, seq_len, pools, prof)
 
 
-# ── chained QKV (row-sharded): one fanout produces q, k, v; cols comptime, rows runtime ──
 @fieldwise_init
 struct ScaledGemmKernel[
     cols: Int, MR: Int,

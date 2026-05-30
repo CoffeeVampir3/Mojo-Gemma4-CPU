@@ -1,12 +1,12 @@
 from std.collections import InlineArray
-from std.memory import UnsafePointer
+from std.memory import Span, UnsafePointer
 from std.benchmark import keep
 
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from kernels.helpers import Binding, ArenaBases
-from kernels.gemm import dispatch_gemm
+from kernels.helpers import Binding, RankView
+from kernels.gemm import dispatch_gemm, dispatch_gemm_cols
 from kernels.profiling import Profiler
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
@@ -35,20 +35,20 @@ def arena_alloc[dtype: DType](
     return ptr.value()
 
 
-def arena_bases[tp: Int](
+def arena_bases(
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
-) -> ArenaBases[tp]:
-    var bases = ArenaBases[tp].uninitialized()
-    for r in range(tp):
-        bases[r] = Int(arenas[r].base.value())
-    return bases
+) -> List[Int]:
+    var bases = List[Int](capacity=len(arenas))
+    for r in range(len(arenas)):
+        bases.append(Int(arenas[r].base.value()))
+    return bases^
 
 
-def arena_alloc_all[dtype: DType, tp: Int](
+def arena_alloc_all[dtype: DType](
     mut arenas: List[NumaArena[alignment=ALIGNMENT]], count: Int,
 ) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
     var first = UnsafePointer[Scalar[dtype], MutAnyOrigin].unsafe_dangling()
-    for r in range(tp):
+    for r in range(len(arenas)):
         var ptr = arena_alloc[dtype](arenas[r], count)
         if r == 0:
             first = ptr
@@ -60,33 +60,63 @@ def fill_pattern(ptr: BF16Ptr, count: Int):
         ptr[i] = BFloat16(Float32((i % 253) - 126) * 0.005)
 
 
-def fill_pattern_all[tp: Int](
-    ptrs: Binding[BFloat16, tp], count: Int,
+def fill_pattern_all[o: ImmutOrigin](
+    ptrs: Binding[BFloat16, o], count: Int,
 ):
-    for r in range(tp):
+    for r in range(ptrs.degree()):
         fill_pattern(ptrs[r], count)
 
 
 def measure_gemm_m[
-    P: BurstThreadPool, //, rows: Int, cols: Int, tp: Int, MR: Int,
+    P: BurstThreadPool, o: ImmutOrigin, //, cols: Int, MR: Int,
 ](
     mut pools: List[P],
-    xs: Binding[BFloat16, tp], ws: Binding[BFloat16, tp],
-    outs: Binding[BFloat16, tp], output: BF16Ptr,
+    xs: Binding[BFloat16, o], ws: Binding[BFloat16, o],
+    outs: Binding[BFloat16, o], output: BF16Ptr,
+    rows: Int,
     m: Int, mut samples: SampleBuffer,
 ):
     var prof = Profiler[False]()
     for _ in range(WARMUP):
-        dispatch_gemm[rows=rows, cols=cols, tp=tp, MR=MR](
-            xs, ws, outs, m, pools, prof)
+        dispatch_gemm[cols=cols, MR=MR](
+            xs, ws, outs, rows, m, pools, prof)
     keep(output[0])
     samples.clear()
     for _ in range(SAMPLES):
         var t0 = now_ns()
-        dispatch_gemm[rows=rows, cols=cols, tp=tp, MR=MR](
-            xs, ws, outs, m, pools, prof)
+        dispatch_gemm[cols=cols, MR=MR](
+            xs, ws, outs, rows, m, pools, prof)
         var t1 = now_ns()
-        var t_done = max_last_ts[tp=tp](pools)
+        var t_done = max_last_ts(pools)
+        samples.push(t_done - t0, t1 - t0)
+    keep(output[0])
+    var ks = compute_stats(samples.kernel_ns, samples.n)
+    var wsx = compute_stats(samples.wall_ns, samples.n)
+    var bytes_payload = (m * cols + rows * cols) * 2
+    print_row(String(t"M={m} MR={MR}"), ks, wsx, bytes_payload)
+
+
+def measure_gemm_cols_m[
+    P: BurstThreadPool, o: ImmutOrigin, //, rows: Int, MR: Int,
+](
+    mut pools: List[P],
+    xs: Binding[BFloat16, o], ws: Binding[BFloat16, o],
+    outs: Binding[BFloat16, o], output: BF16Ptr,
+    cols: Int,
+    m: Int, mut samples: SampleBuffer,
+):
+    var prof = Profiler[False]()
+    for _ in range(WARMUP):
+        dispatch_gemm_cols[rows=rows, MR=MR](
+            xs, ws, outs, cols, m, pools, prof)
+    keep(output[0])
+    samples.clear()
+    for _ in range(SAMPLES):
+        var t0 = now_ns()
+        dispatch_gemm_cols[rows=rows, MR=MR](
+            xs, ws, outs, cols, m, pools, prof)
+        var t1 = now_ns()
+        var t_done = max_last_ts(pools)
         samples.push(t_done - t0, t1 - t0)
     keep(output[0])
     var ks = compute_stats(samples.kernel_ns, samples.n)
@@ -96,16 +126,17 @@ def measure_gemm_m[
 
 
 def section_m_sweep[
-    P: BurstThreadPool, //, rows: Int, cols: Int, tp: Int,
+    P: BurstThreadPool, o: ImmutOrigin, //, cols: Int,
 ](
     mut pools: List[P],
     x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    bases: ArenaBases[tp], label: String,
+    view: RankView[o], rows: Int, label: String,
 ):
+    var tp = len(pools)
     print(t"\n=== GEMM M-sweep, {label} (rows={rows} cols={cols} tp={tp}) ===")
-    var xs = Binding[BFloat16, tp](x, bases)
-    var ws = Binding[BFloat16, tp](weight, bases)
-    var outs = Binding[BFloat16, tp](output, bases)
+    var xs = Binding[BFloat16, o](x, view)
+    var ws = Binding[BFloat16, o](weight, view)
+    var outs = Binding[BFloat16, o](output, view)
     var samples = SampleBuffer(SAMPLES)
 
     var ms = InlineArray[Int, 9](uninitialized=True)
@@ -114,69 +145,96 @@ def section_m_sweep[
 
     for i in range(9):
         var m = ms[i]
-        measure_gemm_m[rows=rows, cols=cols, tp=tp, MR=4](
-            pools, xs, ws, outs, output, m, samples)
+        measure_gemm_m[cols=cols, MR=4](
+            pools, xs, ws, outs, output, rows, m, samples)
 
 
-def section_mr_sweep[
-    P: BurstThreadPool, //, rows: Int, cols: Int, tp: Int,
+def section_m_sweep_cols[
+    P: BurstThreadPool, o: ImmutOrigin, //, rows: Int,
 ](
     mut pools: List[P],
     x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
-    bases: ArenaBases[tp], label: String,
+    view: RankView[o], cols: Int, label: String,
 ):
+    var tp = len(pools)
+    print(t"\n=== GEMM-cols M-sweep, {label} (rows={rows} cols={cols} tp={tp}) ===")
+    var xs = Binding[BFloat16, o](x, view)
+    var ws = Binding[BFloat16, o](weight, view)
+    var outs = Binding[BFloat16, o](output, view)
+    var samples = SampleBuffer(SAMPLES)
+
+    var ms = InlineArray[Int, 9](uninitialized=True)
+    ms[0] = 1; ms[1] = 2; ms[2] = 4; ms[3] = 8
+    ms[4] = 16; ms[5] = 64; ms[6] = 256; ms[7] = 1024; ms[8] = 4096
+
+    for i in range(9):
+        var m = ms[i]
+        measure_gemm_cols_m[rows=rows, MR=4](
+            pools, xs, ws, outs, output, cols, m, samples)
+
+
+def section_mr_sweep[
+    P: BurstThreadPool, o: ImmutOrigin, //, cols: Int,
+](
+    mut pools: List[P],
+    x: BF16Ptr, weight: BF16Ptr, output: BF16Ptr,
+    view: RankView[o], rows: Int, label: String,
+):
+    var tp = len(pools)
     print(
         t"\n=== GEMM MR-sweep at M=64, {label} (rows={rows} cols={cols} tp={tp}) ==="
     )
-    var xs = Binding[BFloat16, tp](x, bases)
-    var ws = Binding[BFloat16, tp](weight, bases)
-    var outs = Binding[BFloat16, tp](output, bases)
+    var xs = Binding[BFloat16, o](x, view)
+    var ws = Binding[BFloat16, o](weight, view)
+    var outs = Binding[BFloat16, o](output, view)
     var samples = SampleBuffer(SAMPLES)
 
-    measure_gemm_m[rows=rows, cols=cols, tp=tp, MR=1](
-        pools, xs, ws, outs, output, 64, samples)
-    measure_gemm_m[rows=rows, cols=cols, tp=tp, MR=2](
-        pools, xs, ws, outs, output, 64, samples)
-    measure_gemm_m[rows=rows, cols=cols, tp=tp, MR=4](
-        pools, xs, ws, outs, output, 64, samples)
-    measure_gemm_m[rows=rows, cols=cols, tp=tp, MR=8](
-        pools, xs, ws, outs, output, 64, samples)
+    measure_gemm_m[cols=cols, MR=1](
+        pools, xs, ws, outs, output, rows, 64, samples)
+    measure_gemm_m[cols=cols, MR=2](
+        pools, xs, ws, outs, output, rows, 64, samples)
+    measure_gemm_m[cols=cols, MR=4](
+        pools, xs, ws, outs, output, rows, 64, samples)
+    measure_gemm_m[cols=cols, MR=8](
+        pools, xs, ws, outs, output, rows, 64, samples)
 
 
-def run_all[P: BurstThreadPool, //, tp: Int](
+def run_all[P: BurstThreadPool, //](
     mut pools: List[P],
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
-    comptime gate_up_rows = INTERMEDIATE // tp
+    var tp = len(pools)
+    var gate_up_rows = INTERMEDIATE // tp
     comptime gate_up_cols = HIDDEN
     comptime down_rows = HIDDEN
-    comptime down_cols = INTERMEDIATE // tp
+    var down_cols = INTERMEDIATE // tp
 
-    var bases = arena_bases[tp](arenas)
+    var bases = arena_bases(arenas)
+    var view = RankView(Span(bases))
 
     comptime MAX_X_ELEMS = MAX_M * HIDDEN
     comptime MAX_W_ELEMS = HIDDEN * HIDDEN
     comptime MAX_O_ELEMS = MAX_M * HIDDEN
 
-    var x = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_X_ELEMS)
-    var w = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_W_ELEMS)
-    var o = arena_alloc_all[DType.bfloat16, tp](arenas, MAX_O_ELEMS)
+    var x = arena_alloc_all[DType.bfloat16](arenas, MAX_X_ELEMS)
+    var w = arena_alloc_all[DType.bfloat16](arenas, MAX_W_ELEMS)
+    var o = arena_alloc_all[DType.bfloat16](arenas, MAX_O_ELEMS)
 
-    fill_pattern_all[tp](Binding[BFloat16, tp](x, bases), MAX_X_ELEMS)
-    fill_pattern_all[tp](Binding[BFloat16, tp](w, bases), MAX_W_ELEMS)
+    fill_pattern_all(view.bind(x), MAX_X_ELEMS)
+    fill_pattern_all(view.bind(w), MAX_W_ELEMS)
     for r in range(tp):
         _ = arenas[r].prefault(0, arenas[r].used())
 
     var cap = pools[0].get_capacity()
     print(t"pool capacity: {cap} workers")
 
-    section_m_sweep[rows=gate_up_rows, cols=gate_up_cols, tp=tp](
-        pools, x, w, o, bases, "FFN gate/up shape")
-    section_m_sweep[rows=down_rows, cols=down_cols, tp=tp](
-        pools, x, w, o, bases, "FFN down shape")
+    section_m_sweep[cols=gate_up_cols](
+        pools, x, w, o, view, gate_up_rows, "FFN gate/up shape")
+    section_m_sweep_cols[rows=down_rows](
+        pools, x, w, o, view, down_cols, "FFN down shape")
 
-    section_mr_sweep[rows=gate_up_rows, cols=gate_up_cols, tp=tp](
-        pools, x, w, o, bases, "FFN gate/up shape")
+    section_mr_sweep[cols=gate_up_cols](
+        pools, x, w, o, view, gate_up_rows, "FFN gate/up shape")
 
 
 def main():
@@ -196,10 +254,8 @@ def main():
             return
 
     @parameter
-    def dispatch_gemm_tp[
-        P: BurstThreadPool, //, degree: Int,
-    ](var selected_pools: List[P]):
-        run_all[tp=degree](selected_pools, arenas)
+    def dispatch_gemm_tp[P: BurstThreadPool, //](var selected_pools: List[P]):
+        run_all(selected_pools, arenas)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_gemm_tp,

@@ -209,7 +209,6 @@ struct Gemma4Layout[max_seq_len: Int](Copyable, ImplicitlyCopyable):
         return t
 
 
-# ───────────────────────────── scratch islands (degree-free) ────────────────
 comptime SLIDING_NUM_Q_MAX = C.Q_DIM_SLIDING // C.HEAD_DIM_SLIDING
 comptime SLIDING_PARTIAL_STRIDE_MAX = flash_partial_stride(
     SLIDING_NUM_Q_MAX, C.HEAD_DIM_SLIDING)
@@ -559,7 +558,7 @@ def dispatch_full_attention_qkv[
         cols=C.HIDDEN, max_worker_count=max_worker_count,
     ](xs, attn.k_proj.binding(attn_ctx), k_outs, k_rows, seq_len, pools, prof)
 
-    # Full attention has no v_proj; v reads from k's pre-norm buffer (chain V→Q→K).
+    # Full attention reuses the raw K projection as V before K normalization.
     dispatch_rms_norm_qkv_heads[
         head_dim=head_dim, sqrt_n=sqrt_hd, n_eps=hd_eps,
         max_worker_count=max_worker_count,

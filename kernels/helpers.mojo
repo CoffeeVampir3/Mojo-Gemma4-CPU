@@ -198,7 +198,7 @@ def recommended_workers[
 
 
 @fieldwise_init
-struct RankView[o: ImmutOrigin](Copyable, ImplicitlyCopyable):
+struct RankView[o: ImmutOrigin](TrivialRegisterPassable):
     """Non-owning view over the model's per-rank arena bases. `len(bases)` is
     the runtime tensor-parallel degree; the origin ties the view to the owning
     List so the compiler enforces the lifetime. Every rank's arena is
@@ -221,7 +221,7 @@ struct RankView[o: ImmutOrigin](Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Binding[T: AnyType, o: ImmutOrigin](Copyable, ImplicitlyCopyable):
+struct Binding[T: AnyType, o: ImmutOrigin](TrivialRegisterPassable):
     var ptr: UnsafePointer[Self.T, MutAnyOrigin]
     var view: RankView[Self.o]
 

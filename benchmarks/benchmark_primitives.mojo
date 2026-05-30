@@ -1,4 +1,3 @@
-from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.benchmark import keep
 from std.sys.info import simd_width_of
@@ -12,7 +11,7 @@ from kernels.helpers import (
 )
 from kernels.reductions import dispatch_allreduce
 from kernels.profiling import Profiler
-from modeling.model_spec import BF16, Encoding
+from modeling.model_spec import BF16
 from benchmarks.bench_harness import (
     SampleBuffer, compute_stats, print_row, max_last_ts, now_ns,
     DEFAULT_SAMPLES,
@@ -163,12 +162,13 @@ def timed_copy[P: BurstThreadPool](
         samples.push(t_done - t0, t1 - t0)
 
 
-def section_local_bw[P: BurstThreadPool, //, tp: Int](
+def section_local_bw[P: BurstThreadPool, //](
     mut pools: List[P],
-    src: InlineArray[BF16Ptr, tp],
-    dst: InlineArray[BF16Ptr, tp],
+    src: List[BF16Ptr],
+    dst: List[BF16Ptr],
     count: Int,
 ):
+    var tp = len(pools)
     var mb = count * 2 // 1024 // 1024
     print(t"\n=== Local BW per node ({mb} MB bf16) ===")
     var samples = SampleBuffer(SAMPLES)
@@ -189,12 +189,12 @@ def section_local_bw[P: BurstThreadPool, //, tp: Int](
         print_row(String(t"n{n} copy"), ck, cw, count * 4)
 
 
-def section_remote_cached[P: BurstThreadPool, //, tp: Int](
+def section_remote_cached[P: BurstThreadPool, //](
     mut pools: List[P],
-    src: InlineArray[BF16Ptr, tp],
+    src: List[BF16Ptr],
     count: Int,
 ):
-    comptime
+    var tp = len(pools)
     if tp <= 1:
         return
     print("\n=== Cached remote read BW (data in reader L3 after warmup) ===")
@@ -211,12 +211,12 @@ def section_remote_cached[P: BurstThreadPool, //, tp: Int](
                 ks, ws, count * 2)
 
 
-def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
+def section_remote_fresh[P: BurstThreadPool, //](
     mut pools: List[P],
-    bufs: InlineArray[BF16Ptr, tp],
+    bufs: List[BF16Ptr],
     count: Int,
 ):
-    comptime
+    var tp = len(pools)
     if tp <= 1:
         return
     print("\n=== Fresh remote read BW (owner writes, reader reads) ===")
@@ -253,12 +253,12 @@ def section_remote_fresh[P: BurstThreadPool, //, tp: Int](
                 ks, ws, count * 2)
 
 
-def section_contended[P: BurstThreadPool, //, tp: Int](
+def section_contended[P: BurstThreadPool, //](
     mut pools: List[P],
-    bufs: InlineArray[BF16Ptr, tp],
+    bufs: List[BF16Ptr],
     count: Int,
 ):
-    comptime
+    var tp = len(pools)
     if tp <= 1:
         return
     print(t"\n=== Contended read BW ({tp} pools read one node, chunked) ===")
@@ -270,7 +270,7 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
             for r in range(tp):
                 _ = tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
                     pools[r], chunk, chunk * r)
-            join_all[tp](pools)
+            join_all(pools)
         samples.clear()
         for _ in range(SAMPLES):
             var buf = DispatchBuffer[ReadSweepKernel]()
@@ -278,9 +278,9 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
             for r in range(tp):
                 _ = tile_dispatch(buf, ReadSweepKernel(bufs[src_node], 0, 0),
                     pools[r], chunk, chunk * r)
-            join_all[tp](pools)
+            join_all(pools)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
         var ks = compute_stats(samples.kernel_ns, samples.n)
         var ws = compute_stats(samples.wall_ns, samples.n)
@@ -289,9 +289,10 @@ def section_contended[P: BurstThreadPool, //, tp: Int](
             ks, ws, count * 2)
 
 
-def section_dispatch[P: BurstThreadPool, //, tp: Int](
+def section_dispatch[P: BurstThreadPool, //](
     mut pools: List[P],
 ):
+    var tp = len(pools)
     print("\n=== Dispatch + join overhead ===")
     var samples = SampleBuffer(SAMPLES)
     for _ in range(WARMUP):
@@ -299,7 +300,7 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
         for r in range(tp):
             buf.slot()[] = NoopKernel(0)
             buf.dispatch(pools[r])
-        join_all[tp](pools)
+        join_all(pools)
     samples.clear()
     for _ in range(SAMPLES):
         var buf = DispatchBuffer[NoopKernel]()
@@ -307,9 +308,9 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
         for r in range(tp):
             buf.slot()[] = NoopKernel(0)
             buf.dispatch(pools[r])
-        join_all[tp](pools)
+        join_all(pools)
         var t1 = now_ns()
-        var t_done = max_last_ts[tp=tp](pools)
+        var t_done = max_last_ts(pools)
         samples.push(t_done - t0, t1 - t0)
     var ks = compute_stats(samples.kernel_ns, samples.n)
     var ws = compute_stats(samples.wall_ns, samples.n)
@@ -322,7 +323,7 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
             for _ in range(cap):
                 buf.slot()[] = NoopKernel(0)
             buf.dispatch(pools[r])
-        join_all[tp](pools)
+        join_all(pools)
     samples.clear()
     for _ in range(SAMPLES):
         var buf = DispatchBuffer[NoopKernel]()
@@ -332,9 +333,9 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
             for _ in range(cap):
                 buf.slot()[] = NoopKernel(0)
             buf.dispatch(pools[r])
-        join_all[tp](pools)
+        join_all(pools)
         var t1 = now_ns()
-        var t_done = max_last_ts[tp=tp](pools)
+        var t_done = max_last_ts(pools)
         samples.push(t_done - t0, t1 - t0)
     var ks2 = compute_stats(samples.kernel_ns, samples.n)
     var ws2 = compute_stats(samples.wall_ns, samples.n)
@@ -343,9 +344,9 @@ def section_dispatch[P: BurstThreadPool, //, tp: Int](
     )
 
 
-def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
+def section_worker_scaling[P: BurstThreadPool, //](
     mut pools: List[P],
-    src: InlineArray[BF16Ptr, tp],
+    src: List[BF16Ptr],
     count: Int,
 ):
     var cap = pools[0].get_capacity()
@@ -405,13 +406,13 @@ def section_worker_scaling[P: BurstThreadPool, //, tp: Int](
             break
 
 
-def section_sweep[P: BurstThreadPool, //, tp: Int](
+def section_sweep[P: BurstThreadPool, //](
     mut pools: List[P],
-    src: InlineArray[BF16Ptr, tp],
-    dst: InlineArray[BF16Ptr, tp],
+    src: List[BF16Ptr],
+    dst: List[BF16Ptr],
 ):
+    var tp = len(pools)
     print(t"\n=== Allreduce bf16 sweep (tp={tp}) ===")
-    comptime immut = ImmutOrigin(MutAnyOrigin)
 
     comptime NUM_SIZES = 18
     var sizes = InlineArray[Int, NUM_SIZES](fill=0)
@@ -439,21 +440,21 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
 
     for s in range(NUM_SIZES):
         var count = sizes[s]
-        var rb = RankBuffers[DType.bfloat16, tp, immut](count=count)
-        var db = RankBuffers[DType.bfloat16, tp, MutAnyOrigin](count=count)
+        var rb = RankBuffers[DType.bfloat16, ImmutAnyOrigin](count=count)
+        var db = RankBuffers[DType.bfloat16, MutAnyOrigin](count=count)
         for r in range(tp):
-            rb.ptrs[r] = src[r].as_immutable()
-            db.ptrs[r] = dst[r]
+            rb.add(src[r].as_immutable())
+            db.add(dst[r])
 
         for _ in range(WARMUP):
-            dispatch_allreduce[BF16, tp](rb, db, pools, prof)
+            dispatch_allreduce[BF16](rb, db, pools, prof)
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
-            dispatch_allreduce[BF16, tp](rb, db, pools, prof)
+            dispatch_allreduce[BF16](rb, db, pools, prof)
             var t1 = now_ns()
-            var t_done = max_last_ts[tp=tp](pools)
+            var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
         keep(db.ptrs[0][0])
 
@@ -470,24 +471,25 @@ def section_sweep[P: BurstThreadPool, //, tp: Int](
         print_row(label, ks, ws, total_bytes)
 
 
-def run_all[P: BurstThreadPool, //, tp: Int](
+def run_all[P: BurstThreadPool, //](
     mut pools: List[P],
     mut arenas: List[NumaArena[alignment=ALIGNMENT]],
 ):
-    var src = InlineArray[BF16Ptr, tp](uninitialized=True)
-    var dst = InlineArray[BF16Ptr, tp](uninitialized=True)
+    var tp = len(pools)
+    var src = List[BF16Ptr](capacity=tp)
+    var dst = List[BF16Ptr](capacity=tp)
     for r in range(tp):
-        src[r] = arena_alloc[DType.bfloat16](arenas[r], MAX_ELEMS)
-        dst[r] = arena_alloc[DType.bfloat16](arenas[r], MAX_ELEMS)
+        src.append(arena_alloc[DType.bfloat16](arenas[r], MAX_ELEMS))
+        dst.append(arena_alloc[DType.bfloat16](arenas[r], MAX_ELEMS))
         fill_pattern(src[r], MAX_ELEMS)
 
-    section_local_bw[tp=tp](pools, src, dst, BUF_ELEMS)
-    section_remote_cached[tp=tp](pools, src, BUF_ELEMS)
-    section_remote_fresh[tp=tp](pools, dst, BUF_ELEMS)
-    section_contended[tp=tp](pools, src, BUF_ELEMS)
-    section_dispatch[tp=tp](pools)
-    section_worker_scaling[tp=tp](pools, src, BUF_ELEMS)
-    section_sweep[tp=tp](pools, src, dst)
+    section_local_bw(pools, src, dst, BUF_ELEMS)
+    section_remote_cached(pools, src, BUF_ELEMS)
+    section_remote_fresh(pools, dst, BUF_ELEMS)
+    section_contended(pools, src, BUF_ELEMS)
+    section_dispatch(pools)
+    section_worker_scaling(pools, src, BUF_ELEMS)
+    section_sweep(pools, src, dst)
 
 
 def main():
@@ -508,9 +510,9 @@ def main():
 
     @parameter
     def dispatch_primitives_tp[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        run_all[tp=degree](selected_pools, arenas)
+        run_all(selected_pools, arenas)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_primitives_tp,

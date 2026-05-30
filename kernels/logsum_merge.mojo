@@ -146,19 +146,19 @@ struct FinalizeKernel[head_dim: Int](
 
 
 @fieldwise_init
-struct ContextFlashMergeConfig[head_dim: Int, o: ImmutOrigin]:
+struct ContextFlashMergeConfig[
+    head_dim: Int, o: ImmutOrigin, co: ImmutOrigin,
+](TrivialRegisterPassable):
     var output: Binding[BFloat16, Self.o]
     var partials: Binding[Float32, Self.o]
-    var num_sources: List[Int]
+    var num_sources: Span[Int, Self.co]
 
 
 @fieldwise_init
 struct ContextFinalizeKernel[
-    head_dim: Int, o: ImmutOrigin, cfg_origin: Origin,
+    head_dim: Int, o: ImmutOrigin, co: ImmutOrigin,
 ](WorkerRangePartitionedKernel):
-    var config: UnsafePointer[
-        ContextFlashMergeConfig[Self.head_dim, Self.o],
-        Self.cfg_origin]
+    var config: ContextFlashMergeConfig[Self.head_dim, Self.o, Self.co]
     var q_rank: Int
     var segment_scratch: UnsafePointer[MergeSegment, MutAnyOrigin]
     var num_q: Int
@@ -169,16 +169,16 @@ struct ContextFinalizeKernel[
     var end: Int
 
     def execute(mut self):
-        var tp = len(self.config[].num_sources)
+        var tp = len(self.config.num_sources)
         var segs = self.segment_scratch + self.worker_id * tp
         for r in range(tp):
             segs[r] = MergeSegment(
-                self.config[].partials[r], self.partial_stride,
-                self.config[].num_sources[r])
+                self.config.partials[r], self.partial_stride,
+                self.config.num_sources[r])
         var seg_span = Span(ptr=segs, length=tp)
         for local_h in range(self.start, self.end):
             var global_h = self.q_rank * self.local_num_q + local_h
-            var dst = self.config[].output[self.q_rank] + local_h * Self.head_dim
+            var dst = self.config.output[self.q_rank] + local_h * Self.head_dim
             write_finalized_head[Self.head_dim](
                 dst, seg_span, self.num_q, global_h)
 
@@ -267,18 +267,17 @@ def dispatch_merge_context_flash_partials[
             memset_zero(output[r], local_num_q * head_dim)
         return
 
-    var cfg = ContextFlashMergeConfig[head_dim, o](
-        output, partials_buf, num_sources.copy())
-    var config = UnsafePointer(to=cfg).as_immutable()
-    comptime cfg_ro = ImmutOrigin(origin_of(cfg))
-    comptime K = ContextFinalizeKernel[head_dim, o, cfg_ro]
+    comptime co = origin_of(num_sources)
+    var cfg = ContextFlashMergeConfig[head_dim, o, co](
+        output, partials_buf, Span[Int, co](num_sources))
+    comptime K = ContextFinalizeKernel[head_dim, o, co]
     var nq = num_q
     var lnq = local_num_q
     var ps = partial_stride
 
     @parameter
     def make(q_rank: Int) -> K:
-        return K(config, q_rank, segment_scratch[q_rank], nq, lnq, ps, 0, 0, 0)
+        return K(cfg, q_rank, segment_scratch[q_rank], nq, lnq, ps, 0, 0, 0)
 
     fanout_dispatch[
         make,
