@@ -21,13 +21,14 @@ from quant.recipe import QuantRecipe
 @fieldwise_init
 struct BqEmbedLookupKernel[
     tok_origin: ImmutOrigin,
-    hidden: Int, block: Int, scale: Float64, shard_rows: Int,
+    hidden: Int, block: Int, scale: Float64,
 ](WorkerRangePartitionedKernel):
     var token_ids: Span[Int32, Self.tok_origin]
     var weight: I8Ptr
     var scales: F32Ptr
     var dst: BF16Ptr
     var row_workspace: F32Ptr
+    var shard_rows: Int
     var rank: Int
     var worker_id: Int
     var start: Int
@@ -38,10 +39,10 @@ struct BqEmbedLookupKernel[
         var row_workspace = self.row_workspace + self.worker_id * Self.hidden
         for tok in range(self.start, self.end):
             var tid = Int(self.token_ids[tok])
-            var owner = tid // Self.shard_rows
+            var owner = tid // self.shard_rows
             var dst_row = self.dst + tok * Self.hidden
             if owner == self.rank:
-                var local_row = tid - owner * Self.shard_rows
+                var local_row = tid - owner * self.shard_rows
                 dequant_weight_row_per_block[Self.block](
                     self.weight + local_row * Self.hidden,
                     self.scales + local_row * nb,
@@ -63,32 +64,33 @@ struct BqEmbedLookupKernel[
 
 def dispatch_bq_embed_lookup[
     P: BurstThreadPool, tok_origin: ImmutOrigin,
-    quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    quant: QuantRecipe, o: ImmutOrigin,
     Profile: Bool, N: Int, //,
-    scale: Float64, shard_rows: Int,
+    hidden: Int, scale: Float64,
     max_worker_count: Int = 128,
 ](
     token_ids: Span[Int32, tok_origin],
-    weight: ButterquantWeight[quant, n, m, tp],
-    dst: Binding[BFloat16, tp],
-    row_workspace: Binding[Float32, tp],
+    weight: ButterquantWeight[quant, o],
+    dst: Binding[BFloat16, o],
+    row_workspace: Binding[Float32, o],
+    shard_rows: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_per_block[quant](), "embed lookup expects a per-block weight scale"
     comptime K = BqEmbedLookupKernel[
-        tok_origin, m, quant_k_block[quant](), scale, shard_rows,
+        tok_origin, hidden, quant_k_block[quant](), scale,
     ]
 
     @parameter
     def make(r: Int) -> K:
         return K(
             token_ids, weight.data[r], weight.scale[r], dst[r],
-            row_workspace[r],
+            row_workspace[r], shard_rows,
             r, 0, 0, 0,
         )
 
-    fanout_dispatch[tp, make, max_worker_count=max_worker_count, label="bq_embed_lookup"](
-        pools, prof, seq_len, seq_len * m * 6,
-        inline_threshold_bytes=EMBED_INLINE_TOKENS * m * 6)
+    fanout_dispatch[make, max_worker_count=max_worker_count, label="bq_embed_lookup"](
+        pools, prof, seq_len, seq_len * hidden * 6,
+        inline_threshold_bytes=EMBED_INLINE_TOKENS * hidden * 6)

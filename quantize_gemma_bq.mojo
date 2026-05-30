@@ -20,10 +20,10 @@ def main():
 
     @parameter
     def dispatch_quantize[
-        P: BurstThreadPool, //, degree: Int,
+        P: BurstThreadPool, //,
     ](var pools: List[P]):
         var t0 = perf_counter_ns()
-        var ok = Gemma4[degree=degree, Pool=P].quantize(
+        var ok = Gemma4[Pool=P].quantize(
             Path(SOURCE), Path(OUTPUT), topo, pools^)
         var elapsed_s = (perf_counter_ns() - t0) / 1_000_000_000
         if ok:

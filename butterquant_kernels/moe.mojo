@@ -76,7 +76,7 @@ def emit_bq_gate_up_panel[
 
 @fieldwise_init
 struct BqPhase1GateUpKernel[
-    hidden: Int, gate_up: Int, inter: Int, experts_per_rank: Int, MR: Int = 4,
+    hidden: Int, gate_up: Int, inter: Int, MR: Int = 4,
 ](RangePartitionedKernel):
     """Intermediate-tile-partitioned gate/up projection. Each worker owns a
     range of intermediate tiles [tile_start, tile_end) and processes that
@@ -93,12 +93,13 @@ struct BqPhase1GateUpKernel[
     var gate_up_scale: F32Ptr
     var gate_up_colsum: F32Ptr
     var hidden_bucket: BF16Ptr
+    var experts_per_rank: Int
     var tile_start: Int
     var tile_end: Int
 
     def execute(mut self):
         comptime n_inter_tiles = Self.inter // VNNI_N_STEP
-        for expert in range(Self.experts_per_rank):
+        for expert in range(self.experts_per_rank):
             var rec_lo = Int(self.expert_offset[expert])
             var rec_hi = Int(self.expert_offset[expert + 1])
             var n_tok = rec_hi - rec_lo
@@ -129,35 +130,34 @@ struct BqPhase1GateUpKernel[
 
 
 def dispatch_bq_phase1_gate_up[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    P: BurstThreadPool, quant: QuantRecipe, o: ImmutOrigin,
     Profile: Bool, N: Int, //,
-    hidden: Int, gate_up: Int, inter: Int, experts_per_rank: Int,
+    hidden: Int, gate_up: Int, inter: Int,
     MR: Int = 4, max_worker_count: Int = 128,
 ](
-    act: ButterquantActivation[tp],
-    expert_offset: Binding[Int32, tp],
-    routes: Binding[SparseRoute, tp],
-    experts_gate_up: ButterquantWeight[quant, n, m, tp],
-    hidden_bucket: Binding[BFloat16, tp],
+    act: ButterquantActivation[o],
+    expert_offset: Binding[Int32, o],
+    routes: Binding[SparseRoute, o],
+    experts_gate_up: ButterquantWeight[quant, o],
+    hidden_bucket: Binding[BFloat16, o],
+    experts_per_rank: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_vnni_packed[quant](), "bq phase1 consumes VNNI-packed experts"
     comptime assert quant_has_colsum[quant](), "bq phase1 requires a colsum sidecar"
-    comptime assert n == experts_per_rank * gate_up, "experts_gate_up DATA_N mismatch"
-    comptime assert m == hidden, "experts_gate_up DATA_M mismatch"
     comptime n_inter_tiles = inter // VNNI_N_STEP
-    comptime Kern = BqPhase1GateUpKernel[hidden, gate_up, inter, experts_per_rank, MR]
+    comptime Kern = BqPhase1GateUpKernel[hidden, gate_up, inter, MR]
     var cs = experts_gate_up.colsum_checked()
 
     @parameter
     def make(r: Int) -> Kern:
         return Kern(act.data[r], act.scale[r], expert_offset[r], routes[r],
                     experts_gate_up.data[r], experts_gate_up.scale[r], cs[r],
-                    hidden_bucket[r], 0, 0)
+                    hidden_bucket[r], experts_per_rank, 0, 0)
 
     fanout_dispatch[
-        tp, make,
+        make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="bq_phase1_gate_up",
@@ -166,7 +166,7 @@ def dispatch_bq_phase1_gate_up[
 
 @always_inline
 def emit_bq_down_panel[
-    hidden: Int, inter: Int, block: Int, data_n: Int, PR: Int,
+    hidden: Int, inter: Int, block: Int, PR: Int,
 ](
     rec_start: Int,
     routes: SparseRoutePtr,
@@ -176,6 +176,7 @@ def emit_bq_down_panel[
     wsc: F32Ptr,
     cs: F32Ptr,
     e_row_base: Int,
+    data_n: Int,
     moe_accum: F32Ptr,
     tile_start: Int,
     tile_end: Int,
@@ -200,8 +201,8 @@ def emit_bq_down_panel[
         for b in range(nb):
             var iacc = InlineArray[SIMD[DType.int32, width], PR * acc_count](
                 fill=SIMD[DType.int32, width](0))
-            accumulate_n_step[width, PR, inter](
-                act, 0, w, t * VNNI_N_STEP * inter + b * blk_bytes,
+            accumulate_n_step[width, PR](
+                act, 0, inter, w, t * VNNI_N_STEP * inter + b * blk_bytes,
                 b * block, block, iacc)
             comptime for r in range(PR):
                 var adv = SIMD[DType.float32, width](
@@ -226,7 +227,7 @@ def emit_bq_down_panel[
 
 @fieldwise_init
 struct BqPhase2DownKernel[
-    hidden: Int, inter: Int, block: Int, experts_per_rank: Int, MR: Int = 4,
+    hidden: Int, inter: Int, block: Int, MR: Int = 4,
 ](RangePartitionedKernel):
     var expert_offset: I32Ptr
     var routes: SparseRoutePtr
@@ -238,12 +239,13 @@ struct BqPhase2DownKernel[
     var moe_accum: F32Ptr
     var moe_partial: BF16Ptr
     var seq_len: Int
+    var experts_per_rank: Int
     var tile_start: Int
     var tile_end: Int
 
     def execute(mut self):
         comptime width = simd_width_of[DType.int32]()
-        comptime data_n = Self.experts_per_rank * Self.hidden
+        var data_n = self.experts_per_rank * Self.hidden
         var col_lo = self.tile_start * VNNI_N_STEP
         var col_hi = self.tile_end * VNNI_N_STEP
 
@@ -254,7 +256,7 @@ struct BqPhase2DownKernel[
                 (row + c).store(SIMD[DType.float32, width](0))
                 c += width
 
-        for e in range(Self.experts_per_rank):
+        for e in range(self.experts_per_rank):
             var rec_lo = Int(self.expert_offset[e])
             var rec_hi = Int(self.expert_offset[e + 1])
             var n_tok = rec_hi - rec_lo
@@ -266,16 +268,16 @@ struct BqPhase2DownKernel[
             var rb = 0
             while rb + Self.MR <= n_tok:
                 emit_bq_down_panel[
-                    Self.hidden, Self.inter, Self.block, data_n, Self.MR,
+                    Self.hidden, Self.inter, Self.block, Self.MR,
                 ](rec_lo + rb, self.routes, self.bucket_i8, self.bucket_sa,
-                  w, wsc, self.down_colsum, e_row_base, self.moe_accum,
+                  w, wsc, self.down_colsum, e_row_base, data_n, self.moe_accum,
                   self.tile_start, self.tile_end)
                 rb += Self.MR
             while rb < n_tok:
                 emit_bq_down_panel[
-                    Self.hidden, Self.inter, Self.block, data_n, 1,
+                    Self.hidden, Self.inter, Self.block, 1,
                 ](rec_lo + rb, self.routes, self.bucket_i8, self.bucket_sa,
-                  w, wsc, self.down_colsum, e_row_base, self.moe_accum,
+                  w, wsc, self.down_colsum, e_row_base, data_n, self.moe_accum,
                   self.tile_start, self.tile_end)
                 rb += 1
 
@@ -294,41 +296,40 @@ struct BqPhase2DownKernel[
 
 
 def dispatch_bq_phase2_down[
-    P: BurstThreadPool, quant: QuantRecipe, n: Int, m: Int, tp: Int,
+    P: BurstThreadPool, quant: QuantRecipe, o: ImmutOrigin,
     Profile: Bool, N: Int, //,
-    hidden: Int, inter: Int, experts_per_rank: Int,
+    hidden: Int, inter: Int,
     MR: Int = 4, max_worker_count: Int = 128,
 ](
-    bucket: ButterquantBlockActivation[tp],
-    expert_offset: Binding[Int32, tp],
-    routes: Binding[SparseRoute, tp],
-    experts_down: ButterquantWeight[quant, n, m, tp],
-    moe_accum: Binding[Float32, tp],
-    moe_partial: Binding[BFloat16, tp],
+    bucket: ButterquantBlockActivation[o],
+    expert_offset: Binding[Int32, o],
+    routes: Binding[SparseRoute, o],
+    experts_down: ButterquantWeight[quant, o],
+    moe_accum: Binding[Float32, o],
+    moe_partial: Binding[BFloat16, o],
+    experts_per_rank: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime assert quant_vnni_packed[quant](), "bq phase2 consumes VNNI-packed experts"
     comptime assert quant_colsum_per_block[quant](), "bq phase2 requires a per-block colsum"
-    comptime assert n == experts_per_rank * hidden, "experts_down DATA_N mismatch"
-    comptime assert m == inter, "experts_down DATA_M mismatch"
     if seq_len <= 0:
         return
     comptime n_tiles = hidden // VNNI_N_STEP
     comptime Kern = BqPhase2DownKernel[
-        hidden, inter, quant_k_block[quant](), experts_per_rank, MR]
+        hidden, inter, quant_k_block[quant](), MR]
     var cs = experts_down.colsum_checked()
 
     @parameter
     def make(r: Int) -> Kern:
         return Kern(expert_offset[r], routes[r], bucket.data[r], bucket.scale[r],
                     experts_down.data[r], experts_down.scale[r], cs[r],
-                    moe_accum[r], moe_partial[r], seq_len, 0, 0)
+                    moe_accum[r], moe_partial[r], seq_len, experts_per_rank, 0, 0)
 
     fanout_dispatch[
-        tp, make,
+        make,
         max_worker_count=max_worker_count,
         worker_policy=saturate_workers,
         label="bq_phase2_down",
-    ](pools, prof, n_tiles, seq_len * hidden * 2 + n * m)
+    ](pools, prof, n_tiles, seq_len * hidden * 2 + experts_per_rank * hidden * inter)

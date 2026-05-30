@@ -567,7 +567,7 @@ struct Quantizer(Movable):
         var local = String(FT.NAME)
 
         var offs = InlineArray[Int, 5](fill=-1)
-        comptime MANIFEST = quant_manifest[FT.ENCODING, FT.SHAPE, FT.QUANT]()
+        comptime MANIFEST = quant_manifest[FT.ENCODING, FT.SHAPE, FT.QUANT](1)
         comptime for i in range(MANIFEST.count):
             comptime MEMBER = MANIFEST.members[i]
             comptime if MEMBER.role != QuantRole.COLSUM:

@@ -48,38 +48,38 @@ def quant_has_colsum[q: QuantRecipe]() -> Bool:
 
 
 @fieldwise_init
-struct ButterquantWeight[quant: QuantRecipe, n: Int, m: Int, tp: Int](
+struct ButterquantWeight[quant: QuantRecipe, o: ImmutOrigin](
     Copyable, ImplicitlyCopyable,
 ):
     comptime HAS_COLSUM = quant_has_colsum[Self.quant]()
 
-    var data: Binding[Int8, Self.tp]
-    var scale: Binding[Float32, Self.tp]
-    var colsum: Binding[Float32, Self.tp]
+    var data: Binding[Int8, Self.o]
+    var scale: Binding[Float32, Self.o]
+    var colsum: Binding[Float32, Self.o]
 
     @always_inline
-    def colsum_checked(self) -> Binding[Float32, Self.tp]:
+    def colsum_checked(self) -> Binding[Float32, Self.o]:
         comptime assert Self.HAS_COLSUM, (
             "ButterquantWeight recipe declared no colsum but tried to access one.")
         return self.colsum
 
 
 @fieldwise_init
-struct ButterquantRouter[quant: QuantRecipe, n: Int, m: Int, tp: Int](
+struct ButterquantRouter[quant: QuantRecipe, o: ImmutOrigin](
     Copyable, ImplicitlyCopyable,
 ):
-    var centered: Binding[BFloat16, Self.tp]
-    var gauge: Optional[Binding[BFloat16, Self.tp]]
-    var bias: Optional[Binding[Float32, Self.tp]]
+    var centered: Binding[BFloat16, Self.o]
+    var gauge: Optional[Binding[BFloat16, Self.o]]
+    var bias: Optional[Binding[Float32, Self.o]]
 
 
 @fieldwise_init
-struct ButterquantActivation[tp: Int](Copyable, ImplicitlyCopyable):
-    var data: Binding[Int8, Self.tp]
-    var scale: Binding[Float32, Self.tp]
+struct ButterquantActivation[o: ImmutOrigin](Copyable, ImplicitlyCopyable):
+    var data: Binding[Int8, Self.o]
+    var scale: Binding[Float32, Self.o]
 
 
 @fieldwise_init
-struct ButterquantBlockActivation[tp: Int](Copyable, ImplicitlyCopyable):
-    var data: Binding[Int8, Self.tp]
-    var scale: Binding[Float32, Self.tp]
+struct ButterquantBlockActivation[o: ImmutOrigin](Copyable, ImplicitlyCopyable):
+    var data: Binding[Int8, Self.o]
+    var scale: Binding[Float32, Self.o]
