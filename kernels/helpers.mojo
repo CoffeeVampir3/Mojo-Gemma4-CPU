@@ -182,6 +182,18 @@ def worker_range(
 
 
 @always_inline
+def min_pool_capacity[P: BurstThreadPool, //](
+    read pools: List[P], max_worker_count: Int,
+) -> Int:
+    var cap = max_worker_count
+    for r in range(len(pools)):
+        var c = pools[r].get_capacity()
+        if c < cap:
+            cap = c
+    return cap
+
+
+@always_inline
 def recommended_workers[
     bw_product: Int = DISPATCH_BW_PRODUCT,
     amortized_bytes: Int = PARALLEL_AMORTIZED_BYTES,

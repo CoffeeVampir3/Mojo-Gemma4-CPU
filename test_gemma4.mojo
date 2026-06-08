@@ -107,6 +107,11 @@ def load_and_run[
     print(t"model loaded in {load_ms} ms")
     print()
 
+    var seq = model.admit_sequence()
+    if seq < 0:
+        print("sequence admission failed")
+        return
+
     var prompt_len = len(token_ids)
 
     var tok_buf = int32_tokens(token_ids)
@@ -123,7 +128,7 @@ def load_and_run[
         var logits: TemporalLogitsView[VOCAB]
         if pos == 0:
             var t1 = perf_counter_ns()
-            logits = model.forward(Span(tok_buf), 0)
+            logits = model.forward(seq, Span(tok_buf), 0)
             prefill_ms = elapsed_ms_since(t1)
             pos = prompt_len
             model.profiler.report("prefill")
@@ -131,7 +136,7 @@ def load_and_run[
             decode_start = perf_counter_ns()
         else:
             step_buf[0] = Int32(next_id)
-            logits = model.forward(Span(step_buf), pos)
+            logits = model.forward(seq, Span(step_buf), pos)
             pos += 1
 
         next_id = greedy_next_token(logits)

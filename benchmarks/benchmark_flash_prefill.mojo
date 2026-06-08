@@ -8,7 +8,7 @@ from threading.topological_dispatch import with_topological_rank_dispatch
 from kernels.attention_dispatch_kernels import (
     dispatch_sliding_attention, dispatch_full_attention,
 )
-from kernels.attention_ops import flash_partial_stride
+from kernels.attention_ops import KVRun, KVRunTable, flash_partial_stride
 from kernels.helpers import Binding, RankView
 from kernels.logsum_merge import MergeSegment
 from kernels.profiling import Profiler
@@ -39,6 +39,7 @@ comptime FULL_GQA = FULL_NUM_Q // FULL_NUM_KV
 comptime FULL_KV_STRIDE = FULL_NUM_KV * FULL_HEAD_DIM
 comptime FULL_CHUNK_SIZE = 512
 comptime FULL_MAX_SEQ = 4096
+comptime FULL_PAGE_LEN = 1024
 
 comptime SLIDING_PSTRIDE = flash_partial_stride(SLIDING_NUM_Q, SLIDING_HEAD_DIM)
 comptime FULL_PSTRIDE = flash_partial_stride(FULL_NUM_Q, FULL_HEAD_DIM)
@@ -94,6 +95,7 @@ def fill_pattern_all[o: ImmutOrigin](
 
 def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -120,16 +122,18 @@ def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
             var done = 0
             while done < seq_len:
                 var chunk_len = min(SLIDING_CHUNK_SIZE, seq_len - done)
+                runs[].runs[0].base_pos = Int32(done)
                 dispatch_sliding_attention[
                     head_dim=SLIDING_HEAD_DIM, max_q=SLIDING_NUM_Q,
                     gqa_ratio=SLIDING_GQA,
                     window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
+                    page_len=SLIDING_WINDOW,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
-                    output.shifted(done * q_stride), worker_scratch,
+                    output.shifted(done * q_stride), worker_scratch, runs,
                     SLIDING_NUM_Q, SLIDING_PSTRIDE, SLIDING_KV_STRIDE,
-                    done, chunk_len, pools, prof)
+                    chunk_len, pools, prof)
                 done += chunk_len
             keep(output[0][0])
 
@@ -139,16 +143,18 @@ def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
             var done = 0
             while done < seq_len:
                 var chunk_len = min(SLIDING_CHUNK_SIZE, seq_len - done)
+                runs[].runs[0].base_pos = Int32(done)
                 dispatch_sliding_attention[
                     head_dim=SLIDING_HEAD_DIM, max_q=SLIDING_NUM_Q,
                     gqa_ratio=SLIDING_GQA,
                     window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
+                    page_len=SLIDING_WINDOW,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
-                    output.shifted(done * q_stride), worker_scratch,
+                    output.shifted(done * q_stride), worker_scratch, runs,
                     SLIDING_NUM_Q, SLIDING_PSTRIDE, SLIDING_KV_STRIDE,
-                    done, chunk_len, pools, prof)
+                    chunk_len, pools, prof)
                 done += chunk_len
             var t1 = now_ns()
             var t_done = max_last_ts(pools)
@@ -164,6 +170,7 @@ def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
 
 def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -194,16 +201,18 @@ def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
             var done = 0
             while done < seq_len:
                 var chunk_len = min(FULL_CHUNK_SIZE, seq_len - done)
+                runs[].runs[0].base_pos = Int32(done)
                 dispatch_full_attention[
                     head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
                     gqa_ratio=FULL_GQA,
                     kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE,
+                    page_len=FULL_PAGE_LEN,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
                     output.shifted(done * local_q_stride),
-                    partials_scratch, merge_segments, local_num_q,
-                    done, chunk_len, pools, prof)
+                    partials_scratch, merge_segments, runs, local_num_q,
+                    chunk_len, pools, prof)
                 done += chunk_len
             keep(output[0][0])
 
@@ -213,16 +222,18 @@ def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
             var done = 0
             while done < seq_len:
                 var chunk_len = min(FULL_CHUNK_SIZE, seq_len - done)
+                runs[].runs[0].base_pos = Int32(done)
                 dispatch_full_attention[
                     head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
                     gqa_ratio=FULL_GQA,
                     kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE,
+                    page_len=FULL_PAGE_LEN,
                     max_worker_count=MAX_WORKERS,
                 ](
                     q.shifted(done * q_stride), k_cache, v_cache,
                     output.shifted(done * local_q_stride),
-                    partials_scratch, merge_segments, local_num_q,
-                    done, chunk_len, pools, prof)
+                    partials_scratch, merge_segments, runs, local_num_q,
+                    chunk_len, pools, prof)
                 done += chunk_len
             var t1 = now_ns()
             var t_done = max_last_ts(pools)
@@ -240,6 +251,7 @@ def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
 
 def section_validation_sliding[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -249,15 +261,17 @@ def section_validation_sliding[P: BurstThreadPool, o: ImmutOrigin, //](
     print("\n=== Validation (sliding, seq_len=64) ===")
     comptime SL = 64
     var prof = Profiler[False]()
+    runs[].runs[0].base_pos = Int32(0)
 
     dispatch_sliding_attention[
         head_dim=SLIDING_HEAD_DIM, max_q=SLIDING_NUM_Q,
         gqa_ratio=SLIDING_GQA,
         window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
+        page_len=SLIDING_WINDOW,
         max_worker_count=MAX_WORKERS,
-    ](q, k_cache, v_cache, output, worker_scratch,
+    ](q, k_cache, v_cache, output, worker_scratch, runs,
       SLIDING_NUM_Q, SLIDING_PSTRIDE, SLIDING_KV_STRIDE,
-      0, SL, pools, prof)
+      SL, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()
@@ -276,6 +290,7 @@ def section_validation_sliding[P: BurstThreadPool, o: ImmutOrigin, //](
 
 def section_validation_full[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -291,14 +306,16 @@ def section_validation_full[P: BurstThreadPool, o: ImmutOrigin, //](
     comptime M_OFF = FULL_NUM_Q * FULL_HEAD_DIM
     comptime L_OFF = M_OFF + FULL_NUM_Q
     var prof = Profiler[False]()
+    runs[].runs[0].base_pos = Int32(0)
 
     dispatch_full_attention[
         head_dim=FULL_HEAD_DIM, num_q=FULL_NUM_Q,
         gqa_ratio=FULL_GQA,
         kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE,
+        page_len=FULL_PAGE_LEN,
         max_worker_count=MAX_WORKERS,
-    ](q, k_cache, v_cache, output, partials_scratch, merge_segments,
-      local_num_q, 0, SL, pools, prof)
+    ](q, k_cache, v_cache, output, partials_scratch, merge_segments, runs,
+      local_num_q, SL, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()
@@ -381,10 +398,16 @@ def run_sliding[P: BurstThreadPool, //](
         t"num_kv={SLIDING_NUM_KV} gqa={SLIDING_GQA} window={SLIDING_WINDOW}"
     )
 
+    var runs_table = KVRunTable()
+    var run = KVRun(0, 0)
+    run.base_rows.append(Int32(0))
+    runs_table.runs.append(run^)
+    var runs = UnsafePointer(to=runs_table)
+
     section_validation_sliding(
-        pools, q, k_cache, v_cache, output, worker_scratch)
+        pools, runs, q, k_cache, v_cache, output, worker_scratch)
     section_sliding_sweep(
-        pools, q, k_cache, v_cache, output, worker_scratch)
+        pools, runs, q, k_cache, v_cache, output, worker_scratch)
 
 
 def run_full[P: BurstThreadPool, //](
@@ -429,11 +452,19 @@ def run_full[P: BurstThreadPool, //](
         t"gqa={FULL_GQA} max_seq={FULL_MAX_SEQ}"
     )
 
+    var runs_table = KVRunTable()
+    var run = KVRun(0, 0)
+    var rows_per_page = FULL_PAGE_LEN // tp
+    for ordinal in range(FULL_MAX_SEQ // FULL_PAGE_LEN):
+        run.base_rows.append(Int32(ordinal * rows_per_page))
+    runs_table.runs.append(run^)
+    var runs = UnsafePointer(to=runs_table)
+
     section_validation_full(
-        pools, q, k_cache, v_cache, output, partials_scratch,
+        pools, runs, q, k_cache, v_cache, output, partials_scratch,
         merge_segments)
     section_full_sweep(
-        pools, q, k_cache, v_cache, output, partials_scratch,
+        pools, runs, q, k_cache, v_cache, output, partials_scratch,
         merge_segments)
 
 

@@ -1,4 +1,4 @@
-from std.memory import memcpy
+from std.memory import UnsafePointer, memcpy
 from std.sys.info import simd_width_of
 
 from simd_math import sincos_simd
@@ -8,6 +8,7 @@ from .helpers import (
     fanout_dispatch,
     BF16Ptr, F32Ptr, W,
 )
+from .attention_ops import KVRunTable, PagedKV
 from .dispatch_heuristics import ROPE_INLINE_TOKENS
 from .profiling import Profiler
 
@@ -52,11 +53,11 @@ struct RopeCacheWriteKernel[
     half: Int,
     pair_stride: Int,
     head_dim: Int,
-    slot_mask: Int,
 ](RangePartitionedKernel):
     """The KV cache slot stride equals the per-token KV write size
     (`num_kv * head_dim`) in every Gemma4 cache layout, so it is derived rather
     than threaded separately."""
+    var runs: UnsafePointer[KVRunTable, MutAnyOrigin]
     var q: BF16Ptr
     var k_src: BF16Ptr
     var v_src: BF16Ptr
@@ -64,19 +65,36 @@ struct RopeCacheWriteKernel[
     var v_cache: BF16Ptr
     var cos_table: F32Ptr
     var sin_table: F32Ptr
-    var base_pos: Int
     var num_q: Int
     var num_kv: Int
     var cache_degree: Int
     var rank: Int
+    var page_shift: Int
+    var row_mask: Int
+    var page_mask: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
         var q_stride = self.num_q * Self.head_dim
         var kv_stride = self.num_kv * Self.head_dim
+        ref run_list = self.runs[].runs
+        var num_runs = len(run_list)
+        var r = 0
+        var kv = PagedKV(
+            run_list[0].base_rows.unsafe_ptr(),
+            self.page_shift, self.row_mask, self.page_mask)
+        var run_start = Int(run_list[0].buf_start)
+        var run_pos = Int(run_list[0].base_pos)
         for tok in range(self.start, self.end):
-            var pos = self.base_pos + tok
+            while r + 1 < num_runs and tok >= Int(run_list[r + 1].buf_start):
+                r += 1
+                kv = PagedKV(
+                    run_list[r].base_rows.unsafe_ptr(),
+                    self.page_shift, self.row_mask, self.page_mask)
+                run_start = Int(run_list[r].buf_start)
+                run_pos = Int(run_list[r].base_pos)
+            var pos = run_pos + (tok - run_start)
             var cos_row = self.cos_table + pos * Self.half
             var sin_row = self.sin_table + pos * Self.half
 
@@ -86,7 +104,7 @@ struct RopeCacheWriteKernel[
                     q_tok + h * Self.head_dim, cos_row, sin_row)
 
             if pos % self.cache_degree == self.rank:
-                var slot = (pos // self.cache_degree) & Self.slot_mask
+                var slot = kv.slot(0, pos // self.cache_degree)
                 var k_tok = self.k_src + tok * kv_stride
                 var k_dst = self.k_cache + slot * kv_stride
                 for h in range(self.num_kv):
@@ -108,7 +126,6 @@ struct RopeCacheWriteKernel[
 def dispatch_rope_cache_write[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     half: Int, pair_stride: Int, head_dim: Int,
-    slot_mask: Int,
     max_worker_count: Int = 128,
 ](
     q: Binding[BFloat16, o],
@@ -118,24 +135,28 @@ def dispatch_rope_cache_write[
     v_cache: Binding[BFloat16, o],
     cos_table: Binding[Float32, o],
     sin_table: Binding[Float32, o],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     num_q: Int, num_kv: Int, cache_degree: Int,
-    base_pos: Int, seq_len: Int,
+    page_shift: Int, row_mask: Int, page_mask: Int,
+    seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
-    comptime K = RopeCacheWriteKernel[
-        half, pair_stride, head_dim, slot_mask]
+    comptime K = RopeCacheWriteKernel[half, pair_stride, head_dim]
     var row_bytes = (num_q + 2 * num_kv) * head_dim * 2
     var nq = num_q
     var nkv = num_kv
     var cd = cache_degree
+    var ps = page_shift
+    var rm = row_mask
+    var pm = page_mask
 
     @parameter
     def make(r: Int) -> K:
-        return K(q[r], k_src[r], v_src[r],
+        return K(runs, q[r], k_src[r], v_src[r],
                  k_cache[r], v_cache[r],
                  cos_table[r], sin_table[r],
-                 base_pos, nq, nkv, cd, r % cd, 0, 0)
+                 nq, nkv, cd, r % cd, ps, rm, pm, 0, 0)
 
     fanout_dispatch[make, max_worker_count=max_worker_count, label="rope_cache_write"](
         pools, prof, seq_len, seq_len * row_bytes,
