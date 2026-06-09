@@ -94,14 +94,15 @@ def degree_contracts_ok(degree: Int) -> Bool:
 
 @always_inline
 def paging_contracts_ok[
-    max_seq_len: Int, batching_seq_len: Int,
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
 ](degree: Int) -> Bool:
     var rows_per_page = PAGE_LEN // degree
     return (
         PAGE_LEN % degree == 0
         and rows_per_page > 0
         and (rows_per_page & (rows_per_page - 1)) == 0
-        and batching_seq_len % (2 * C.SLIDING_WINDOW) == 0
+        and max_resident_seqs > 0
+        and batching_seq_len % PAGE_LEN == 0
         and max_seq_len % PAGE_LEN == 0
         and batching_seq_len >= max_seq_len
     )
@@ -125,8 +126,12 @@ struct Gemma4Shapes:
     ]
 
 
-struct Gemma4StateShapes[max_seq_len: Int, batching_seq_len: Int]:
-    comptime SlidingKV   = TensorColumnSharded[Self.batching_seq_len, C.KV_DIM_SLIDING]
+struct Gemma4StateShapes[
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
+]:
+    comptime SlidingKV   = TensorColumnSharded[
+        Self.max_resident_seqs * SLIDING_RING_PAGES * PAGE_LEN, C.KV_DIM_SLIDING,
+    ]
     comptime FullKV      = ContextRowSharded[Self.batching_seq_len, C.KV_DIM_FULL]
     comptime SlidingRope = Replicated[Self.max_seq_len, C.ROPE_HALF_SLIDING]
     comptime FullRope    = Replicated[Self.max_seq_len, C.ROPE_HALF_FULL]
@@ -187,17 +192,21 @@ struct FullLayerRefs(Copyable, ImplicitlyCopyable, SlotGroup):
 
 
 struct SlidingKVSlots[
-    max_seq_len: Int, batching_seq_len: Int,
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
 ](Copyable, ImplicitlyCopyable, SlotGroup):
-    comptime S = Gemma4StateShapes[Self.max_seq_len, Self.batching_seq_len]
+    comptime S = Gemma4StateShapes[
+        Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+    ]
     var k: Slot[BF16, Self.S.SlidingKV]
     var v: Slot[BF16, Self.S.SlidingKV]
 
 
 struct FullKVSlots[
-    max_seq_len: Int, batching_seq_len: Int,
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
 ](Copyable, ImplicitlyCopyable, SlotGroup):
-    comptime S = Gemma4StateShapes[Self.max_seq_len, Self.batching_seq_len]
+    comptime S = Gemma4StateShapes[
+        Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+    ]
     var k: Slot[BF16, Self.S.FullKV]
     var v: Slot[BF16, Self.S.FullKV]
 
@@ -219,13 +228,19 @@ struct TailRefs(Copyable, ImplicitlyCopyable, SlotGroup):
 
 
 @fieldwise_init
-struct Gemma4Layout[max_seq_len: Int, batching_seq_len: Int](Copyable, ImplicitlyCopyable):
+struct Gemma4Layout[
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
+](Copyable, ImplicitlyCopyable):
     var arena: ArenaLayout
     var sliding: Repeated[SlidingLayerRefs]
     var full: Repeated[FullLayerRefs]
 
-    var sliding_kv: Repeated[SlidingKVSlots[Self.max_seq_len, Self.batching_seq_len]]
-    var full_kv: Repeated[FullKVSlots[Self.max_seq_len, Self.batching_seq_len]]
+    var sliding_kv: Repeated[SlidingKVSlots[
+        Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+    ]]
+    var full_kv: Repeated[FullKVSlots[
+        Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+    ]]
     var activations: ActivationSlots
     var sliding_rope: RopeSlots[C.ROPE_HALF_SLIDING, Self.max_seq_len]
     var full_rope: RopeSlots[C.ROPE_HALF_FULL, Self.max_seq_len]
@@ -386,13 +401,15 @@ def calculate_peak_scratch(degree: Int, max_workers: Int) -> Int:
 
 
 def build_gemma4_plan[
-    max_seq_len: Int, batching_seq_len: Int,
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
 ](degree: Int, max_workers: Int, mut descs: List[WeightDesc]) -> Gemma4Layout[
-    max_seq_len, batching_seq_len,
+    max_seq_len, batching_seq_len, max_resident_seqs,
 ]:
     if not degree_contracts_ok(degree):
         abort(t"gemma4: degree {degree} does not divide the model dimensions")
-    if not paging_contracts_ok[max_seq_len, batching_seq_len](degree):
+    if not paging_contracts_ok[
+        max_seq_len, batching_seq_len, max_resident_seqs,
+    ](degree):
         abort(t"gemma4: page geometry contracts violated at degree {degree}")
     if max_workers <= 0:
         abort(t"gemma4: max_workers must be positive, got {max_workers}")
@@ -428,16 +445,22 @@ def build_gemma4_plan[
 
     var state_cursor = distributed
 
-    var skv_proto = SlidingKVSlots[max_seq_len, batching_seq_len]()
+    var skv_proto = SlidingKVSlots[
+        max_seq_len, batching_seq_len, max_resident_seqs,
+    ]()
     var skv_stride = stamp_offsets(skv_proto, degree)
-    var sliding_kv = Repeated[SlidingKVSlots[max_seq_len, batching_seq_len]](
-        skv_proto, state_cursor, skv_stride, C.NUM_SLIDING_LAYERS)
+    var sliding_kv = Repeated[SlidingKVSlots[
+        max_seq_len, batching_seq_len, max_resident_seqs,
+    ]](skv_proto, state_cursor, skv_stride, C.NUM_SLIDING_LAYERS)
     state_cursor = align_up(state_cursor + C.NUM_SLIDING_LAYERS * skv_stride)
 
-    var fkv_proto = FullKVSlots[max_seq_len, batching_seq_len]()
+    var fkv_proto = FullKVSlots[
+        max_seq_len, batching_seq_len, max_resident_seqs,
+    ]()
     var fkv_stride = stamp_offsets(fkv_proto, degree)
-    var full_kv = Repeated[FullKVSlots[max_seq_len, batching_seq_len]](
-        fkv_proto, state_cursor, fkv_stride, C.NUM_FULL_LAYERS)
+    var full_kv = Repeated[FullKVSlots[
+        max_seq_len, batching_seq_len, max_resident_seqs,
+    ]](fkv_proto, state_cursor, fkv_stride, C.NUM_FULL_LAYERS)
     state_cursor = align_up(state_cursor + C.NUM_FULL_LAYERS * fkv_stride)
 
     var activations = ActivationSlots()
@@ -459,7 +482,7 @@ def build_gemma4_plan[
         host_bytes=align_up(state_cursor),
         scratch_off=scratch_off,
     )
-    return Gemma4Layout[max_seq_len, batching_seq_len](
+    return Gemma4Layout[max_seq_len, batching_seq_len, max_resident_seqs](
         arena=arena,
         sliding=Repeated[SlidingLayerRefs](sl_proto, sl_off, sl_stride, C.NUM_SLIDING_LAYERS),
         full=Repeated[FullLayerRefs](fl_proto, fl_off, fl_stride, C.NUM_FULL_LAYERS),
@@ -471,9 +494,10 @@ def build_gemma4_plan[
 
 def dispatch_sliding_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
-    max_seq_len: Int, batching_seq_len: Int, max_worker_count: Int = 128,
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
+    max_worker_count: Int = 128,
 ](
-    layout: Gemma4Layout[max_seq_len, batching_seq_len],
+    layout: Gemma4Layout[max_seq_len, batching_seq_len, max_resident_seqs],
     ctx: BindContext[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     seq_len: Int,
@@ -564,9 +588,10 @@ def dispatch_sliding_attention_qkv[
 
 def dispatch_full_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
-    max_seq_len: Int, batching_seq_len: Int, max_worker_count: Int = 128,
+    max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
+    max_worker_count: Int = 128,
 ](
-    layout: Gemma4Layout[max_seq_len, batching_seq_len],
+    layout: Gemma4Layout[max_seq_len, batching_seq_len, max_resident_seqs],
     ctx: BindContext[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     seq_len: Int,
@@ -812,6 +837,7 @@ def dispatch_ffn[
 struct Gemma4[
     max_seq_len: Int = 8192,
     batching_seq_len: Int = 8192,
+    max_resident_seqs: Int = 4,
     Pool: BurstThreadPool = BurstPool[],
     profile: Bool = False, profile_slots: Int = 64,
 ](Movable, ScheduledModel):
@@ -819,7 +845,9 @@ struct Gemma4[
 
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
-    var layout: Gemma4Layout[Self.max_seq_len, Self.batching_seq_len]
+    var layout: Gemma4Layout[
+        Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+    ]
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
     var degree: Int
@@ -834,7 +862,9 @@ struct Gemma4[
     def __init__(out self,
         var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
         var pools: List[Self.Pool],
-        layout: Gemma4Layout[Self.max_seq_len, Self.batching_seq_len],
+        layout: Gemma4Layout[
+            Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+        ],
         degree: Int,
         max_workers: Int,
     ):
@@ -913,7 +943,7 @@ struct Gemma4[
         print("  rope tables initialized")
 
     def batch_geometry(self) -> BatchGeometry:
-        var max_seqs = Self.batching_seq_len // (SLIDING_RING_PAGES * PAGE_LEN)
+        var max_seqs = Self.max_resident_seqs
         var pools = List[PagePoolSpec]()
         pools.append(PagePoolSpec(
             num_pages=max_seqs * SLIDING_RING_PAGES,
@@ -1045,6 +1075,7 @@ struct Gemma4[
                 dispatch_full_attention_qkv[
                     max_seq_len=Self.max_seq_len,
                     batching_seq_len=Self.batching_seq_len,
+                    max_resident_seqs=Self.max_resident_seqs,
                 ](
                     layout, ctx, full_runs, total, entry.local_idx,
                     self.scratch, self.full_plan, self.pools, self.profiler)
@@ -1052,6 +1083,7 @@ struct Gemma4[
                 dispatch_sliding_attention_qkv[
                     max_seq_len=Self.max_seq_len,
                     batching_seq_len=Self.batching_seq_len,
+                    max_resident_seqs=Self.max_resident_seqs,
                 ](
                     layout, ctx, sliding_runs, total, entry.local_idx,
                     self.scratch, self.sliding_plan, self.pools, self.profiler)
@@ -1146,7 +1178,7 @@ struct Gemma4[
 
         var descs = List[WeightDesc]()
         var layout = build_gemma4_plan[
-            Self.max_seq_len, Self.batching_seq_len,
+            Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
         ](degree, max_workers, descs)
 
         var size = layout.arena.host_arena_bytes()
