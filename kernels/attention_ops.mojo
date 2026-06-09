@@ -39,11 +39,6 @@ def pow2_shift(value: Int) -> Int:
 
 @fieldwise_init
 struct PagedKV(KVSlot):
-    """Resolves a logical row through a sequence's page map. `base_rows` points
-    into the owning run's page-map storage, which is stable for the life of a
-    burst (tables are never mutated with work in flight). `page_mask = -1`
-    walks a growing table (full attention); a power-of-two page ring (sliding)
-    wraps with `page_mask = ring_pages - 1`."""
     var base_rows: UnsafePointer[Int32, MutAnyOrigin]
     var shift: Int
     var row_mask: Int
@@ -56,41 +51,44 @@ struct PagedKV(KVSlot):
             p & self.row_mask)
 
 
-struct KVRun(Copyable, Movable):
-    """One packed-chunk run: contiguous buffer rows from a single sequence,
-    starting at buffer row `buf_start` and sequence position `base_pos`.
-    `base_rows` maps page ordinal to the physical base row in the kind's pool;
-    full attention indexes it by local-row ordinal, sliding by `ordinal & 1`."""
+@fieldwise_init
+struct KVRun(Copyable, Movable, ImplicitlyCopyable):
     var buf_start: Int32
     var base_pos: Int32
-    var base_rows: List[Int32]
-
-    def __init__(out self, buf_start: Int, base_pos: Int):
-        self.buf_start = Int32(buf_start)
-        self.base_pos = Int32(base_pos)
-        self.base_rows = List[Int32]()
+    var rows_off: Int32
+    var page_count: Int32
 
 
 struct KVRunTable(Movable):
-    """Orchestrator-owned per-step run metadata for one cache kind. Kernels
-    receive a pointer and read it in place; the owner never mutates it while
-    a burst is in flight."""
     var runs: List[KVRun]
+    var base_rows: List[Int32]
 
     def __init__(out self):
         self.runs = List[KVRun]()
+        self.base_rows = List[Int32]()
 
     def clear(mut self):
         self.runs.clear()
+        self.base_rows.clear()
+
+    def begin_run(mut self, buf_start: Int, base_pos: Int):
+        self.runs.append(KVRun(
+            Int32(buf_start), Int32(base_pos),
+            Int32(len(self.base_rows)), Int32(0)))
+
+    def add_base_row(mut self, row: Int32):
+        self.base_rows.append(row)
+        self.runs[len(self.runs) - 1].page_count += 1
+
+    @always_inline
+    def row_ptr(self, run_idx: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
+        return UnsafePointer[Int32, MutAnyOrigin](
+            unsafe_from_address=Int(self.base_rows.unsafe_ptr()),
+        ) + Int(self.runs[run_idx].rows_off)
 
 
 @fieldwise_init
 struct RunSplitBand(Copyable, ImplicitlyCopyable):
-    """One decode run's claim on the per-rank partial-stripe pool. A "split" is
-    one worker's contiguous KV sub-range producing one flash partial; this run
-    owns stripes `[split_base, split_base + n_splits)`, finalized into output
-    token row `buf_start`. `n_splits == 0` means the run contributes nothing on
-    this rank (e.g. full attention where the rank owns no KV for the run)."""
     var buf_start: Int
     var split_base: Int
     var n_splits: Int
@@ -102,13 +100,6 @@ def plan_run_splits(
     cap: Int,
     min_split: Int,
 ) -> List[RunSplitBand]:
-    """Apportion up to `cap` splits across runs on one rank. Each run with
-    `kv_len > 0` gets at least one split and at most `ceil(kv_len / min_split)`
-    (no sub-`min_split` splits); the remaining budget is handed out greedily to
-    whichever run currently carries the most KV per split, which minimizes the
-    largest single-split scan. `split_base` is the prefix sum of `n_splits`, so
-    the bands tile the partial-stripe pool with no overlap. Pure orchestrator
-    arithmetic: O(cap * num_runs), run once per rank before dispatch."""
     var num_runs = len(kv_lens)
     var bands = List[RunSplitBand](capacity=num_runs)
     var max_splits = List[Int](capacity=num_runs)

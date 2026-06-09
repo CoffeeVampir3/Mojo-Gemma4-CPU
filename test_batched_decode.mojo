@@ -1,10 +1,9 @@
-from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
 
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from kernels.attention_ops import KVRun, KVRunTable, flash_partial_stride
+from kernels.attention_ops import KVRunTable, flash_partial_stride
 from kernels.attention_dispatch_kernels import (
     dispatch_sliding_attention, dispatch_full_attention,
 )
@@ -143,10 +142,9 @@ def run_sliding[P: BurstThreadPool, //](
     # Reference: each run alone through the single-run (seq_len == 1) path.
     for i in range(B):
         var rt = KVRunTable()
-        var run = KVRun(0, positions[i])
-        run.base_rows.append(Int32(i * S_SLAB))
-        run.base_rows.append(Int32(i * S_SLAB + S_PAGE))
-        rt.runs.append(run^)
+        rt.begin_run(0, positions[i])
+        rt.add_base_row(Int32(i * S_SLAB))
+        rt.add_base_row(Int32(i * S_SLAB + S_PAGE))
         var runs = UnsafePointer(to=rt)
         var q_i = view.bind(q_ptr + i * S_QSTRIDE)
         var out_i = view.bind(ref_ptr + i * S_QSTRIDE)
@@ -159,10 +157,9 @@ def run_sliding[P: BurstThreadPool, //](
     # Under test: all runs packed, the batched-split path.
     var bt = KVRunTable()
     for i in range(B):
-        var run = KVRun(i, positions[i])
-        run.base_rows.append(Int32(i * S_SLAB))
-        run.base_rows.append(Int32(i * S_SLAB + S_PAGE))
-        bt.runs.append(run^)
+        bt.begin_run(i, positions[i])
+        bt.add_base_row(Int32(i * S_SLAB))
+        bt.add_base_row(Int32(i * S_SLAB + S_PAGE))
     var bruns = UnsafePointer(to=bt)
     dispatch_sliding_attention[
         head_dim=S_HEAD_DIM, max_q=S_NUM_Q, gqa_ratio=S_GQA,
@@ -213,9 +210,8 @@ def run_full[P: BurstThreadPool, //](
 
     for i in range(B):
         var rt = KVRunTable()
-        var run = KVRun(0, positions[i])
-        run.base_rows.append(Int32(i * F_SLAB))
-        rt.runs.append(run^)
+        rt.begin_run(0, positions[i])
+        rt.add_base_row(Int32(i * F_SLAB))
         var runs = UnsafePointer(to=rt)
         var q_i = view.bind(q_ptr + i * F_QSTRIDE)
         var out_i = view.bind(ref_ptr + i * out_stride)
@@ -227,9 +223,8 @@ def run_full[P: BurstThreadPool, //](
 
     var bt = KVRunTable()
     for i in range(B):
-        var run = KVRun(i, positions[i])
-        run.base_rows.append(Int32(i * F_SLAB))
-        bt.runs.append(run^)
+        bt.begin_run(i, positions[i])
+        bt.add_base_row(Int32(i * F_SLAB))
     var bruns = UnsafePointer(to=bt)
     dispatch_full_attention[
         head_dim=F_HEAD_DIM, num_q=F_NUM_Q, gqa_ratio=F_GQA,

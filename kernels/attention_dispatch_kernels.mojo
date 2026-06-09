@@ -332,7 +332,7 @@ def dispatch_sliding_attention[
     @parameter
     def make_decode(r: Int, start_pos: Int) -> DecodeK:
         var kv = PagedKV(
-            runs[].runs[0].base_rows.unsafe_ptr(),
+            runs[].row_ptr(0),
             page_shift, row_mask, page_mask)
         return DecodeK(kv, q[r], k_base[r], v_base[r], partials[r],
                        nq, ps, ks, 0, start_pos, 0, 0)
@@ -345,7 +345,7 @@ def dispatch_sliding_attention[
     @parameter
     def make_decode_run(r: Int, run_idx: Int, start_pos: Int) -> DecodeK:
         var kv = PagedKV(
-            runs[].runs[run_idx].base_rows.unsafe_ptr(),
+            runs[].row_ptr(run_idx),
             page_shift, row_mask, page_mask)
         var q_off = Int(runs[].runs[run_idx].buf_start) * nq * head_dim
         return DecodeK(kv, q[r] + q_off, k_base[r], v_base[r], partials[r],
@@ -396,7 +396,7 @@ def dispatch_full_attention[
     @parameter
     def make_decode(r: Int) -> DecodeK:
         var kv = PagedKV(
-            runs[].runs[0].base_rows.unsafe_ptr(), page_shift, row_mask, -1)
+            runs[].row_ptr(0), page_shift, row_mask, -1)
         return DecodeK(kv, q[r], k_base[r], v_base[r], partials[r],
                        num_q, partial_stride, kv_stride, 0, 0, 0, 0)
 
@@ -408,7 +408,7 @@ def dispatch_full_attention[
     @parameter
     def make_decode_run(r: Int, run_idx: Int) -> DecodeK:
         var kv = PagedKV(
-            runs[].runs[run_idx].base_rows.unsafe_ptr(),
+            runs[].row_ptr(run_idx),
             page_shift, row_mask, -1)
         var q_off = Int(runs[].runs[run_idx].buf_start) * num_q * head_dim
         return DecodeK(kv, q[r] + q_off, k_base[r], v_base[r], partials[r],

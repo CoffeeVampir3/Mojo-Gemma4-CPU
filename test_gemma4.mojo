@@ -1,5 +1,3 @@
-from std.memory import Span
-from std.sys.info import simd_width_of
 from std.pathlib import Path
 from std.time import perf_counter_ns
 
@@ -8,15 +6,17 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
-from modeling.gemma4_common import Gemma4BaseConfig
 from modeling.gemma_4_moe import Gemma4
-from modeling.temporal_scratch import TemporalLogitsView
+from modeling.gemma4_common import Gemma4BaseConfig
+from kernels.flash_sample import SamplingParams
+from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
+from continuous_batching.scheduler import ContinuousBatchScheduler
 
 
 comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B"
-comptime VOCAB = Gemma4BaseConfig.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 128
+comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime BOS_TOKEN_ID = 2
 comptime EOS_TOKEN_ID = 1
 
@@ -34,32 +34,26 @@ def tokens_per_second(token_count: Int, elapsed_ms: Int) -> Int:
 def encode_prompt(
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     prompt: String,
-) -> List[Int]:
-    var token_ids = List[Int]()
-    token_ids.append(BOS_TOKEN_ID)
+) -> List[Int32]:
+    var token_ids = List[Int32]()
+    token_ids.append(Int32(BOS_TOKEN_ID))
     var encoded = tok.encode(prompt)
     for i in range(len(encoded)):
-        token_ids.append(encoded[i])
+        token_ids.append(Int32(encoded[i]))
     return token_ids^
 
 
-def int32_tokens(read token_ids: List[Int]) -> List[Int32]:
-    var out = List[Int32](capacity=len(token_ids))
-    for i in range(len(token_ids)):
-        out.append(Int32(token_ids[i]))
-    return out^
+def decode_int32(
+    mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
+    read ids: List[Int32],
+) -> String:
+    var as_int = List[Int](capacity=len(ids))
+    for i in range(len(ids)):
+        as_int.append(Int(ids[i]))
+    return tok.decode(as_int)
 
 
-def merged_ids(read prompt_ids: List[Int], read generated_ids: List[Int]) -> List[Int]:
-    var out = List[Int](capacity=len(prompt_ids) + len(generated_ids))
-    for i in range(len(prompt_ids)):
-        out.append(prompt_ids[i])
-    for i in range(len(generated_ids)):
-        out.append(generated_ids[i])
-    return out^
-
-
-def print_prompt(prompt: String, read token_ids: List[Int]):
+def print_prompt(prompt: String, read token_ids: List[Int32]):
     var prompt_repr = repr(prompt)
     print(t"prompt: {prompt_repr}")
     var n_tokens = len(token_ids)
@@ -69,33 +63,13 @@ def print_prompt(prompt: String, read token_ids: List[Int]):
     print()
 
 
-def greedy_next_token(
-    read view: TemporalLogitsView[VOCAB],
-) -> Int:
-    comptime width = simd_width_of[DType.float32]()
-    var best_val: Float32 = -1e30
-    var best_idx = 0
-
-    for j in range(0, VOCAB, width):
-        var values = view.load_f32[width](j)
-        var local_best = values.reduce_max()[0]
-        if local_best > best_val:
-            best_val = local_best
-            for k in range(width):
-                if values[k] == local_best:
-                    best_idx = j + k
-                    break
-
-    return best_idx
-
-
 def load_and_run[
     P: BurstThreadPool, //,
 ](
     topo: NumaTopology,
     var pools: List[P],
-    read tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
-    read token_ids: List[Int],
+    mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
+    read token_ids: List[Int32],
 ):
     var t0 = perf_counter_ns()
     var model_opt = Gemma4[profile=True, Pool=P].load(
@@ -107,58 +81,46 @@ def load_and_run[
     print(t"model loaded in {load_ms} ms")
     print()
 
-    var seq = model.admit_sequence()
-    if seq < 0:
-        print("sequence admission failed")
-        return
+    var greedy = SamplingParams(
+        Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
+    var sched = ContinuousBatchScheduler[
+        Gemma4[profile=True, Pool=P].POSITIONS_PER_PAGE,
+    ](model.batch_geometry(), STEP_BUDGET, Int32(EOS_TOKEN_ID))
+
+    var prompt_tokens = List[Int32](capacity=len(token_ids))
+    for i in range(len(token_ids)):
+        prompt_tokens.append(token_ids[i])
+    var request_id = sched.submit(prompt_tokens^, greedy, MAX_NEW_TOKENS)
 
     var prompt_len = len(token_ids)
-
-    var tok_buf = int32_tokens(token_ids)
-    var step_buf = List[Int32](capacity=1)
-    step_buf.append(0)
-
-    var generated = List[Int]()
-    var next_id = 0
-    var pos = 0
+    var t1 = perf_counter_ns()
     var prefill_ms = 0
+    while len(sched.requests[request_id].generated) == 0:
+        if sched.step(model) == 0:
+            print("scheduler stalled during prefill")
+            return
+        prefill_ms = elapsed_ms_since(t1)
+    model.profiler.report("prefill")
+    model.profiler.reset()
+
     var decode_start = perf_counter_ns()
-
-    while len(generated) < MAX_NEW_TOKENS:
-        var logits: TemporalLogitsView[VOCAB]
-        if pos == 0:
-            var t1 = perf_counter_ns()
-            logits = model.forward(seq, Span(tok_buf), 0)
-            prefill_ms = elapsed_ms_since(t1)
-            pos = prompt_len
-            model.profiler.report("prefill")
-            model.profiler.reset()
-            decode_start = perf_counter_ns()
-        else:
-            step_buf[0] = Int32(next_id)
-            logits = model.forward(seq, Span(step_buf), pos)
-            pos += 1
-
-        next_id = greedy_next_token(logits)
-        generated.append(next_id)
-
-        if next_id == EOS_TOKEN_ID:
-            break
-
+    while sched.pending_work():
+        if sched.step(model) == 0:
+            print("scheduler stalled during decode")
+            return
     model.profiler.report("decode")
 
     var prefill_tps = tokens_per_second(prompt_len, prefill_ms)
     print(t"prompt  | {prompt_len} tokens | {prefill_ms} ms | {prefill_tps} t/s")
 
     var decode_elapsed_ms = elapsed_ms_since(decode_start)
-    var decode_tokens = len(generated) - 1
+    var decode_tokens = len(sched.requests[request_id].generated) - 1
     var decode_tps = tokens_per_second(decode_tokens, decode_elapsed_ms)
     print(t"decode  | {decode_tokens} tokens | {decode_elapsed_ms} ms | {decode_tps} t/s")
 
-    var all_ids = merged_ids(token_ids, generated)
-    var full_text = tok.decode(all_ids)
+    var n_generated = len(sched.requests[request_id].generated)
+    var full_text = decode_int32(tok, sched.requests[request_id].tokens)
     print()
-    var n_generated = len(generated)
     print(t"=== generated {n_generated} tokens ===")
     print(full_text)
 

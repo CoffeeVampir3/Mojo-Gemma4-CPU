@@ -242,12 +242,6 @@ struct Gemma4Layout[max_seq_len: Int](Copyable, ImplicitlyCopyable):
 
     var tail: Repeated[TailRefs]
 
-    @always_inline
-    def bind(self, base: Int) -> Self:
-        var t = self
-        t.arena = t.arena.bind(base)
-        return t
-
 
 comptime SLIDING_NUM_Q_MAX = C.Q_DIM_SLIDING // C.HEAD_DIM_SLIDING
 comptime SLIDING_PARTIAL_STRIDE_MAX = flash_partial_stride(
@@ -551,7 +545,6 @@ def build_gemma4_plan[
     state_cursor = stamp_offsets(full_rope, degree, state_cursor)
 
     var arena = ArenaLayout(
-        base=0,
         distributed_bytes=distributed,
         state_bytes=state_cursor - distributed,
         host_bytes=align_up(state_cursor),
@@ -601,8 +594,7 @@ def dispatch_bq_sliding_attention_qkv[
         "sliding attention chunk exceeds SLIDING_WINDOW",
     )
 
-    var attn_ctx = ctx.with_layer(
-        layout.sliding.base(ctx.view.bases[0], layer_idx))
+    var attn_ctx = ctx.with_layer(layout.sliding.base(layer_idx))
     var attn = layout.sliding.proto.attn
 
     var q_outs = scratch.binding[Gemma4SlidingScratch, "q"](ctx, plan)
@@ -623,11 +615,11 @@ def dispatch_bq_sliding_attention_qkv[
     var qi_bias = scratch.binding[Gemma4SlidingScratch, "qi_bias"](ctx, plan)
     var f_q = scratch.binding[Gemma4SlidingScratch, "f_q"](ctx, plan)
 
-    var kv_lb = layout.sliding_kv.base(ctx.view.bases[0], layer_idx)
-    var k_cache = layout.sliding_kv.proto.k.binding(kv_lb, ctx.view)
-    var k_scale = layout.sliding_kv.proto.k_scale.binding(kv_lb, ctx.view)
-    var v_cache = layout.sliding_kv.proto.v.binding(kv_lb, ctx.view)
-    var v_scale = layout.sliding_kv.proto.v_scale.binding(kv_lb, ctx.view)
+    var kv_ctx = ctx.with_layer(layout.sliding_kv.base(layer_idx))
+    var k_cache = layout.sliding_kv.proto.k.binding(kv_ctx)
+    var k_scale = layout.sliding_kv.proto.k_scale.binding(kv_ctx)
+    var v_cache = layout.sliding_kv.proto.v.binding(kv_ctx)
+    var v_scale = layout.sliding_kv.proto.v_scale.binding(kv_ctx)
 
     dispatch_bq_attn_prep[
         head_dim=head_dim, rope_half=rope_half, pair_stride=head_dim // 2,
@@ -697,8 +689,7 @@ def dispatch_bq_full_attention_qkv[
     var local_q_rows = Gemma4Shapes.FullO.data_m(degree)
     var local_num_q_heads = local_q_rows // head_dim
 
-    var attn_ctx = ctx.with_layer(
-        layout.full.base(ctx.view.bases[0], layer_idx))
+    var attn_ctx = ctx.with_layer(layout.full.base(layer_idx))
     var attn = layout.full.proto.attn
 
     var q_outs = scratch.binding[Gemma4FullScratch, "q"](ctx, plan)
@@ -713,11 +704,11 @@ def dispatch_bq_full_attention_qkv[
     var qi_bias = scratch.binding[Gemma4FullScratch, "qi_bias"](ctx, plan)
     var f_q = scratch.binding[Gemma4FullScratch, "f_q"](ctx, plan)
 
-    var kv_lb = layout.full_kv.base(ctx.view.bases[0], layer_idx)
-    var k_cache = layout.full_kv.proto.k.binding(kv_lb, ctx.view)
-    var k_scale = layout.full_kv.proto.k_scale.binding(kv_lb, ctx.view)
-    var v_cache = layout.full_kv.proto.v.binding(kv_lb, ctx.view)
-    var v_scale = layout.full_kv.proto.v_scale.binding(kv_lb, ctx.view)
+    var kv_ctx = ctx.with_layer(layout.full_kv.base(layer_idx))
+    var k_cache = layout.full_kv.proto.k.binding(kv_ctx)
+    var k_scale = layout.full_kv.proto.k_scale.binding(kv_ctx)
+    var v_cache = layout.full_kv.proto.v.binding(kv_ctx)
+    var v_scale = layout.full_kv.proto.v_scale.binding(kv_ctx)
 
     dispatch_bq_attn_prep[
         head_dim=head_dim, rope_half=rope_half, pair_stride=pair_stride,
@@ -865,7 +856,7 @@ def dispatch_bq_ffn[
     comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
     var intermediate_per_rank = Gemma4Shapes.GateUp.data_n(degree)
 
-    var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_base)
+    var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_address())
 
     var dense_x_i8 = scratch.binding[Gemma4FfnMoeScratch, "dense_x_i8"](ctx, plan)
     var dense_x_sa = scratch.binding[Gemma4FfnMoeScratch, "dense_x_sa"](ctx, plan)
@@ -966,10 +957,10 @@ struct Gemma4[
         self.arena_bases = List[Int]()
         for r in range(degree):
             self.arena_bases.append(Int(arenas[r].base.value()))
-        self.layout = layout.bind(self.arena_bases[0])
+        self.layout = layout
         self.arenas = arenas^
         self.pools = pools^
-        self.scratch = TemporalScratchPool(self.layout.arena.scratch_base())
+        self.scratch = TemporalScratchPool(self.layout.arena.scratch_off)
         self.sliding_plan = derive_scratch_plan[Gemma4SlidingScratch](degree, max_workers)
         self.full_plan = derive_scratch_plan[Gemma4FullScratch](degree, max_workers)
         self.ffn_plan = derive_scratch_plan[Gemma4FfnMoeScratch](degree, max_workers)
@@ -1002,15 +993,14 @@ struct Gemma4[
             var entry = LAYER_SCHEDULE[i]
             if entry.kind == LayerKind.FULL:
                 _ = emit_pack_tasks[FullLayerRefs](
-                    self.layout.full.off
-                    + entry.local_idx * self.layout.full.stride,
+                    self.layout.full.base(entry.local_idx),
                     self.degree, tasks)
             else:
                 _ = emit_pack_tasks[SlidingLayerRefs](
-                    self.layout.sliding.off
-                    + entry.local_idx * self.layout.sliding.stride,
+                    self.layout.sliding.base(entry.local_idx),
                     self.degree, tasks)
-        _ = emit_pack_tasks[TailRefs](self.layout.tail.off, self.degree, tasks)
+        _ = emit_pack_tasks[TailRefs](
+            self.layout.tail.base(0), self.degree, tasks)
 
         var nodes = List[Int]()
         for r in range(self.degree):
@@ -1039,14 +1029,14 @@ struct Gemma4[
             for i in range(C.NUM_LAYERS):
                 var entry = LAYER_SCHEDULE[i]
                 if entry.kind == LayerKind.FULL:
-                    var lb = layout.full.base(base, entry.local_idx)
+                    var lb = base + layout.full.base(entry.local_idx)
                     ref fbody = layout.full.proto.body
                     bake_split_gain_in_place(fbody.input_norm.at(lb), C.HIDDEN)
                     bake_split_gain_in_place(fbody.pre_ffn_norm.at(lb), C.HIDDEN)
                     bake_split_gain_in_place(fbody.pre_ffn_norm_2.at(lb), C.HIDDEN)
                     bake_router_scale(fbody.router_scale.at(lb))
                 else:
-                    var lb = layout.sliding.base(base, entry.local_idx)
+                    var lb = base + layout.sliding.base(entry.local_idx)
                     ref sbody = layout.sliding.proto.body
                     bake_split_gain_in_place(sbody.input_norm.at(lb), C.HIDDEN)
                     bake_split_gain_in_place(sbody.pre_ffn_norm.at(lb), C.HIDDEN)
@@ -1093,8 +1083,7 @@ struct Gemma4[
         )
 
         var ctx = BindContext(RankView(Span(self.arena_bases)), 0)
-        var tail_ctx = ctx.with_layer(
-            layout.tail.base(self.arena_bases[0], 0))
+        var tail_ctx = ctx.with_layer(layout.tail.base(0))
 
         var x_main_ranks = layout.activations.x_main.state_binding(ctx)
         var xs = layout.activations.x_residual.state_binding(ctx)
@@ -1130,11 +1119,10 @@ struct Gemma4[
                 var lb: Int
                 var body: BodyRefs
                 if entry.kind == LayerKind.FULL:
-                    lb = layout.full.base(self.arena_bases[0], entry.local_idx)
+                    lb = layout.full.base(entry.local_idx)
                     body = layout.full.proto.body
                 else:
-                    lb = layout.sliding.base(
-                        self.arena_bases[0], entry.local_idx)
+                    lb = layout.sliding.base(entry.local_idx)
                     body = layout.sliding.proto.body
                 var layer_ctx = ctx.with_layer(lb)
 

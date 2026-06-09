@@ -82,7 +82,7 @@ struct RopeCacheWriteKernel[
         var num_runs = len(run_list)
         var r = 0
         var kv = PagedKV(
-            run_list[0].base_rows.unsafe_ptr(),
+            self.runs[].row_ptr(0),
             self.page_shift, self.row_mask, self.page_mask)
         var run_start = Int(run_list[0].buf_start)
         var run_pos = Int(run_list[0].base_pos)
@@ -90,7 +90,7 @@ struct RopeCacheWriteKernel[
             while r + 1 < num_runs and tok >= Int(run_list[r + 1].buf_start):
                 r += 1
                 kv = PagedKV(
-                    run_list[r].base_rows.unsafe_ptr(),
+                    self.runs[].row_ptr(r),
                     self.page_shift, self.row_mask, self.page_mask)
                 run_start = Int(run_list[r].buf_start)
                 run_pos = Int(run_list[r].base_pos)

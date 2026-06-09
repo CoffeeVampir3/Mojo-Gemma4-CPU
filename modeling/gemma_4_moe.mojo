@@ -14,7 +14,10 @@ from kernels.reductions import dispatch_allreduce_inplace
 from kernels.embedding import dispatch_embed_lookup
 from kernels.rmsnorm import dispatch_rms_norm, dispatch_rms_norm_qkv_heads
 from kernels.rmsnorm import fused_norm_residual_add
-from kernels.gemv import dispatch_gemv_softcap
+from kernels.flash_sample import (
+    SamplingParams, SampleAccum, SampleOutcome, dispatch_flash_sample,
+)
+from kernels.gather import dispatch_gather_rows
 from kernels.gemm import dispatch_gemm, dispatch_gemm_cols, dispatch_gemm_chained_qkv
 from kernels.rope import dispatch_rope_cache_write
 from kernels.attention_ops import flash_partial_stride
@@ -34,7 +37,7 @@ from kernels.elementwise import dispatch_gelu_gate_up, dispatch_scalar_mul
 from kernels.profiling import Profiler
 from modeling.temporal_scratch import (
     ScratchBuffer, ScratchIsland, ScratchPhase, ScratchPhaseOrder, ScaleClass,
-    TemporalLogitsView, TemporalScratchPool, ScratchPlan,
+    TemporalScratchPool, ScratchPlan,
     derive_scratch_plan, aggregate_scratch_peak, co_live_buffers_overlap,
 )
 
@@ -56,19 +59,26 @@ from modeling.modeling_common import (
 from modeling.slot import (
     Slot, SlotGroup, BindContext, stamp_offsets, emit_descs,
 )
-from modeling.kv_runtime import KVRuntime
 from modeling.loader import discover_shards, load_weights_from_descs
+from continuous_batching.schedule import (
+    Schedule, ScheduledModel, MAXIMUM_SAMPLING_LOGITS,
+)
+from continuous_batching.paging import (
+    KVPageAccountant, BatchGeometry, PagePoolSpec,
+)
 
 
 comptime C = Gemma4BaseConfig
 comptime MAX_WORKERS = 128
 comptime PAGE_LEN = C.SLIDING_WINDOW
+comptime CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM = 32
+comptime SLIDING_POOL = 0
+comptime FULL_POOL = 1
+comptime SLIDING_RING_PAGES = 2
 
 
 @always_inline
 def degree_contracts_ok(degree: Int) -> Bool:
-    """Runtime divisibility checks; the model is allocated once at the deployed
-    degree (= NUMA-domain count)."""
     return (
         degree > 0
         and C.NUM_HEADS % degree == 0
@@ -86,9 +96,6 @@ def degree_contracts_ok(degree: Int) -> Bool:
 def paging_contracts_ok[
     max_seq_len: Int, batching_seq_len: Int,
 ](degree: Int) -> Bool:
-    """Page geometry contracts: pages split evenly across ranks with a
-    power-of-two per-rank row count (slot resolution is shift/mask), the
-    pools hold whole sliding rings, and one sequence can always fit."""
     var rows_per_page = PAGE_LEN // degree
     return (
         PAGE_LEN % degree == 0
@@ -119,11 +126,6 @@ struct Gemma4Shapes:
 
 
 struct Gemma4StateShapes[max_seq_len: Int, batching_seq_len: Int]:
-    """Per-token state tensors. KV caches shard with the runtime degree; rope
-    tables are replicated per rank (most-frequent reader is every attention
-    worker on every token). Both KV bricks hold `batching_seq_len` positions of
-    pool capacity carved into PAGE_LEN pages; rope tables stay at the logical
-    per-sequence `max_seq_len`."""
     comptime SlidingKV   = TensorColumnSharded[Self.batching_seq_len, C.KV_DIM_SLIDING]
     comptime FullKV      = ContextRowSharded[Self.batching_seq_len, C.KV_DIM_FULL]
     comptime SlidingRope = Replicated[Self.max_seq_len, C.ROPE_HALF_SLIDING]
@@ -229,12 +231,6 @@ struct Gemma4Layout[max_seq_len: Int, batching_seq_len: Int](Copyable, Implicitl
     var full_rope: RopeSlots[C.ROPE_HALF_FULL, Self.max_seq_len]
 
     var tail: Repeated[TailRefs]
-
-    @always_inline
-    def bind(self, base: Int) -> Self:
-        var t = self
-        t.arena = t.arena.bind(base)
-        return t
 
 
 comptime SLIDING_NUM_Q_MAX = C.Q_DIM_SLIDING // C.HEAD_DIM_SLIDING
@@ -352,10 +348,29 @@ struct Gemma4FfnMoeScratch(ScratchIsland, Copyable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Gemma4HeadScratch(ScratchIsland, Copyable, ImplicitlyCopyable):
-    comptime PHASES = ScratchPhaseOrder["logits"]
+    comptime PHASES = ScratchPhaseOrder["sample"]
 
-    var logits_band: ScratchPhase["logits", "logits"]
-    var logits: ScratchBuffer[BFloat16, C.VOCAB_SIZE, ScaleClass.PER_DEGREE]
+    var sample_band: ScratchPhase["sample", "sample"]
+    var accums: ScratchBuffer[
+        SampleAccum[MAXIMUM_SAMPLING_LOGITS],
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.PER_WORKER,
+    ]
+    var head_x: ScratchBuffer[
+        BFloat16,
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM * C.HIDDEN, ScaleClass.FIXED,
+    ]
+    var emit_rows: ScratchBuffer[
+        Int32,
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.FIXED,
+    ]
+    var sample_params: ScratchBuffer[
+        SamplingParams,
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.FIXED,
+    ]
+    var outcome: ScratchBuffer[
+        SampleOutcome[MAXIMUM_SAMPLING_LOGITS],
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.FIXED,
+    ]
 
 
 @fieldwise_init
@@ -439,7 +454,6 @@ def build_gemma4_plan[
     state_cursor = stamp_offsets(full_rope, degree, state_cursor)
 
     var arena = ArenaLayout(
-        base=0,
         distributed_bytes=distributed,
         state_bytes=state_cursor - distributed,
         host_bytes=align_up(state_cursor),
@@ -469,9 +483,6 @@ def dispatch_sliding_attention_qkv[
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
-    """Sliding-window attention for `seq_len` Q-tokens described by `runs`.
-    Caller keeps each run `<= SLIDING_WINDOW` so a run's KV writes land in
-    one half of its 2-page ring and the prior chunk stays addressable."""
     var degree = ctx.degree()
     comptime head_dim = C.HEAD_DIM_SLIDING
     comptime gqa_ratio = C.NUM_HEADS // C.NUM_KV_HEADS_SLIDING
@@ -491,7 +502,7 @@ def dispatch_sliding_attention_qkv[
         "sliding attention chunk exceeds SLIDING_WINDOW",
     )
 
-    var attn_ctx = ctx.with_layer(layout.sliding.base(ctx.view.bases[0], layer_idx))
+    var attn_ctx = ctx.with_layer(layout.sliding.base(layer_idx))
     var attn = layout.sliding.proto.attn
 
     var q_outs = scratch.binding[Gemma4SlidingScratch, "q"](ctx, plan)
@@ -515,9 +526,9 @@ def dispatch_sliding_attention_qkv[
       attn.k_norm.binding(attn_ctx),
       num_q_heads, num_kv_heads, seq_len, pools, prof)
 
-    var kv_lb = layout.sliding_kv.base(ctx.view.bases[0], layer_idx)
-    var k_kv = layout.sliding_kv.proto.k.binding(kv_lb, ctx.view)
-    var v_kv = layout.sliding_kv.proto.v.binding(kv_lb, ctx.view)
+    var kv_ctx = ctx.with_layer(layout.sliding_kv.base(layer_idx))
+    var k_kv = layout.sliding_kv.proto.k.binding(kv_ctx)
+    var v_kv = layout.sliding_kv.proto.v.binding(kv_ctx)
 
     comptime page_shift = pow2_shift(PAGE_LEN)
     comptime row_mask = PAGE_LEN - 1
@@ -565,8 +576,6 @@ def dispatch_full_attention_qkv[
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
-    """Full attention. Q/K are replicated (head counts comptime); the context
-    shard `degree` and the column-sharded o_proj are runtime."""
     var degree = ctx.degree()
     comptime head_dim = C.HEAD_DIM_FULL
     comptime q_rows = C.Q_DIM_FULL
@@ -582,7 +591,7 @@ def dispatch_full_attention_qkv[
     var local_q_rows = Gemma4Shapes.FullO.data_m(degree)
     var local_num_q_heads = local_q_rows // head_dim
 
-    var attn_ctx = ctx.with_layer(layout.full.base(ctx.view.bases[0], layer_idx))
+    var attn_ctx = ctx.with_layer(layout.full.base(layer_idx))
     var attn = layout.full.proto.attn
 
     var q_outs = scratch.binding[Gemma4FullScratch, "q"](ctx, plan)
@@ -606,9 +615,9 @@ def dispatch_full_attention_qkv[
       attn.k_norm.binding(attn_ctx),
       num_q_heads, num_kv_heads, seq_len, pools, prof)
 
-    var kv_lb = layout.full_kv.base(ctx.view.bases[0], layer_idx)
-    var k_kv = layout.full_kv.proto.k.binding(kv_lb, ctx.view)
-    var v_kv = layout.full_kv.proto.v.binding(kv_lb, ctx.view)
+    var kv_ctx = ctx.with_layer(layout.full_kv.base(layer_idx))
+    var k_kv = layout.full_kv.proto.k.binding(kv_ctx)
+    var v_kv = layout.full_kv.proto.v.binding(kv_ctx)
 
     var rows_per_page = PAGE_LEN // degree
     var page_shift = pow2_shift(rows_per_page)
@@ -741,7 +750,7 @@ def dispatch_ffn[
     comptime n_eps = C.HIDDEN * C.RMS_NORM_EPS
     var intermediate_per_rank = Gemma4Shapes.GateUp.data_n(degree)
 
-    var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_base)
+    var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_address())
 
     var gate = scratch.binding[Gemma4FfnMoeScratch, "ffn_gate"](ctx, plan)
     var up = scratch.binding[Gemma4FfnMoeScratch, "ffn_up"](ctx, plan)
@@ -805,18 +814,21 @@ struct Gemma4[
     batching_seq_len: Int = 8192,
     Pool: BurstThreadPool = BurstPool[],
     profile: Bool = False, profile_slots: Int = 64,
-](Movable):
+](Movable, ScheduledModel):
+    comptime POSITIONS_PER_PAGE = PAGE_LEN
+
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
     var layout: Gemma4Layout[Self.max_seq_len, Self.batching_seq_len]
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
     var degree: Int
-    var kv: KVRuntime
     var sliding_plan: ScratchPlan
     var full_plan: ScratchPlan
     var ffn_plan: ScratchPlan
     var head_plan: ScratchPlan
+    var sliding_runs: KVRunTable
+    var full_runs: KVRunTable
     var profiler: Profiler[Self.profile, Self.profile_slots]
 
     def __init__(out self,
@@ -830,15 +842,10 @@ struct Gemma4[
         self.arena_bases = List[Int]()
         for r in range(degree):
             self.arena_bases.append(Int(arenas[r].base.value()))
-        self.layout = layout.bind(self.arena_bases[0])
+        self.layout = layout
         self.arenas = arenas^
         self.pools = pools^
-        self.kv = KVRuntime(
-            PAGE_LEN, degree,
-            Self.batching_seq_len // PAGE_LEN,
-            Self.batching_seq_len // (2 * C.SLIDING_WINDOW),
-            Self.max_seq_len // PAGE_LEN)
-        self.scratch = TemporalScratchPool(self.layout.arena.scratch_base())
+        self.scratch = TemporalScratchPool(self.layout.arena.scratch_off)
         self.sliding_plan = derive_scratch_plan[Gemma4SlidingScratch](degree, max_workers)
         self.full_plan = derive_scratch_plan[Gemma4FullScratch](degree, max_workers)
         self.ffn_plan = derive_scratch_plan[Gemma4FfnMoeScratch](degree, max_workers)
@@ -863,6 +870,8 @@ struct Gemma4[
                 self.head_plan, degree, max_workers),
             "head scratch plan overlaps co-live buffers",
         )
+        self.sliding_runs = KVRunTable()
+        self.full_runs = KVRunTable()
         self.profiler = Profiler[Self.profile, Self.profile_slots]()
 
     def model_init(mut self):
@@ -878,10 +887,10 @@ struct Gemma4[
                 var entry = LAYER_SCHEDULE[i]
                 var p: UnsafePointer[BFloat16, MutAnyOrigin]
                 if entry.kind == LayerKind.FULL:
-                    var lb = layout.full.base(arena_base, entry.local_idx)
+                    var lb = arena_base + layout.full.base(entry.local_idx)
                     p = layout.full.proto.body.router_scale.at(lb)
                 else:
-                    var lb = layout.sliding.base(arena_base, entry.local_idx)
+                    var lb = arena_base + layout.sliding.base(entry.local_idx)
                     p = layout.sliding.proto.body.router_scale.at(lb)
                 for j in range(0, C.HIDDEN, width):
                     var lane = p + j
@@ -903,20 +912,53 @@ struct Gemma4[
             ](fl_cos, fl_sin, 1000000.0, C.HEAD_DIM_FULL, 0, 1)
         print("  rope tables initialized")
 
-    def admit_sequence(mut self) -> Int:
-        return self.kv.admit()
+    def batch_geometry(self) -> BatchGeometry:
+        var max_seqs = Self.batching_seq_len // (SLIDING_RING_PAGES * PAGE_LEN)
+        var pools = List[PagePoolSpec]()
+        pools.append(PagePoolSpec(
+            num_pages=max_seqs * SLIDING_RING_PAGES,
+            fixed_pages_per_seq=SLIDING_RING_PAGES,
+            max_pages_per_seq=SLIDING_RING_PAGES))
+        pools.append(PagePoolSpec(
+            num_pages=Self.batching_seq_len // PAGE_LEN,
+            fixed_pages_per_seq=0,
+            max_pages_per_seq=Self.max_seq_len // PAGE_LEN))
+        return BatchGeometry(
+            max_seqs=max_seqs,
+            max_slots=CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM,
+            max_step_tokens=C.SLIDING_WINDOW,
+            pools=pools^)
 
-    def release_sequence(mut self, seq_id: Int):
-        self.kv.release(seq_id)
+    def bind_step_runs(
+        mut self, read schedule: Schedule, read pages: KVPageAccountant,
+    ):
+        var rows_per_page = PAGE_LEN // self.degree
+        self.sliding_runs.clear()
+        self.full_runs.clear()
+        var buf_start = 0
+        for i in range(len(schedule.slots)):
+            var seq_id = schedule.slots[i].seq_id
+            var base_pos = schedule.slots[i].base_pos
+            var last_pos = base_pos + schedule.slots[i].n_tokens - 1
 
-    def forward[
-        tok_origin: ImmutOrigin, //,
-    ](
+            self.full_runs.begin_run(buf_start, base_pos)
+            for ordinal in range(last_pos // PAGE_LEN + 1):
+                var page = pages.page_index(FULL_POOL, seq_id, ordinal)
+                debug_assert(page >= 0, "execute: run references unmapped page")
+                self.full_runs.add_base_row(Int32(page * rows_per_page))
+
+            self.sliding_runs.begin_run(buf_start, base_pos)
+            for ordinal in range(SLIDING_RING_PAGES):
+                var page = pages.page_index(SLIDING_POOL, seq_id, ordinal)
+                self.sliding_runs.add_base_row(Int32(page * PAGE_LEN))
+
+            buf_start += schedule.slots[i].n_tokens
+
+    def execute(
         mut self,
-        seq_id: Int,
-        token_ids: Span[Int32, tok_origin],
-        base_pos: Int,
-    ) -> TemporalLogitsView[C.VOCAB_SIZE]:
+        read schedule: Schedule,
+        read pages: KVPageAccountant,
+    ) -> List[SampleOutcome[MAXIMUM_SAMPLING_LOGITS]]:
         ref layout = self.layout
         var degree = self.degree
         comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
@@ -927,122 +969,160 @@ struct Gemma4[
         var shard_rows = Gemma4TailShapes.Embed.data_n(degree)
 
         var wall_t0 = perf_counter_ns()
-        var total_len = len(token_ids)
-        debug_assert(total_len > 0, "forward called with empty token_ids")
+        var num_slots = len(schedule.slots)
+        var total = len(schedule.tokens)
+        debug_assert(num_slots > 0, "execute called with no slots")
         debug_assert(
-            base_pos + total_len <= Self.max_seq_len,
-            "forward exceeds max_seq_len",
+            num_slots <= CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM,
+            "execute slot count exceeds parallelism cap",
         )
         debug_assert(
-            seq_id >= 0 and seq_id < self.kv.max_seqs
-            and self.kv.seqs[seq_id].active,
-            "forward called with an inactive sequence id",
+            total <= C.SLIDING_WINDOW,
+            "execute packed tokens exceed SLIDING_WINDOW",
         )
 
         var ctx = BindContext(RankView(Span(self.arena_bases)), 0)
-        var tail_ctx = ctx.with_layer(
-            layout.tail.base(self.arena_bases[0], 0))
+        var tail_ctx = ctx.with_layer(layout.tail.base(0))
 
         var x_main_ranks = layout.activations.x_main.state_binding(ctx)
         var x_res_ranks = layout.activations.x_residual.state_binding(ctx)
-        var logits = self.scratch.binding[
-            Gemma4HeadScratch, "logits",
+        var accums = self.scratch.binding[
+            Gemma4HeadScratch, "accums",
+        ](ctx, self.head_plan)
+        var sample_params = self.scratch.binding[
+            Gemma4HeadScratch, "sample_params",
+        ](ctx, self.head_plan)
+        var head_x = self.scratch.binding[
+            Gemma4HeadScratch, "head_x",
+        ](ctx, self.head_plan)
+        var emit_rows = self.scratch.binding[
+            Gemma4HeadScratch, "emit_rows",
+        ](ctx, self.head_plan)
+        var outcome = self.scratch.binding[
+            Gemma4HeadScratch, "outcome",
         ](ctx, self.head_plan)
 
-        var consumed = 0
-        var pos = base_pos
-        while consumed < total_len:
-            var remaining = total_len - consumed
-            var chunk_len = remaining if remaining < C.SLIDING_WINDOW else C.SLIDING_WINDOW
-            var is_last = (consumed + chunk_len == total_len)
+        var buf_starts = List[Int](capacity=num_slots)
+        var buf_start = 0
+        for i in range(num_slots):
+            buf_starts.append(buf_start)
+            buf_start += schedule.slots[i].n_tokens
+        debug_assert(
+            buf_start == total,
+            "execute slot token counts must sum to len(tokens)",
+        )
+        self.bind_step_runs(schedule, pages)
+        var full_runs = UnsafePointer(to=self.full_runs)
+        var sliding_runs = UnsafePointer(to=self.sliding_runs)
 
-            var last_pos = pos + chunk_len - 1
-            if not self.kv.reserve_full(seq_id, last_pos):
-                abort(t"gemma4: full KV page pool exhausted at pos {last_pos}")
-            self.kv.begin_step()
-            self.kv.push_run(seq_id, 0, pos, last_pos)
-            self.kv.note_extent(seq_id, pos + chunk_len)
-            var full_runs = UnsafePointer(to=self.kv.full_runs)
-            var sliding_runs = UnsafePointer(to=self.kv.sliding_runs)
+        dispatch_embed_lookup[
+            hidden=C.HIDDEN, scale=embed_scale,
+        ](Span(schedule.tokens),
+          layout.tail.proto.embed.binding(tail_ctx),
+          x_main_ranks, shard_rows, total, self.pools, self.profiler)
+        dispatch_allreduce_inplace[BF16](
+            x_main_ranks, total * C.HIDDEN, self.pools, self.profiler)
 
-            var chunk = Span[Int32, tok_origin](
-                ptr=token_ids.unsafe_ptr() + consumed,
-                length=chunk_len)
+        for i in range(C.NUM_LAYERS):
+            var entry = LAYER_SCHEDULE[i]
+            var lb: Int
+            var body: BodyRefs
+            if entry.kind == LayerKind.FULL:
+                lb = layout.full.base(entry.local_idx)
+                body = layout.full.proto.body
+            else:
+                lb = layout.sliding.base(entry.local_idx)
+                body = layout.sliding.proto.body
+            var layer_ctx = ctx.with_layer(lb)
 
-            dispatch_embed_lookup[
-                hidden=C.HIDDEN, scale=embed_scale,
-            ](chunk,
-              layout.tail.proto.embed.binding(tail_ctx),
-              x_main_ranks, shard_rows, chunk_len, self.pools, self.profiler)
+            dispatch_rms_norm[
+                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+            ](x_main_ranks, x_res_ranks,
+              body.input_norm.binding(layer_ctx),
+              total, self.pools, self.profiler)
+
+            if entry.kind == LayerKind.FULL:
+                dispatch_full_attention_qkv[
+                    max_seq_len=Self.max_seq_len,
+                    batching_seq_len=Self.batching_seq_len,
+                ](
+                    layout, ctx, full_runs, total, entry.local_idx,
+                    self.scratch, self.full_plan, self.pools, self.profiler)
+            else:
+                dispatch_sliding_attention_qkv[
+                    max_seq_len=Self.max_seq_len,
+                    batching_seq_len=Self.batching_seq_len,
+                ](
+                    layout, ctx, sliding_runs, total, entry.local_idx,
+                    self.scratch, self.sliding_plan, self.pools, self.profiler)
+
             dispatch_allreduce_inplace[BF16](
-                x_main_ranks, chunk_len * C.HIDDEN, self.pools, self.profiler)
+                x_res_ranks, total * C.HIDDEN, self.pools, self.profiler)
 
-            for i in range(C.NUM_LAYERS):
-                var entry = LAYER_SCHEDULE[i]
-                var lb: Int
-                var body: BodyRefs
-                if entry.kind == LayerKind.FULL:
-                    lb = layout.full.base(self.arena_bases[0], entry.local_idx)
-                    body = layout.full.proto.body
-                else:
-                    lb = layout.sliding.base(self.arena_bases[0], entry.local_idx)
-                    body = layout.sliding.proto.body
-                var layer_ctx = ctx.with_layer(lb)
+            fused_norm_residual_add[
+                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+            ](x_res_ranks, x_main_ranks, x_main_ranks,
+              body.post_attn_norm.binding(layer_ctx),
+              total, self.pools, self.profiler)
 
-                dispatch_rms_norm[
-                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                ](x_main_ranks, x_res_ranks,
-                  body.input_norm.binding(layer_ctx),
-                  chunk_len, self.pools, self.profiler)
+            dispatch_ffn(
+                body, layer_ctx, x_main_ranks, x_res_ranks, total,
+                self.scratch, self.ffn_plan, self.pools, self.profiler)
 
-                if entry.kind == LayerKind.FULL:
-                    dispatch_full_attention_qkv[
-                        max_seq_len=Self.max_seq_len,
-                        batching_seq_len=Self.batching_seq_len,
-                    ](
-                        layout, ctx, full_runs, chunk_len, entry.local_idx,
-                        self.scratch, self.full_plan, self.pools, self.profiler)
-                else:
-                    dispatch_sliding_attention_qkv[
-                        max_seq_len=Self.max_seq_len,
-                        batching_seq_len=Self.batching_seq_len,
-                    ](
-                        layout, ctx, sliding_runs, chunk_len, entry.local_idx,
-                        self.scratch, self.sliding_plan, self.pools, self.profiler)
+        var outcomes = List[SampleOutcome[MAXIMUM_SAMPLING_LOGITS]]()
+        var emit_slots = List[Int](capacity=num_slots)
+        var emit_row = List[Int](capacity=num_slots)
+        for i in range(num_slots):
+            if schedule.slots[i].emit:
+                emit_slots.append(i)
+                emit_row.append(buf_starts[i] + schedule.slots[i].n_tokens - 1)
+        var num_emit = len(emit_slots)
 
-                dispatch_allreduce_inplace[BF16](
-                    x_res_ranks, chunk_len * C.HIDDEN, self.pools, self.profiler)
+        if num_emit > 0:
+            debug_assert(
+                num_emit <= CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM,
+                "execute emit count exceeds parallelism cap",
+            )
+            var contiguous = True
+            for j in range(num_emit):
+                if emit_row[j] != emit_row[0] + j:
+                    contiguous = False
 
-                fused_norm_residual_add[
-                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                ](x_res_ranks, x_main_ranks, x_main_ranks,
-                  body.post_attn_norm.binding(layer_ctx),
-                  chunk_len, self.pools, self.profiler)
+            for r in range(degree):
+                for j in range(num_emit):
+                    (sample_params[r] + j)[] = schedule.slots[emit_slots[j]].sampling
 
-                dispatch_ffn(
-                    body, layer_ctx, x_main_ranks, x_res_ranks, chunk_len,
-                    self.scratch, self.ffn_plan, self.pools, self.profiler)
+            var x_head = x_main_ranks
+            if contiguous:
+                x_head = x_main_ranks.shifted(emit_row[0] * C.HIDDEN)
+            else:
+                for r in range(degree):
+                    for j in range(num_emit):
+                        (emit_rows[r] + j)[] = Int32(emit_row[j])
+                dispatch_gather_rows[cols=C.HIDDEN](
+                    x_main_ranks, head_x, emit_rows, num_emit,
+                    self.pools, self.profiler)
+                x_head = head_x
 
-            if is_last:
-                var x_last = x_main_ranks.shifted((chunk_len - 1) * C.HIDDEN)
+            dispatch_rms_norm[
+                hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
+            ](x_head, x_head,
+              layout.tail.proto.final_norm.binding(tail_ctx),
+              num_emit, self.pools, self.profiler)
 
-                dispatch_rms_norm[
-                    hidden=C.HIDDEN, sqrt_n=sqrt_n, n_eps=n_eps,
-                ](x_last, x_last,
-                  layout.tail.proto.final_norm.binding(tail_ctx),
-                  1, self.pools, self.profiler)
+            var out_ptr = outcome[0]
+            dispatch_flash_sample[
+                cols=C.HIDDEN, cap=C.LOGIT_SOFTCAP,
+                n_max=MAXIMUM_SAMPLING_LOGITS,
+            ](x_head, layout.tail.proto.embed.binding(tail_ctx),
+              accums, sample_params, out_ptr, num_emit, vocab_per_rank,
+              self.pools, self.profiler)
 
-                dispatch_gemv_softcap[
-                    cols=C.HIDDEN, cap=C.LOGIT_SOFTCAP,
-                ](x_last, layout.tail.proto.embed.binding(tail_ctx), logits,
-                  vocab_per_rank, self.pools, self.profiler)
-
-            consumed += chunk_len
-            pos += chunk_len
+            for j in range(num_emit):
+                outcomes.append((out_ptr + j)[])
 
         self.profiler.add_wall(Int(perf_counter_ns() - wall_t0))
-        return TemporalLogitsView[C.VOCAB_SIZE](
-            logits.ptr, self.arena_bases.copy())
+        return outcomes^
 
     @staticmethod
     def load(

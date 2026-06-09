@@ -234,16 +234,15 @@ def aggregate_scratch_peak[T: AnyType](degree: Int, workers: Int) -> Int:
 
 
 struct TemporalScratchPool(Movable, Copyable, ImplicitlyCopyable):
-    var base: UnsafePointer[UInt8, MutAnyOrigin]
+    var scratch_off: Int
 
-    def __init__(out self, base: Int):
-        self.base = UnsafePointer[UInt8, MutAnyOrigin](
-            unsafe_from_address=base)
+    def __init__(out self, scratch_off: Int):
+        self.scratch_off = scratch_off
 
     @always_inline
     def slot[
         I: ScratchIsland, name: StringLiteral,
-    ](self, plan: ScratchPlan) -> UnsafePointer[
+    ](self, arena_base: Int, plan: ScratchPlan) -> UnsafePointer[
         downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
         MutAnyOrigin,
     ]:
@@ -252,7 +251,7 @@ struct TemporalScratchPool(Movable, Copyable, ImplicitlyCopyable):
         return UnsafePointer[
             downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
             MutAnyOrigin,
-        ](unsafe_from_address=Int(self.base) + off)
+        ](unsafe_from_address=arena_base + self.scratch_off + off)
 
     @always_inline
     def binding[
@@ -261,7 +260,7 @@ struct TemporalScratchPool(Movable, Copyable, ImplicitlyCopyable):
         downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
         o,
     ]:
-        return ctx.view.bind(self.slot[I, name](plan))
+        return ctx.view.bind(self.slot[I, name](ctx.view.bases[0], plan))
 
 
 struct TemporalLogitsView[

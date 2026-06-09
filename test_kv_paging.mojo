@@ -3,12 +3,33 @@ from std.os import abort
 
 from numa import NumaArena, NumaTopology
 from kernels.attention_ops import (
-    KVRun, KVRunTable, LinearKV, PagedKV, RingKV, pow2_shift,
+    KVRunTable, LinearKV, PagedKV, RingKV, pow2_shift,
 )
-from modeling.kv_runtime import KVPageAllocator, KVRuntime
+from continuous_batching.paging import (
+    KVPageAccountant, KVPageAllocator, PagePoolSpec, BatchGeometry,
+)
 
 
 comptime FPtr = UnsafePointer[Float32, MutAnyOrigin]
+comptime RING_POOL = 0
+comptime GROWING_POOL = 1
+
+
+def two_pool_geometry(
+    page_len: Int, max_seqs: Int, num_pages: Int, max_pages_per_seq: Int,
+) -> BatchGeometry:
+    var pools = List[PagePoolSpec]()
+    pools.append(PagePoolSpec(
+        num_pages=max_seqs * 2,
+        fixed_pages_per_seq=2,
+        max_pages_per_seq=2))
+    pools.append(PagePoolSpec(
+        num_pages=num_pages,
+        fixed_pages_per_seq=0,
+        max_pages_per_seq=max_pages_per_seq))
+    return BatchGeometry(
+        max_seqs=max_seqs, max_slots=max_seqs, max_step_tokens=page_len,
+        pools=pools^)
 
 
 def policy_equivalence() -> Int:
@@ -49,7 +70,7 @@ def policy_equivalence() -> Int:
 
 
 def allocator_behavior() -> Int:
-    print("--- allocator refcounts ---")
+    print("--- allocator free list ---")
     var failures = 0
     var pages = KVPageAllocator(4)
 
@@ -67,62 +88,70 @@ def allocator_behavior() -> Int:
         failures += 1
     if pages.acquire() != 1:
         failures += 1
-
-    pages.retain(0)
-    pages.release(0)
     if pages.available() != 0:
-        failures += 1
-    pages.release(0)
-    if pages.available() != 1:
-        failures += 1
-    if pages.acquire() != 0:
         failures += 1
 
     print(t"  {failures} mismatches")
     return failures
 
 
-def runtime_lifecycle() -> Int:
-    print("--- runtime admission / reservation / release ---")
+def accountant_lifecycle() -> Int:
+    print("--- accountant admission / reservation / release ---")
     var failures = 0
-    var kv = KVRuntime(
-        page_len=4, degree=1, num_pages=2, max_seqs=2, max_pages_per_seq=4)
+    var kv = KVPageAccountant(two_pool_geometry(
+        page_len=4, max_seqs=2, num_pages=2, max_pages_per_seq=4))
 
     var a = kv.admit()
     if a != 0:
         failures += 1
+    if kv.page_index(RING_POOL, a, 0) != 0 or kv.page_index(RING_POOL, a, 1) != 1:
+        failures += 1
+    var b = kv.admit()
+    if b != 1:
+        failures += 1
     if kv.admit() != -1:
         failures += 1
-    if Int(kv.seqs[a].sliding_pages[0]) != 0 or Int(kv.seqs[a].sliding_pages[1]) != 1:
+
+    var need = List[Int](length=kv.pool_count(), fill=0)
+    kv.pages_needed(a, 1, need)
+    if need[RING_POOL] != 0 or need[GROWING_POOL] != 2:
+        failures += 1
+    if not kv.fits(need):
         failures += 1
 
-    if not kv.reserve_full(a, 7):
+    if not kv.reserve(a, 1):
         failures += 1
-    if kv.reserve_full(a, 11):
+    if kv.reserve(a, 2):
         failures += 1
-    if not kv.reserve_full(a, 7):
+    if not kv.reserve(a, 1):
         failures += 1
 
-    kv.begin_step()
-    kv.push_run(a, 0, 4, 7)
-    if len(kv.full_runs.runs) != 1 or len(kv.sliding_runs.runs) != 1:
+    var full_runs = KVRunTable()
+    var sliding_runs = KVRunTable()
+    full_runs.begin_run(0, 4)
+    for ordinal in range(2):
+        full_runs.add_base_row(Int32(kv.page_index(GROWING_POOL, a, ordinal) * 4))
+    sliding_runs.begin_run(0, 4)
+    for ordinal in range(2):
+        sliding_runs.add_base_row(Int32(kv.page_index(RING_POOL, a, ordinal) * 4))
+
+    if len(full_runs.runs) != 1 or len(sliding_runs.runs) != 1:
         failures += 1
-    ref full_run = kv.full_runs.runs[0]
-    if len(full_run.base_rows) != 2:
+    if Int(full_runs.runs[0].page_count) != 2:
         failures += 1
-    if Int(full_run.base_rows[0]) != 0 or Int(full_run.base_rows[1]) != 4:
+    if Int(full_runs.row_ptr(0)[0]) != 0 or Int(full_runs.row_ptr(0)[1]) != 4:
         failures += 1
-    ref sliding_run = kv.sliding_runs.runs[0]
-    if Int(sliding_run.base_rows[0]) != 0 or Int(sliding_run.base_rows[1]) != 4:
+    if Int(sliding_runs.row_ptr(0)[0]) != 0 or Int(sliding_runs.row_ptr(0)[1]) != 4:
         failures += 1
 
     kv.release(a)
-    if kv.full_pages.available() != 2 or kv.sliding_pages.available() != 2:
-        failures += 1
-    var b = kv.admit()
-    if b != 0:
-        failures += 1
     kv.release(b)
+    if kv.pool_available(RING_POOL) != 4 or kv.pool_available(GROWING_POOL) != 2:
+        failures += 1
+    var c = kv.admit()
+    if c != 0:
+        failures += 1
+    kv.release(c)
 
     print(t"  {failures} mismatches")
     return failures
@@ -158,38 +187,47 @@ def paged_traversal() -> Int:
             abort("traversal: brick alloc failed")
         bricks.append(got.value())
 
-    var kv = KVRuntime(
-        page_len=page_len, degree=degree, num_pages=num_pages,
-        max_seqs=4, max_pages_per_seq=4)
+    var kv = KVPageAccountant(two_pool_geometry(
+        page_len=page_len, max_seqs=4, num_pages=num_pages,
+        max_pages_per_seq=4))
     var seq_a = kv.admit()
     var seq_b = kv.admit()
     var len_a = 10
     var len_b = 6
 
-    _ = kv.reserve_full(seq_a, 3)
-    _ = kv.reserve_full(seq_b, 3)
-    _ = kv.reserve_full(seq_a, 7)
-    _ = kv.reserve_full(seq_b, 5)
-    _ = kv.reserve_full(seq_a, 9)
+    _ = kv.reserve(seq_a, 0)
+    _ = kv.reserve(seq_b, 0)
+    _ = kv.reserve(seq_a, 1)
+    _ = kv.reserve(seq_b, 1)
+    _ = kv.reserve(seq_a, 2)
 
-    if kv.full_table.page_index(seq_a, 1) != 2:
+    if kv.page_index(GROWING_POOL, seq_a, 1) != 2:
         failures += 1
-    if kv.full_table.page_index(seq_b, 1) != 3:
+    if kv.page_index(GROWING_POOL, seq_b, 1) != 3:
         failures += 1
-
-    kv.begin_step()
-    kv.push_run(seq_a, 0, 0, len_a - 1)
-    kv.push_run(seq_b, 0, 0, len_b - 1)
 
     var lengths = List[Int]()
     lengths.append(len_a)
     lengths.append(len_b)
 
+    var full_runs = KVRunTable()
+    var seq_ids = List[Int]()
+    seq_ids.append(seq_a)
+    seq_ids.append(seq_b)
+    var buf_start = 0
+    for s in range(2):
+        full_runs.begin_run(buf_start, 0)
+        var last_ordinal = (lengths[s] - 1) // page_len
+        for ordinal in range(last_ordinal + 1):
+            full_runs.add_base_row(Int32(
+                kv.page_index(GROWING_POOL, seq_ids[s], ordinal)
+                * rows_per_page))
+        buf_start += lengths[s]
+
     for rank in range(degree):
         for s in range(2):
-            ref run = kv.full_runs.runs[s]
             var paged = PagedKV(
-                run.base_rows.unsafe_ptr(), page_shift, row_mask, -1)
+                full_runs.row_ptr(s), page_shift, row_mask, -1)
             for pos in range(lengths[s]):
                 if pos % degree != rank:
                     continue
@@ -200,9 +238,8 @@ def paged_traversal() -> Int:
 
     for rank in range(degree):
         for s in range(2):
-            ref run = kv.full_runs.runs[s]
             var paged = PagedKV(
-                run.base_rows.unsafe_ptr(), page_shift, row_mask, -1)
+                full_runs.row_ptr(s), page_shift, row_mask, -1)
             for pos in range(lengths[s]):
                 if pos % degree != rank:
                     continue
@@ -214,7 +251,7 @@ def paged_traversal() -> Int:
 
     kv.release(seq_a)
     kv.release(seq_b)
-    if kv.full_pages.available() != num_pages:
+    if kv.pool_available(GROWING_POOL) != num_pages:
         failures += 1
 
     print(t"  {failures} mismatches")
@@ -225,9 +262,9 @@ def main():
     var total = 0
     total += policy_equivalence()
     total += allocator_behavior()
-    total += runtime_lifecycle()
+    total += accountant_lifecycle()
     total += paged_traversal()
     if total == 0:
-        print("RESULT: PASS -- paged KV policies, allocator, and runtime hold")
+        print("RESULT: PASS -- paged KV policies, allocator, and accountant hold")
     else:
         print(t"RESULT: FAIL -- {total} mismatches")
