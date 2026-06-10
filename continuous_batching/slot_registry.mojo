@@ -49,6 +49,14 @@ struct SlotRegistry(Movable):
             self.tokens[seq_id].append(source[start + t])
         self.last_used[seq_id] = now
 
+    def seed(
+        mut self, seq_id: Int, source: Span[Int32, _], count: Int, now: UInt,
+    ):
+        self.tokens[seq_id].clear()
+        for i in range(count):
+            self.tokens[seq_id].append(source[i])
+        self.last_used[seq_id] = now
+
     def set_warm(mut self, seq_id: Int):
         self.owner[seq_id] = -1
 
@@ -57,25 +65,17 @@ struct SlotRegistry(Movable):
         self.owner[seq_id] = -1
         self.tokens[seq_id].clear()
 
-    def match_append(self, incoming: Span[Int32, _]) -> Int:
-        var best = -1
-        var best_len = 0
-        for sid in range(self.max_seqs):
-            if not self.resident[sid] or self.owner[sid] >= 0:
-                continue
-            var n = len(self.tokens[sid])
-            if n <= best_len or n > len(incoming):
-                continue
-            ref toks = self.tokens[sid]
-            var is_prefix = True
-            for i in range(n):
-                if toks[i] != incoming[i]:
-                    is_prefix = False
-                    break
-            if is_prefix:
-                best = sid
-                best_len = n
-        return best
+    @always_inline
+    def is_resident(self, seq_id: Int) -> Bool:
+        return self.resident[seq_id]
+
+    def prefix_len(self, seq_id: Int, incoming: Span[Int32, _]) -> Int:
+        ref toks = self.tokens[seq_id]
+        var n = min(len(toks), len(incoming))
+        for i in range(n):
+            if toks[i] != incoming[i]:
+                return i
+        return n
 
     def lru_victim(self) -> Int:
         var victim = -1

@@ -15,17 +15,29 @@ struct BatchSlot(Copyable, Movable, ImplicitlyCopyable):
     var sampling: SamplingParams
 
 
+@fieldwise_init
+struct PageCopy(Copyable, Movable, ImplicitlyCopyable):
+    var pool: Int
+    var src_page: Int
+    var dst_page: Int
+    var pos_start: Int
+    var pos_count: Int
+
+
 struct Schedule(Movable):
     var slots: List[BatchSlot]
     var tokens: List[Int32]
+    var copies: List[PageCopy]
 
     def __init__(out self):
         self.slots = List[BatchSlot]()
         self.tokens = List[Int32]()
+        self.copies = List[PageCopy]()
 
     def clear(mut self):
         self.slots.clear()
         self.tokens.clear()
+        self.copies.clear()
 
 
 trait ScheduledModel:

@@ -15,18 +15,38 @@ def seq(read xs: List[Int32]) -> Span[Int32, origin_of(xs)]:
     return Span(xs)
 
 
+def best_prefix(
+    read reg: SlotRegistry, read incoming: List[Int32], want_owned: Bool,
+) -> Tuple[Int, Int]:
+    var best = -1
+    var best_lcp = 0
+    for sid in range(reg.max_seqs):
+        if not reg.is_resident(sid):
+            continue
+        if (reg.owner_of(sid) >= 0) != want_owned:
+            continue
+        var lcp = reg.prefix_len(sid, Span(incoming))
+        if lcp > best_lcp:
+            best = sid
+            best_lcp = lcp
+    return (best, best_lcp)
+
+
 def test_match_on_empty() -> Int:
     print("match_on_empty")
     var f = 0
     var reg = SlotRegistry(4)
     var q: List[Int32] = [1, 2, 3]
-    f += check(reg.match_append(seq(q)) == -1, "no resident slots -> no match")
+    var warm = best_prefix(reg, q, False)
+    var active = best_prefix(reg, q, True)
+    f += check(warm[0] == -1, "no resident slots -> no warm match")
+    f += check(active[0] == -1, "no resident slots -> no active match")
     f += check(reg.lru_victim() == -1, "no resident slots -> no victim")
     return f
 
 
-def test_append_match() -> Int:
-    print("append_match")
+def test_prefix_len() -> Int:
+    print("prefix_len")
     var f = 0
     var reg = SlotRegistry(4)
     var prefix: List[Int32] = [1, 2, 3]
@@ -35,19 +55,30 @@ def test_append_match() -> Int:
     reg.set_warm(0)
 
     var cont: List[Int32] = [1, 2, 3, 4, 5]
-    f += check(reg.match_append(seq(cont)) == 0, "strict-prefix continuation matches")
+    f += check(reg.prefix_len(0, seq(cont)) == 3,
+               "continuation matches whole history")
     f += check(reg.length(0) == 3, "history length tracks fed tokens")
 
     var other: List[Int32] = [9, 9, 9, 9]
-    f += check(reg.match_append(seq(other)) == -1, "non-prefix request does not match")
+    f += check(reg.prefix_len(0, seq(other)) == 0,
+               "fully diverged request shares nothing")
+
+    var edited: List[Int32] = [1, 2, 9, 9]
+    f += check(reg.prefix_len(0, seq(edited)) == 2,
+               "edited request matches up to the divergence")
 
     var exact: List[Int32] = [1, 2, 3]
-    f += check(reg.match_append(seq(exact)) == 0, "exact-length match reuses the slot for regeneration")
+    f += check(reg.prefix_len(0, seq(exact)) == 3,
+               "exact-length request matches its full length")
+
+    var shorter: List[Int32] = [1, 2]
+    f += check(reg.prefix_len(0, seq(shorter)) == 2,
+               "shorter request is capped at its own length")
     return f
 
 
-def test_owner_excluded() -> Int:
-    print("owner_excluded")
+def test_owner_partition() -> Int:
+    print("owner_partition")
     var f = 0
     var reg = SlotRegistry(4)
     var prefix: List[Int32] = [7, 8]
@@ -55,11 +86,18 @@ def test_owner_excluded() -> Int:
     reg.extend(2, seq(prefix), 0, 0, 2, UInt(50))
 
     var cont: List[Int32] = [7, 8, 9]
-    f += check(reg.match_append(seq(cont)) == -1, "a live (owned) slot is not reusable")
+    var warm = best_prefix(reg, cont, False)
+    var active = best_prefix(reg, cont, True)
+    f += check(warm[0] == -1, "a live slot never matches as warm")
+    f += check(active[0] == 2 and active[1] == 2,
+               "a live slot matches as active")
     f += check(reg.lru_victim() == -1, "a live slot is never an LRU victim")
 
     reg.set_warm(2)
-    f += check(reg.match_append(seq(cont)) == 2, "set_warm makes it reusable")
+    warm = best_prefix(reg, cont, False)
+    active = best_prefix(reg, cont, True)
+    f += check(warm[0] == 2, "set_warm moves the slot to the warm side")
+    f += check(active[0] == -1, "set_warm removes it from the active side")
     f += check(reg.lru_victim() == 2, "set_warm makes it evictable")
     return f
 
@@ -78,7 +116,12 @@ def test_longest_prefix_wins() -> Int:
     reg.set_warm(1)
 
     var cont: List[Int32] = [1, 2, 3, 4, 5, 6]
-    f += check(reg.match_append(seq(cont)) == 1, "longest matching prefix wins")
+    var m = best_prefix(reg, cont, False)
+    f += check(m[0] == 1 and m[1] == 4, "longest matching prefix wins")
+
+    var diverging: List[Int32] = [1, 2, 9, 9]
+    m = best_prefix(reg, diverging, False)
+    f += check(m[1] == 2, "divergence caps the reported prefix")
     return f
 
 
@@ -104,18 +147,42 @@ def test_lru_victim() -> Int:
     reg.close(1)
     f += check(reg.lru_victim() == 2, "after eviction next-oldest is the victim")
     f += check(reg.length(1) == 0, "close drops history")
+    f += check(not reg.is_resident(1), "closed slot is no longer resident")
     var cont: List[Int32] = [2, 2]
-    f += check(reg.match_append(seq(cont)) == -1, "closed slot no longer matches")
+    var m = best_prefix(reg, cont, False)
+    f += check(m[0] == -1, "closed slot no longer matches")
+    return f
+
+
+def test_seed_and_truncate() -> Int:
+    print("seed_and_truncate")
+    var f = 0
+    var reg = SlotRegistry(4)
+    var donor_toks: List[Int32] = [5, 6, 7, 8]
+    reg.open(0, owner_id=1, now=UInt(100))
+    reg.seed(0, seq(donor_toks), 3, UInt(100))
+    f += check(reg.length(0) == 3, "seed preloads the prefix length")
+
+    var cont: List[Int32] = [5, 6, 7, 9, 9]
+    reg.set_warm(0)
+    var m = best_prefix(reg, cont, False)
+    f += check(m[0] == 0 and m[1] == 3, "seeded tokens match as a prefix")
+
+    reg.adopt(0, 7, UInt(200))
+    reg.seed(0, seq(cont), 2, UInt(200))
+    f += check(reg.length(0) == 2, "re-seed truncates the history")
+    f += check(reg.owner_of(0) == 7, "adopt installs the new owner")
     return f
 
 
 def main():
     var failures = 0
     failures += test_match_on_empty()
-    failures += test_append_match()
-    failures += test_owner_excluded()
+    failures += test_prefix_len()
+    failures += test_owner_partition()
     failures += test_longest_prefix_wins()
     failures += test_lru_victim()
+    failures += test_seed_and_truncate()
     print()
     if failures == 0:
         print("all slot-registry checks passed")

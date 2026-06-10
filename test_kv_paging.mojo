@@ -157,6 +157,73 @@ def accountant_lifecycle() -> Int:
     return failures
 
 
+def hold_semantics() -> Int:
+    print("--- page holds: share / truncate / privatize ---")
+    var failures = 0
+    var kv = KVPageAccountant(two_pool_geometry(
+        page_len=4, max_seqs=4, num_pages=8, max_pages_per_seq=8))
+
+    var donor = kv.admit()
+    var fork = kv.admit()
+    if not kv.reserve(donor, 2):
+        failures += 1
+    if kv.pool_available(GROWING_POOL) != 5:
+        failures += 1
+
+    kv.share(GROWING_POOL, donor, fork, 0)
+    kv.share(GROWING_POOL, donor, fork, 1)
+    if kv.pool_available(GROWING_POOL) != 5:
+        failures += 1
+    if (kv.page_index(GROWING_POOL, fork, 0)
+            != kv.page_index(GROWING_POOL, donor, 0)):
+        failures += 1
+    var shared_page = kv.page_index(GROWING_POOL, donor, 0)
+    if kv.page_holds(GROWING_POOL, shared_page) != 2:
+        failures += 1
+    var private_page = kv.page_index(GROWING_POOL, donor, 2)
+    if kv.page_holds(GROWING_POOL, private_page) != 1:
+        failures += 1
+
+    if not kv.reserve(fork, 2):
+        failures += 1
+    if kv.page_index(GROWING_POOL, fork, 2) == private_page:
+        failures += 1
+    if kv.pool_available(GROWING_POOL) != 4:
+        failures += 1
+
+    kv.truncate(donor, 0)
+    if kv.page_index(GROWING_POOL, donor, 1) != -1:
+        failures += 1
+    if kv.page_holds(GROWING_POOL, kv.page_index(GROWING_POOL, fork, 1)) != 1:
+        failures += 1
+    if kv.pool_available(GROWING_POOL) != 5:
+        failures += 1
+
+    var old_shared = kv.page_index(GROWING_POOL, fork, 0)
+    var fresh = kv.replace_with_private(GROWING_POOL, fork, 0)
+    if fresh < 0 or fresh == old_shared:
+        failures += 1
+    if kv.page_holds(GROWING_POOL, old_shared) != 1:
+        failures += 1
+    if kv.page_holds(GROWING_POOL, fresh) != 1:
+        failures += 1
+
+    kv.retain_page(GROWING_POOL, old_shared)
+    kv.release(donor)
+    if kv.page_holds(GROWING_POOL, old_shared) != 1:
+        failures += 1
+    kv.release_page(GROWING_POOL, old_shared)
+
+    kv.release(fork)
+    if kv.pool_available(GROWING_POOL) != 8:
+        failures += 1
+    if kv.pool_available(RING_POOL) != 8:
+        failures += 1
+
+    print(t"  {failures} mismatches")
+    return failures
+
+
 @always_inline
 def probe_value(rank: Int, seq_id: Int, seq_pos: Int, d: Int) -> Float32:
     return Float32(rank * 100000 + seq_id * 10000 + seq_pos * 100 + d)
@@ -263,6 +330,7 @@ def main():
     total += policy_equivalence()
     total += allocator_behavior()
     total += accountant_lifecycle()
+    total += hold_semantics()
     total += paged_traversal()
     if total == 0:
         print("RESULT: PASS -- paged KV policies, allocator, and accountant hold")

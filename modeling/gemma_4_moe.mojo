@@ -18,6 +18,7 @@ from kernels.flash_sample import (
     SamplingParams, SampleAccum, SampleOutcome, dispatch_flash_sample,
 )
 from kernels.gather import dispatch_gather_rows
+from kernels.page_copy import CopyJob, dispatch_copy_jobs
 from kernels.gemm import dispatch_gemm, dispatch_gemm_cols, dispatch_gemm_chained_qkv
 from kernels.rope import dispatch_rope_cache_write
 from kernels.attention_ops import flash_partial_stride
@@ -959,6 +960,45 @@ struct Gemma4[
             max_step_tokens=C.SLIDING_WINDOW,
             pools=pools^)
 
+    def run_prefix_copies(mut self, read schedule: Schedule):
+        if len(schedule.copies) == 0:
+            return
+        var degree = self.degree
+        var sliding_row_bytes = (C.KV_DIM_SLIDING // degree) * 2
+        var full_row_bytes = C.KV_DIM_FULL * 2
+        var full_rows_per_page = PAGE_LEN // degree
+        var jobs = List[CopyJob]()
+        for c in range(len(schedule.copies)):
+            var page_copy = schedule.copies[c]
+            if page_copy.pool == SLIDING_POOL:
+                var src = ((page_copy.src_page * PAGE_LEN
+                            + page_copy.pos_start) * sliding_row_bytes)
+                var dst = ((page_copy.dst_page * PAGE_LEN
+                            + page_copy.pos_start) * sliding_row_bytes)
+                var span = page_copy.pos_count * sliding_row_bytes
+                for l in range(C.NUM_SLIDING_LAYERS):
+                    var lb = self.layout.sliding_kv.base(l)
+                    var k_off = lb + self.layout.sliding_kv.proto.k.offset
+                    var v_off = lb + self.layout.sliding_kv.proto.v.offset
+                    jobs.append(CopyJob(k_off + src, k_off + dst, span))
+                    jobs.append(CopyJob(v_off + src, v_off + dst, span))
+            else:
+                var row_start = page_copy.pos_start // degree
+                var row_end = ((page_copy.pos_start + page_copy.pos_count
+                                + degree - 1) // degree)
+                var src = ((page_copy.src_page * full_rows_per_page
+                            + row_start) * full_row_bytes)
+                var dst = ((page_copy.dst_page * full_rows_per_page
+                            + row_start) * full_row_bytes)
+                var span = (row_end - row_start) * full_row_bytes
+                for l in range(C.NUM_FULL_LAYERS):
+                    var lb = self.layout.full_kv.base(l)
+                    var k_off = lb + self.layout.full_kv.proto.k.offset
+                    var v_off = lb + self.layout.full_kv.proto.v.offset
+                    jobs.append(CopyJob(k_off + src, k_off + dst, span))
+                    jobs.append(CopyJob(v_off + src, v_off + dst, span))
+        dispatch_copy_jobs(jobs, self.arena_bases, self.pools, self.profiler)
+
     def bind_step_runs(
         mut self, read schedule: Schedule, read pages: KVPageAccountant,
     ):
@@ -1041,6 +1081,7 @@ struct Gemma4[
             buf_start == total,
             "execute slot token counts must sum to len(tokens)",
         )
+        self.run_prefix_copies(schedule)
         self.bind_step_runs(schedule, pages)
         var full_runs = UnsafePointer(to=self.full_runs)
         var sliding_runs = UnsafePointer(to=self.sliding_runs)

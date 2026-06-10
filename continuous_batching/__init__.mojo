@@ -1,5 +1,5 @@
 from .schedule import (
-    Schedule, BatchSlot, ScheduledModel, MAXIMUM_SAMPLING_LOGITS,
+    Schedule, BatchSlot, PageCopy, ScheduledModel, MAXIMUM_SAMPLING_LOGITS,
 )
 from .paging import (
     KVPageAccountant, KVPageAllocator, KVPageTable,
