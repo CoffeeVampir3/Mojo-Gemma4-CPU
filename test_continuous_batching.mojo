@@ -175,7 +175,7 @@ def run_scheduler[
     var follow = encode_prompt(tok, String(" In one word, why?"))
     for t in range(1, len(follow)):
         turn2.append(follow[t])
-    var turn2_id = sched.submit(turn2^, greedy, MAX_NEW_TOKENS)
+    var turn2_id = sched.submit(turn2^, greedy, MAX_NEW_TOKENS).value()
 
     var cont_t0 = perf_counter_ns()
     var steps2 = run_steps(sched, model, String("cont"))
@@ -191,7 +191,7 @@ def run_scheduler[
     var prompt_a = List[Int32]()
     for t in range(len(base_a)):
         prompt_a.append(base_a[t])
-    var req_a = sched.submit(prompt_a^, greedy, LARGE_MAX_NEW)
+    var req_a = sched.submit(prompt_a^, greedy, LARGE_MAX_NEW).value()
     _ = run_steps(sched, model, String("prefill-a"), 3)
     var sid_a = sched.requests[req_a].seq_id
     failures += check(
@@ -199,7 +199,7 @@ def run_scheduler[
         "donor prefilled past the fork point before the fork request lands")
 
     var req_b = sched.submit(
-        prefix_plus_tail(base_a, FORK_A_AT, 3001, 8), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_a, FORK_A_AT, 3001, 8), greedy, LARGE_MAX_NEW).value()
     _ = run_steps(sched, model, String("fork-b"), 1)
     var sid_b = sched.requests[req_b].seq_id
     failures += check(sid_b >= 0 and sid_b != sid_a, "fork gets its own sequence")
@@ -232,7 +232,7 @@ def run_scheduler[
 
     print("=== phase 3: stale-window edit falls back to fresh prefill ===")
     var req_stale = sched.submit(
-        prefix_plus_tail(base_a, STALE_AT, 4001, 8), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_a, STALE_AT, 4001, 8), greedy, LARGE_MAX_NEW).value()
     _ = run_steps(sched, model, String("stale"), 1)
     var sid_stale = sched.requests[req_stale].seq_id
     failures += check(
@@ -246,7 +246,7 @@ def run_scheduler[
 
     print("=== phase 4: near-tail edit adopts and truncates in place ===")
     var req_edit = sched.submit(
-        prefix_plus_tail(base_a, EDIT_A_AT, 5001, 6), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_a, EDIT_A_AT, 5001, 6), greedy, LARGE_MAX_NEW).value()
     _ = run_steps(sched, model, String("edit"), 1)
     failures += check(
         sched.requests[req_edit].seq_id == sid_a,
@@ -260,7 +260,7 @@ def run_scheduler[
     print("=== phase 5: fork and edit exactness vs fresh prefill ===")
     drop_warm(sched)
     var ref_b = sched.submit(
-        prefix_plus_tail(base_a, FORK_A_AT, 3001, 8), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_a, FORK_A_AT, 3001, 8), greedy, LARGE_MAX_NEW).value()
     var refb_t0 = perf_counter_ns()
     var refb_steps = run_steps(sched, model, String("ref-b"))
     print(t"reference b: {refb_steps} steps | {elapsed_ms_since(refb_t0)} ms")
@@ -270,7 +270,7 @@ def run_scheduler[
 
     drop_warm(sched)
     var ref_edit = sched.submit(
-        prefix_plus_tail(base_a, EDIT_A_AT, 5001, 6), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_a, EDIT_A_AT, 5001, 6), greedy, LARGE_MAX_NEW).value()
     var refe_t0 = perf_counter_ns()
     var refe_steps = run_steps(sched, model, String("ref-edit"))
     print(t"reference edit: {refe_steps} steps | {elapsed_ms_since(refe_t0)} ms")
@@ -285,14 +285,14 @@ def run_scheduler[
     var prompt_c = List[Int32]()
     for t in range(len(base_c)):
         prompt_c.append(base_c[t])
-    var req_c = sched.submit(prompt_c^, greedy, LARGE_MAX_NEW)
+    var req_c = sched.submit(prompt_c^, greedy, LARGE_MAX_NEW).value()
     _ = run_steps(sched, model, String("prefill-c"), 3)
     var sid_c = sched.requests[req_c].seq_id
     failures += check(
         sched.registry.length(sid_c) >= FORK_C_AT,
         "second donor prefilled past its fork point")
     var req_d = sched.submit(
-        prefix_plus_tail(base_c, FORK_C_AT, 6001, 8), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_c, FORK_C_AT, 6001, 8), greedy, LARGE_MAX_NEW).value()
     _ = run_steps(sched, model, String("fork-d"))
     var sid_d = sched.requests[req_d].seq_id
     var shared_page1 = sched.pages.page_index(FULL_POOL, sid_c, 1)
@@ -304,7 +304,7 @@ def run_scheduler[
         "shared page carries two holds before the deep edit")
 
     var req_e = sched.submit(
-        prefix_plus_tail(base_c, ADOPT_C_AT, 7001, 6), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_c, ADOPT_C_AT, 7001, 6), greedy, LARGE_MAX_NEW).value()
     _ = run_steps(sched, model, String("adopt-e"), 1)
     failures += check(
         sched.requests[req_e].seq_id == sid_c,
@@ -325,7 +325,7 @@ def run_scheduler[
 
     drop_warm(sched)
     var ref_e = sched.submit(
-        prefix_plus_tail(base_c, ADOPT_C_AT, 7001, 6), greedy, LARGE_MAX_NEW)
+        prefix_plus_tail(base_c, ADOPT_C_AT, 7001, 6), greedy, LARGE_MAX_NEW).value()
     var refp_t0 = perf_counter_ns()
     var refp_steps = run_steps(sched, model, String("ref-e"))
     print(t"reference e: {refp_steps} steps | {elapsed_ms_since(refp_t0)} ms")

@@ -130,6 +130,22 @@ struct KVPageAccountant(Movable):
         return self.pools[pool_idx].pages.hold_count(page)
 
     @always_inline
+    def pool_pages(self, pool_idx: Int) -> Int:
+        return self.pools[pool_idx].spec.num_pages
+
+    @always_inline
+    def pool_seq_page_limit(self, pool_idx: Int) -> Int:
+        return self.pools[pool_idx].spec.max_pages_per_seq
+
+    def freeable_pages(self, pool_idx: Int, seq_id: Int) -> Int:
+        var count = 0
+        for ordinal in range(self.pools[pool_idx].spec.max_pages_per_seq):
+            var page = self.pools[pool_idx].table.page_index(seq_id, ordinal)
+            if page >= 0 and self.pools[pool_idx].pages.hold_count(page) == 1:
+                count += 1
+        return count
+
+    @always_inline
     def retain_page(mut self, pool_idx: Int, page: Int):
         self.pools[pool_idx].pages.retain(page)
 

@@ -1095,6 +1095,8 @@ struct Gemma4[
             x_main_ranks, total * C.HIDDEN, self.pools, self.profiler)
 
         for i in range(C.NUM_LAYERS):
+            if schedule.fully_cancelled():
+                return List[SampleOutcome[MAXIMUM_SAMPLING_LOGITS]]()
             var entry = LAYER_SCHEDULE[i]
             var lb: Int
             var body: BodyRefs

@@ -1,9 +1,29 @@
+from std.atomic import Atomic, Ordering
+from std.memory import ArcPointer
+
 from kernels.flash_sample import SamplingParams, SampleOutcome
 
 from .paging import KVPageAccountant, BatchGeometry
 
 
 comptime MAXIMUM_SAMPLING_LOGITS = 64
+
+
+struct CancelToken(Copyable, Movable, ImplicitlyCopyable):
+    var flag: ArcPointer[Scalar[DType.int]]
+
+    def __init__(out self):
+        self.flag = ArcPointer(Scalar[DType.int](0))
+
+    @always_inline
+    def cancel(mut self):
+        Atomic[DType.int].store[ordering=Ordering.RELEASE](
+            self.flag.unsafe_ptr(), 1)
+
+    @always_inline
+    def cancelled(self) -> Bool:
+        return Atomic[DType.int].load[ordering=Ordering.ACQUIRE](
+            self.flag.unsafe_ptr()) != 0
 
 
 @fieldwise_init
@@ -13,6 +33,7 @@ struct BatchSlot(Copyable, Movable, ImplicitlyCopyable):
     var n_tokens: Int
     var emit: Bool
     var sampling: SamplingParams
+    var cancel: CancelToken
 
 
 @fieldwise_init
@@ -38,6 +59,14 @@ struct Schedule(Movable):
         self.slots.clear()
         self.tokens.clear()
         self.copies.clear()
+
+    def fully_cancelled(self) -> Bool:
+        if len(self.slots) == 0:
+            return False
+        for s in range(len(self.slots)):
+            if not self.slots[s].cancel.cancelled():
+                return False
+        return True
 
 
 trait ScheduledModel:

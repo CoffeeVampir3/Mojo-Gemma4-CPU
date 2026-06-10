@@ -90,7 +90,7 @@ def load_and_run[
     var prompt_tokens = List[Int32](capacity=len(token_ids))
     for i in range(len(token_ids)):
         prompt_tokens.append(token_ids[i])
-    var request_id = sched.submit(prompt_tokens^, greedy, MAX_NEW_TOKENS)
+    var request_id = sched.submit(prompt_tokens^, greedy, MAX_NEW_TOKENS).value()
 
     var prompt_len = len(token_ids)
     var t1 = perf_counter_ns()

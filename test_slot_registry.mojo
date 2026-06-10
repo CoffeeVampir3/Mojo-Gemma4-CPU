@@ -1,6 +1,9 @@
 from std.memory import Span
 
 from continuous_batching.slot_registry import SlotRegistry
+from continuous_batching.prefix_hash import refresh_chain
+
+comptime PPP = 2
 
 
 def check(cond: Bool, msg: String) -> Int:
@@ -15,9 +18,19 @@ def seq(read xs: List[Int32]) -> Span[Int32, origin_of(xs)]:
     return Span(xs)
 
 
-def best_prefix(
-    read reg: SlotRegistry, read incoming: List[Int32], want_owned: Bool,
+def plen[ppp: Int](
+    read reg: SlotRegistry[ppp], sid: Int, read q: List[Int32],
+) -> Int:
+    var chain = List[UInt64]()
+    refresh_chain[ppp](chain, Span(q))
+    return reg.prefix_len(sid, Span(q), chain)
+
+
+def best_prefix[ppp: Int](
+    read reg: SlotRegistry[ppp], read incoming: List[Int32], want_owned: Bool,
 ) -> Tuple[Int, Int]:
+    var chain = List[UInt64]()
+    refresh_chain[ppp](chain, Span(incoming))
     var best = -1
     var best_lcp = 0
     for sid in range(reg.max_seqs):
@@ -25,7 +38,7 @@ def best_prefix(
             continue
         if (reg.owner_of(sid) >= 0) != want_owned:
             continue
-        var lcp = reg.prefix_len(sid, Span(incoming))
+        var lcp = reg.prefix_len(sid, Span(incoming), chain)
         if lcp > best_lcp:
             best = sid
             best_lcp = lcp
@@ -35,7 +48,7 @@ def best_prefix(
 def test_match_on_empty() -> Int:
     print("match_on_empty")
     var f = 0
-    var reg = SlotRegistry(4)
+    var reg = SlotRegistry[PPP](4)
     var q: List[Int32] = [1, 2, 3]
     var warm = best_prefix(reg, q, False)
     var active = best_prefix(reg, q, True)
@@ -48,31 +61,31 @@ def test_match_on_empty() -> Int:
 def test_prefix_len() -> Int:
     print("prefix_len")
     var f = 0
-    var reg = SlotRegistry(4)
+    var reg = SlotRegistry[PPP](4)
     var prefix: List[Int32] = [1, 2, 3]
     reg.open(0, owner_id=10, now=UInt(100))
     reg.extend(0, seq(prefix), 0, 0, 3, UInt(100))
     reg.set_warm(0)
 
     var cont: List[Int32] = [1, 2, 3, 4, 5]
-    f += check(reg.prefix_len(0, seq(cont)) == 3,
+    f += check(plen(reg, 0, cont) == 3,
                "continuation matches whole history")
     f += check(reg.length(0) == 3, "history length tracks fed tokens")
 
     var other: List[Int32] = [9, 9, 9, 9]
-    f += check(reg.prefix_len(0, seq(other)) == 0,
+    f += check(plen(reg, 0, other) == 0,
                "fully diverged request shares nothing")
 
     var edited: List[Int32] = [1, 2, 9, 9]
-    f += check(reg.prefix_len(0, seq(edited)) == 2,
+    f += check(plen(reg, 0, edited) == 2,
                "edited request matches up to the divergence")
 
     var exact: List[Int32] = [1, 2, 3]
-    f += check(reg.prefix_len(0, seq(exact)) == 3,
+    f += check(plen(reg, 0, exact) == 3,
                "exact-length request matches its full length")
 
     var shorter: List[Int32] = [1, 2]
-    f += check(reg.prefix_len(0, seq(shorter)) == 2,
+    f += check(plen(reg, 0, shorter) == 2,
                "shorter request is capped at its own length")
     return f
 
@@ -80,7 +93,7 @@ def test_prefix_len() -> Int:
 def test_owner_partition() -> Int:
     print("owner_partition")
     var f = 0
-    var reg = SlotRegistry(4)
+    var reg = SlotRegistry[PPP](4)
     var prefix: List[Int32] = [7, 8]
     reg.open(2, owner_id=5, now=UInt(50))
     reg.extend(2, seq(prefix), 0, 0, 2, UInt(50))
@@ -105,7 +118,7 @@ def test_owner_partition() -> Int:
 def test_longest_prefix_wins() -> Int:
     print("longest_prefix_wins")
     var f = 0
-    var reg = SlotRegistry(4)
+    var reg = SlotRegistry[PPP](4)
     var short: List[Int32] = [1, 2]
     var long: List[Int32] = [1, 2, 3, 4]
     reg.open(0, owner_id=1, now=UInt(10))
@@ -128,7 +141,7 @@ def test_longest_prefix_wins() -> Int:
 def test_lru_victim() -> Int:
     print("lru_victim")
     var f = 0
-    var reg = SlotRegistry(4)
+    var reg = SlotRegistry[PPP](4)
     var a: List[Int32] = [1]
     var b: List[Int32] = [2]
     var c: List[Int32] = [3]
@@ -157,7 +170,7 @@ def test_lru_victim() -> Int:
 def test_seed_and_truncate() -> Int:
     print("seed_and_truncate")
     var f = 0
-    var reg = SlotRegistry(4)
+    var reg = SlotRegistry[PPP](4)
     var donor_toks: List[Int32] = [5, 6, 7, 8]
     reg.open(0, owner_id=1, now=UInt(100))
     reg.seed(0, seq(donor_toks), 3, UInt(100))
@@ -175,6 +188,60 @@ def test_seed_and_truncate() -> Int:
     return f
 
 
+def test_divergent_reseed() -> Int:
+    print("divergent_reseed")
+    var f = 0
+    var reg = SlotRegistry[PPP](4)
+    var original: List[Int32] = [1, 2, 3, 4]
+    reg.open(0, owner_id=1, now=UInt(10))
+    reg.extend(0, seq(original), 0, 0, 4, UInt(10))
+    reg.set_warm(0)
+    f += check(plen(reg, 0, original) == 4, "original history fully matches")
+
+    var divergent: List[Int32] = [1, 9, 3, 4]
+    reg.adopt(0, 2, UInt(20))
+    reg.seed(0, seq(divergent), 4, UInt(20))
+    f += check(plen(reg, 0, divergent) == 4,
+               "re-seeded tokens fully match the new history")
+    f += check(plen(reg, 0, original) == 1,
+               "stale chain entries do not survive a divergent re-seed")
+    return f
+
+
+def test_hashed_matches_exact() -> Int:
+    print("hashed_matches_exact")
+    var f = 0
+    comptime WIDE = 16
+    var reg = SlotRegistry[WIDE](2)
+    var history = List[Int32]()
+    for i in range(64):
+        history.append(Int32(1000 + i * 7))
+    reg.open(0, owner_id=1, now=UInt(10))
+    reg.extend(0, seq(history), 0, 0, 64, UInt(10))
+    reg.set_warm(0)
+
+    var mismatched = 0
+    for divergence in range(65):
+        var query = List[Int32]()
+        for i in range(64):
+            query.append(history[i])
+        if divergence < 64:
+            query[divergence] = Int32(-1)
+        var hashed = plen(reg, 0, query)
+        var exact = reg.exact_prefix_len(0, Span(query))
+        if hashed != exact or exact != min(divergence, 64):
+            mismatched += 1
+    f += check(mismatched == 0,
+               "hashed prefix equals exact prefix at every divergence point")
+
+    var longer = List[Int32]()
+    for i in range(80):
+        longer.append(Int32(1000 + i * 7))
+    f += check(plen(reg, 0, longer) == 64,
+               "longer continuation is capped at the history length")
+    return f
+
+
 def main():
     var failures = 0
     failures += test_match_on_empty()
@@ -183,6 +250,8 @@ def main():
     failures += test_longest_prefix_wins()
     failures += test_lru_victim()
     failures += test_seed_and_truncate()
+    failures += test_divergent_reseed()
+    failures += test_hashed_matches_exact()
     print()
     if failures == 0:
         print("all slot-registry checks passed")

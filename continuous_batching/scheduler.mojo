@@ -4,18 +4,12 @@ from std.time import perf_counter_ns
 from kernels.flash_sample import SamplingParams, SampleOutcome
 
 from .schedule import (
-    Schedule, BatchSlot, PageCopy, ScheduledModel, MAXIMUM_SAMPLING_LOGITS,
+    Schedule, BatchSlot, PageCopy, CancelToken, ScheduledModel,
+    MAXIMUM_SAMPLING_LOGITS,
 )
 from .paging import KVPageAccountant, BatchGeometry
 from .slot_registry import SlotRegistry
-
-
-def common_prefix_len(read a: List[Int32], read b: List[Int32]) -> Int:
-    var n = min(len(a), len(b))
-    for i in range(n):
-        if a[i] != b[i]:
-            return i
-    return n
+from .prefix_hash import refresh_chain, hashed_prefix_len
 
 
 @fieldwise_init
@@ -35,78 +29,148 @@ struct PagePin(Copyable, Movable, ImplicitlyCopyable):
 
 struct Request(Movable):
     var tokens: List[Int32]
+    var chain: List[UInt64]
     var generated: List[Int32]
     var sampling: SamplingParams
     var max_new_tokens: Int
     var seq_id: Int
     var done: Bool
+    var live: Bool
+    var cancel: CancelToken
 
     def __init__(
         out self, var tokens: List[Int32], sampling: SamplingParams,
         max_new_tokens: Int,
     ):
         self.tokens = tokens^
+        self.chain = List[UInt64]()
         self.generated = List[Int32]()
         self.sampling = sampling
         self.max_new_tokens = max_new_tokens
         self.seq_id = -1
         self.done = False
+        self.live = True
+        self.cancel = CancelToken()
+
+    def rehash[positions_per_page: Int](mut self):
+        refresh_chain[positions_per_page](self.chain, Span(self.tokens))
 
 
 struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
     var pages: KVPageAccountant
-    var registry: SlotRegistry
+    var registry: SlotRegistry[Self.positions_per_page]
     var requests: List[Request]
     var schedule: Schedule
     var need: List[Int]
     var max_slots: Int
     var step_budget: Int
-    var eos_token: Int32
-    var first_pending: Int
+    var decode_band: Int
+    var stop_tokens: List[Int32]
+    var pending: List[Int]
+    var free_slots: List[Int]
     var ring_capacity: Int
+    var seq_ceiling: Int
     var ring_floor: List[Int]
     var reuse: List[PrefixReuse]
     var reuse_copies: List[PageCopy]
     var pins: List[PagePin]
+    var reuse_dirty: List[Bool]
 
     def __init__(
         out self, read geometry: BatchGeometry, step_budget: Int,
-        eos_token: Int32,
+        var stop_tokens: List[Int32], decode_band: Int = 4,
     ):
         self.pages = KVPageAccountant(geometry)
-        self.registry = SlotRegistry(geometry.max_seqs)
+        self.registry = SlotRegistry[Self.positions_per_page](
+            geometry.max_seqs)
         self.requests = List[Request]()
         self.schedule = Schedule()
         self.need = List[Int](length=len(geometry.pools), fill=0)
         self.max_slots = geometry.max_slots
         self.step_budget = min(step_budget, geometry.max_step_tokens)
-        self.eos_token = eos_token
-        self.first_pending = 0
+        self.decode_band = decode_band
+        self.stop_tokens = stop_tokens^
+        self.pending = List[Int]()
+        self.free_slots = List[Int]()
         var ring_capacity = 1 << 62
+        var seq_ceiling = 1 << 62
         for p in range(len(geometry.pools)):
             if geometry.pools[p].fixed_pages_per_seq > 0:
                 var cap = (geometry.pools[p].fixed_pages_per_seq
                            * Self.positions_per_page)
                 if cap < ring_capacity:
                     ring_capacity = cap
+            else:
+                var page_cap = min(
+                    geometry.pools[p].max_pages_per_seq,
+                    geometry.pools[p].num_pages)
+                var cap = page_cap * Self.positions_per_page
+                if cap < seq_ceiling:
+                    seq_ceiling = cap
         self.ring_capacity = ring_capacity
+        self.seq_ceiling = seq_ceiling
         self.ring_floor = List[Int](length=geometry.max_seqs, fill=0)
         self.reuse = List[PrefixReuse]()
         self.reuse_copies = List[PageCopy]()
         self.pins = List[PagePin]()
+        self.reuse_dirty = List[Bool](length=geometry.max_seqs, fill=False)
+
+    def __init__(
+        out self, read geometry: BatchGeometry, step_budget: Int,
+        eos_token: Int32, decode_band: Int = 4,
+    ):
+        var stops = List[Int32]()
+        stops.append(eos_token)
+        self = Self(geometry, step_budget, stops^, decode_band)
+
+    @always_inline
+    def is_stop_token(self, token: Int32) -> Bool:
+        for k in range(len(self.stop_tokens)):
+            if token == self.stop_tokens[k]:
+                return True
+        return False
 
     def submit(
         mut self, var tokens: List[Int32], sampling: SamplingParams,
         max_new_tokens: Int,
-    ) -> Int:
-        debug_assert(len(tokens) > 0, "submit requires a non-empty prompt")
-        var request_id = len(self.requests)
-        self.requests.append(Request(tokens^, sampling, max_new_tokens))
+    ) -> Optional[Int]:
+        if len(tokens) == 0 or len(tokens) > self.seq_ceiling:
+            return None
+        var request_id: Int
+        if len(self.free_slots) > 0:
+            request_id = self.free_slots.pop()
+            self.requests[request_id] = Request(
+                tokens^, sampling, max_new_tokens)
+        else:
+            request_id = len(self.requests)
+            self.requests.append(Request(tokens^, sampling, max_new_tokens))
+        self.requests[request_id].rehash[Self.positions_per_page]()
+        self.pending.append(request_id)
         return request_id
 
+    def cancel_token(self, request_id: Int) -> CancelToken:
+        return self.requests[request_id].cancel
+
+    def retire(mut self, request_id: Int) -> Bool:
+        if not self.requests[request_id].live:
+            return False
+        if not self.requests[request_id].done:
+            return False
+        self.requests[request_id].live = False
+        self.requests[request_id].tokens.clear()
+        self.requests[request_id].chain.clear()
+        self.requests[request_id].generated.clear()
+        var kept = List[Int](capacity=len(self.pending))
+        for k in range(len(self.pending)):
+            if self.pending[k] != request_id:
+                kept.append(self.pending[k])
+        self.pending = kept^
+        self.free_slots.append(request_id)
+        return True
+
     def pending_work(self) -> Bool:
-        for i in range(self.first_pending, len(self.requests)):
-            if not self.requests[i].done:
+        for k in range(len(self.pending)):
+            if not self.requests[self.pending[k]].done:
                 return True
         return False
 
@@ -117,6 +181,70 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         self.pages.release(victim)
         self.registry.close(victim)
         return True
+
+    @always_inline
+    def is_warm(self, seq_id: Int) -> Bool:
+        return (self.registry.is_resident(seq_id)
+                and self.registry.owner_of(seq_id) < 0)
+
+    def evict_warm_for(mut self) -> Bool:
+        var victim = -1
+        var oldest = UInt(0)
+        for sid in range(self.registry.max_seqs):
+            if not self.is_warm(sid):
+                continue
+            var frees = False
+            for p in range(self.pages.pool_count()):
+                if self.need[p] <= self.pages.pool_available(p):
+                    continue
+                if self.pages.freeable_pages(p, sid) > 0:
+                    frees = True
+            if not frees:
+                continue
+            if victim < 0 or self.registry.last_used[sid] < oldest:
+                victim = sid
+                oldest = self.registry.last_used[sid]
+        if victim < 0:
+            victim = self.chained_warm_victim()
+        if victim < 0:
+            return False
+        self.pages.release(victim)
+        self.registry.close(victim)
+        return True
+
+    def chained_warm_victim(self) -> Int:
+        var victim = -1
+        var oldest = UInt(0)
+        for p in range(self.pages.pool_count()):
+            if self.need[p] <= self.pages.pool_available(p):
+                continue
+            var warm_holds = List[Int](
+                length=self.pages.pool_pages(p), fill=0)
+            for sid in range(self.registry.max_seqs):
+                if not self.is_warm(sid):
+                    continue
+                for ordinal in range(self.pages.pool_seq_page_limit(p)):
+                    var page = self.pages.page_index(p, sid, ordinal)
+                    if page >= 0:
+                        warm_holds[page] += 1
+            for sid in range(self.registry.max_seqs):
+                if not self.is_warm(sid):
+                    continue
+                var chained = False
+                for ordinal in range(self.pages.pool_seq_page_limit(p)):
+                    var page = self.pages.page_index(p, sid, ordinal)
+                    if page < 0:
+                        continue
+                    if (self.pages.page_holds(p, page) > 1
+                            and warm_holds[page]
+                            == self.pages.page_holds(p, page)):
+                        chained = True
+                if not chained:
+                    continue
+                if victim < 0 or self.registry.last_used[sid] < oldest:
+                    victim = sid
+                    oldest = self.registry.last_used[sid]
+        return victim
 
     @always_inline
     def window_intact(self, seq_id: Int, lcp: Int) -> Bool:
@@ -144,17 +272,42 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         for sid in range(self.registry.max_seqs):
             if not self.registry.is_resident(sid):
                 continue
+            if self.reuse_dirty[sid]:
+                continue
             if (self.registry.owner_of(sid) >= 0) != want_owned:
                 continue
             var lcp = self.registry.prefix_len(
-                sid, Span(self.requests[request_id].tokens))
+                sid, Span(self.requests[request_id].tokens),
+                self.requests[request_id].chain)
             if lcp <= best_lcp:
                 continue
             if not self.window_intact(sid, lcp):
                 continue
             best = sid
             best_lcp = lcp
+        if best >= 0:
+            var exact = self.registry.exact_prefix_len(
+                best, Span(self.requests[request_id].tokens))
+            if exact < best_lcp:
+                best_lcp = exact
+                if best_lcp == 0 or not self.window_intact(best, best_lcp):
+                    return (-1, 0)
         return (best, best_lcp)
+
+    def dirty_donor_exists(self, request_id: Int) -> Bool:
+        for sid in range(self.registry.max_seqs):
+            if not self.reuse_dirty[sid]:
+                continue
+            if not self.registry.is_resident(sid):
+                continue
+            var lcp = self.registry.prefix_len(
+                sid, Span(self.requests[request_id].tokens),
+                self.requests[request_id].chain)
+            if lcp < Self.positions_per_page:
+                continue
+            if self.window_intact(sid, lcp):
+                return True
+        return False
 
     def adopt_prefix(
         mut self, sid: Int, request_id: Int, lcp: Int, now: UInt,
@@ -183,7 +336,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                 if self.pages.page_holds(p, page) > 1:
                     self.need[p] += 1
             while not self.pages.fits(self.need):
-                if self.evict_warm():
+                if self.evict_warm_for():
                     continue
                 take = private_ordinal * Self.positions_per_page
                 do_private = False
@@ -222,6 +375,10 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         self.reuse.append(PrefixReuse(
             sid, True, trim, copy_start,
             len(self.reuse_copies) - copy_start))
+        if (len(self.reuse_copies) > copy_start
+                or (take == req_len
+                    and take % Self.positions_per_page == 0)):
+            self.reuse_dirty[sid] = True
         self.requests[request_id].seq_id = sid
         return True
 
@@ -250,7 +407,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
             self.pages.pages_needed(sid, last_ordinal, self.need)
             if self.pages.fits(self.need):
                 break
-            if not self.evict_warm():
+            if not self.evict_warm_for():
                 self.pages.release(sid)
                 return False
         if not self.pages.reserve(sid, last_ordinal):
@@ -294,7 +451,47 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         self.reuse.append(PrefixReuse(
             sid, False, 0, copy_start,
             len(self.reuse_copies) - copy_start))
+        self.reuse_dirty[sid] = True
         return True
+
+    def request_common_prefix(self, a: Int, b: Int) -> Int:
+        return hashed_prefix_len[Self.positions_per_page](
+            Span(self.requests[a].tokens), self.requests[a].chain,
+            Span(self.requests[b].tokens), self.requests[b].chain)
+
+    @always_inline
+    def slot_want(self, request_id: Int) -> Int:
+        var sid = self.requests[request_id].seq_id
+        var base_pos = self.registry.length(sid)
+        if base_pos >= len(self.requests[request_id].tokens):
+            base_pos = len(self.requests[request_id].tokens) - 1
+        return len(self.requests[request_id].tokens) - base_pos
+
+    def admit_slot(mut self, request_id: Int, mut budget: Int):
+        var sid = self.requests[request_id].seq_id
+        var base_pos = self.registry.length(sid)
+        if base_pos >= len(self.requests[request_id].tokens):
+            base_pos = len(self.requests[request_id].tokens) - 1
+        var want = len(self.requests[request_id].tokens) - base_pos
+        var feed = min(want, budget)
+        for kj in range(len(self.pending)):
+            var j = self.pending[kj]
+            if j == request_id or self.requests[j].seq_id >= 0:
+                continue
+            var common = self.request_common_prefix(request_id, j)
+            if common < Self.positions_per_page:
+                continue
+            var limit = common + Self.positions_per_page - base_pos
+            if limit >= 1 and limit < feed:
+                feed = limit
+        var emit = (base_pos + feed == len(self.requests[request_id].tokens))
+        for t in range(feed):
+            self.schedule.tokens.append(
+                self.requests[request_id].tokens[base_pos + t])
+        self.schedule.slots.append(BatchSlot(
+            sid, base_pos, feed, emit, self.requests[request_id].sampling,
+            self.requests[request_id].cancel))
+        budget -= feed
 
     def preempt_last_slot(mut self, now: UInt):
         var dropped = self.schedule.slots.pop()
@@ -303,20 +500,25 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         var sid = dropped.seq_id
         var owner = self.registry.owner_of(sid)
         var adopted_record = -1
+        var fork_record = -1
         for k in range(len(self.reuse)):
             if self.reuse[k].seq_id != sid:
                 continue
             if self.reuse[k].adopted:
                 adopted_record = k
+            else:
+                fork_record = k
             self.reuse[k].seq_id = -1
         if adopted_record >= 0:
             self.registry.seed(
                 sid, Span(self.requests[owner].tokens),
                 self.reuse[adopted_record].trim_len, now)
             self.registry.set_warm(sid)
-        else:
+        elif fork_record >= 0:
             self.pages.release(sid)
             self.registry.close(sid)
+        else:
+            self.registry.set_warm(sid)
         self.requests[owner].seq_id = -1
 
     def unwind_prefix_reuse(mut self, now: UInt):
@@ -342,14 +544,28 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         self.release_copy_pins()
 
     def build_schedule(mut self, now: UInt) -> Bool:
-        while (self.first_pending < len(self.requests)
-               and self.requests[self.first_pending].done):
-            self.first_pending += 1
+        var kept = List[Int](capacity=len(self.pending))
+        for k in range(len(self.pending)):
+            var i = self.pending[k]
+            if self.requests[i].done:
+                continue
+            if self.requests[i].cancel.cancelled():
+                self.requests[i].done = True
+                var sid = self.requests[i].seq_id
+                if sid >= 0:
+                    self.registry.set_warm(sid)
+                    self.requests[i].seq_id = -1
+                continue
+            kept.append(i)
+        self.pending = kept^
         self.reuse.clear()
         self.reuse_copies.clear()
+        for sid in range(len(self.reuse_dirty)):
+            self.reuse_dirty[sid] = False
 
-        for i in range(self.first_pending, len(self.requests)):
-            if self.requests[i].done or self.requests[i].seq_id >= 0:
+        for k in range(len(self.pending)):
+            var i = self.pending[k]
+            if self.requests[i].seq_id >= 0:
                 continue
             var warm_match = self.best_reusable(i, False)
             var active_match = self.best_reusable(i, True)
@@ -373,6 +589,8 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                     matched = self.adopt_prefix(warm_sid, i, warm_lcp, now)
             if matched:
                 continue
+            if self.dirty_donor_exists(i):
+                continue
             var sid = self.pages.admit()
             if sid < 0:
                 if not self.evict_warm():
@@ -386,35 +604,31 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
 
         self.schedule.clear()
         var budget = self.step_budget
-        for i in range(self.first_pending, len(self.requests)):
-            if self.requests[i].done or self.requests[i].seq_id < 0:
+        var prefill_waiting = False
+        for k in range(len(self.pending)):
+            var i = self.pending[k]
+            if (self.requests[i].seq_id >= 0
+                    and self.slot_want(i) > self.decode_band):
+                prefill_waiting = True
+        var decode_cap = self.max_slots - 1 if prefill_waiting else self.max_slots
+        var slotted = List[Bool](length=len(self.pending), fill=False)
+        for k in range(len(self.pending)):
+            var i = self.pending[k]
+            if self.requests[i].seq_id < 0:
+                continue
+            if len(self.schedule.slots) >= decode_cap or budget < 1:
+                break
+            if self.slot_want(i) > self.decode_band:
+                continue
+            self.admit_slot(i, budget)
+            slotted[k] = True
+        for k in range(len(self.pending)):
+            var i = self.pending[k]
+            if slotted[k] or self.requests[i].seq_id < 0:
                 continue
             if len(self.schedule.slots) >= self.max_slots or budget < 1:
                 break
-            var sid = self.requests[i].seq_id
-            var base_pos = self.registry.length(sid)
-            if base_pos >= len(self.requests[i].tokens):
-                base_pos = len(self.requests[i].tokens) - 1
-            var want = len(self.requests[i].tokens) - base_pos
-            var feed = min(want, budget)
-            for j in range(self.first_pending, len(self.requests)):
-                if (j == i or self.requests[j].done
-                        or self.requests[j].seq_id >= 0):
-                    continue
-                var common = common_prefix_len(
-                    self.requests[i].tokens, self.requests[j].tokens)
-                if common < Self.positions_per_page:
-                    continue
-                var limit = common + Self.positions_per_page - base_pos
-                if limit >= 1 and limit < feed:
-                    feed = limit
-            var emit = (base_pos + feed == len(self.requests[i].tokens))
-            for t in range(feed):
-                self.schedule.tokens.append(
-                    self.requests[i].tokens[base_pos + t])
-            self.schedule.slots.append(BatchSlot(
-                sid, base_pos, feed, emit, self.requests[i].sampling))
-            budget -= feed
+            self.admit_slot(i, budget)
 
         while len(self.schedule.slots) > 0:
             for p in range(len(self.need)):
@@ -427,7 +641,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                     last_pos // Self.positions_per_page, self.need)
             if self.pages.fits(self.need):
                 break
-            if self.evict_warm():
+            if self.evict_warm_for():
                 continue
             if len(self.schedule.slots) == 1:
                 self.unwind_prefix_reuse(now)
@@ -494,11 +708,23 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                 emit_idx += 1
                 self.requests[request_id].generated.append(token)
                 self.requests[request_id].tokens.append(token)
-                if (token == self.eos_token
+                self.requests[request_id].rehash[Self.positions_per_page]()
+                if (self.is_stop_token(token)
                     or len(self.requests[request_id].generated)
-                        >= self.requests[request_id].max_new_tokens):
+                        >= self.requests[request_id].max_new_tokens
+                    or len(self.requests[request_id].tokens)
+                        > self.seq_ceiling):
                     self.requests[request_id].done = True
                     self.registry.set_warm(seq_id)
+
+    def discard_step(mut self):
+        for s in range(len(self.schedule.slots)):
+            var sid = self.schedule.slots[s].seq_id
+            var written_end = (self.schedule.slots[s].base_pos
+                               + self.schedule.slots[s].n_tokens)
+            var floor = written_end - self.ring_capacity
+            if floor > self.ring_floor[sid]:
+                self.ring_floor[sid] = floor
 
     def step[M: ScheduledModel, //](mut self, mut model: M) -> Int:
         comptime assert M.POSITIONS_PER_PAGE == Self.positions_per_page, (
@@ -506,5 +732,8 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         if not self.build_schedule(perf_counter_ns()):
             return 0
         var outs = model.execute(self.schedule, self.pages)
-        self.absorb(outs, perf_counter_ns())
+        if self.schedule.fully_cancelled():
+            self.discard_step()
+        else:
+            self.absorb(outs, perf_counter_ns())
         return len(self.schedule.slots)
