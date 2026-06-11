@@ -5,6 +5,7 @@ from std.reflection import reflect
 from std.sys.info import size_of
 
 from kernels.helpers import Binding
+from modeling.model_spec import ShapeLike
 from modeling.slot import BindContext
 
 
@@ -30,8 +31,8 @@ struct ScaleClass:
 
 
 @always_inline
-def resolve_scratch_bytes(
-    base_elems: Int, element_size: Int, scale: Int, degree: Int, workers: Int,
+def resolve_scratch_elems(
+    base_elems: Int, scale: Int, degree: Int, workers: Int,
 ) -> Int:
     var n = base_elems
     if scale == ScaleClass.PER_DEGREE:
@@ -40,14 +41,15 @@ def resolve_scratch_bytes(
         n = base_elems * workers
     elif scale == ScaleClass.PER_WORKER_PER_DEGREE:
         n = base_elems * workers * degree
-    return aligned_scratch_bytes(n * element_size)
+    return n
 
 
 trait ScratchBufferLike:
     comptime Element: AnyType
     comptime ELEMENT_SIZE: Int
-    comptime BASE_ELEMS: Int
-    comptime SCALE: Int
+
+    @staticmethod
+    def scratch_elems(degree: Int, workers: Int) -> Int: ...
 
 
 @fieldwise_init
@@ -58,6 +60,30 @@ struct ScratchBuffer[T: AnyType, base_elems: Int, scale: Int = ScaleClass.FIXED]
     comptime ELEMENT_SIZE = size_of[Self.T]()
     comptime BASE_ELEMS = Self.base_elems
     comptime SCALE = Self.scale
+
+    @staticmethod
+    @always_inline
+    def scratch_elems(degree: Int, workers: Int) -> Int:
+        return resolve_scratch_elems(
+            Self.base_elems, Self.scale, degree, workers)
+
+
+@fieldwise_init
+struct ShardedScratchBuffer[
+    T: AnyType, rows: Int, S: ShapeLike, col_block: Int = 1,
+](ScratchBufferLike, Copyable, ImplicitlyCopyable):
+    """Per-rank scratch for row-sharded tensor products: `rows` step rows by
+    the shape's per-rank extent. Sizing flows through `S.data_n(degree)` so the
+    shard padding has a single source of truth shared with the weight pack and
+    the dispatch row counts. `col_block` shrinks the per-rank extent for
+    sidecars that carry one element per quantization block."""
+    comptime Element = Self.T
+    comptime ELEMENT_SIZE = size_of[Self.T]()
+
+    @staticmethod
+    @always_inline
+    def scratch_elems(degree: Int, workers: Int) -> Int:
+        return Self.rows * (Self.S.data_n(degree) // Self.col_block)
 
 
 trait ScratchPhaseOrderLike:
@@ -137,8 +163,8 @@ def derive_scratch_plan[T: ScratchPhaseSchema](
                 cur_first >= 0 and cur_last >= cur_first,
                 "scratch buffer declared without a valid phase",
             )
-            sizes[n] = resolve_scratch_bytes(
-                FT.BASE_ELEMS, FT.ELEMENT_SIZE, FT.SCALE, degree, workers)
+            sizes[n] = aligned_scratch_bytes(
+                FT.scratch_elems(degree, workers) * FT.ELEMENT_SIZE)
             firsts[n] = cur_first
             lasts[n] = cur_last
             fields[n] = i
@@ -203,8 +229,8 @@ def co_live_buffers_overlap[T: ScratchPhaseSchema](
             cur_first = T.phase_index[FT.FIRST_NAME]()
             cur_last = T.phase_index[FT.LAST_NAME]()
         comptime if conforms_to(FT, ScratchBufferLike):
-            sizes[n] = resolve_scratch_bytes(
-                FT.BASE_ELEMS, FT.ELEMENT_SIZE, FT.SCALE, degree, workers)
+            sizes[n] = aligned_scratch_bytes(
+                FT.scratch_elems(degree, workers) * FT.ELEMENT_SIZE)
             firsts[n] = cur_first
             lasts[n] = cur_last
             offs[n] = plan.offsets[i]

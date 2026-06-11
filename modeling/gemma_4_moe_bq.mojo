@@ -40,7 +40,8 @@ from butterquant import (
 from butterquant.vnni import VNNI_N_STEP, VNNI_K_STEP
 from butterquant.amx_tiles import prime_amx_environment
 from modeling.temporal_scratch import (
-    ScratchBuffer, ScratchIsland, ScratchPhase, ScratchPhaseOrder, ScaleClass,
+    ScratchBuffer, ShardedScratchBuffer, ScratchIsland, ScratchPhase,
+    ScratchPhaseOrder, ScaleClass,
     TemporalScratchPool, ScratchPlan,
     derive_scratch_plan, aggregate_scratch_peak, co_live_buffers_overlap,
 )
@@ -304,7 +305,6 @@ comptime SLIDING_PARTIAL_STRIDE_MAX = flash_partial_stride(
     SLIDING_NUM_Q_MAX, C.HEAD_DIM_SLIDING)
 comptime FULL_NUM_Q = C.Q_DIM_FULL // C.HEAD_DIM_FULL
 comptime FULL_PARTIAL_STRIDE = flash_partial_stride(FULL_NUM_Q, C.HEAD_DIM_FULL)
-comptime SLIDING_NB_DOWN = C.INTERMEDIATE // C.DOWN_FWHT_BLOCK
 comptime MOE_NB_DOWN = C.MOE_INTERMEDIATE // C.DOWN_FWHT_BLOCK
 comptime HEAD_NB = C.HIDDEN // 128
 
@@ -426,21 +426,21 @@ struct Gemma4FfnMoeScratch(ScratchIsland, Copyable, ImplicitlyCopyable):
     ]
 
     var ffn_gate_band: ScratchPhase["dense_gate_up", "dense_down_quant"]
-    var ffn_gate: ScratchBuffer[
-        BFloat16, C.SLIDING_WINDOW * C.INTERMEDIATE, ScaleClass.PER_DEGREE,
+    var ffn_gate: ShardedScratchBuffer[
+        BFloat16, C.SLIDING_WINDOW, Gemma4Shapes.GateUp,
     ]
 
     var ffn_up_band: ScratchPhase["dense_gate_up", "dense_gate_up"]
-    var ffn_up: ScratchBuffer[
-        BFloat16, C.SLIDING_WINDOW * C.INTERMEDIATE, ScaleClass.PER_DEGREE,
+    var ffn_up: ShardedScratchBuffer[
+        BFloat16, C.SLIDING_WINDOW, Gemma4Shapes.GateUp,
     ]
 
     var dense_gate_band: ScratchPhase["dense_down_quant", "dense_down_post"]
-    var dense_gate_i8: ScratchBuffer[
-        Int8, C.SLIDING_WINDOW * C.INTERMEDIATE, ScaleClass.PER_DEGREE,
+    var dense_gate_i8: ShardedScratchBuffer[
+        Int8, C.SLIDING_WINDOW, Gemma4Shapes.GateUp,
     ]
-    var dense_gate_sa: ScratchBuffer[
-        Float32, C.SLIDING_WINDOW * SLIDING_NB_DOWN, ScaleClass.PER_DEGREE,
+    var dense_gate_sa: ShardedScratchBuffer[
+        Float32, C.SLIDING_WINDOW, Gemma4Shapes.GateUp, C.DOWN_FWHT_BLOCK,
     ]
     var dense_gate_row_workspace_band: ScratchPhase[
         "dense_down_quant", "dense_down_quant",

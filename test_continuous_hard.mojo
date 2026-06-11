@@ -6,7 +6,7 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
-from modeling.gemma_4_moe_bq import Gemma4
+from modeling.gemma_4_moe import Gemma4
 from modeling.gemma4_common import Gemma4BaseConfig
 from kernels.flash_sample import SamplingParams
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
@@ -15,7 +15,7 @@ from test_sequences import sample_prompts
 
 
 comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
-comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-bq"
+comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B"
 comptime MAX_NEW_TOKENS = 128
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime BOS_TOKEN_ID = 2
@@ -160,17 +160,14 @@ def load_and_run[
 
 
 def main():
-    print("Continuous-batching pair test (bq): two long prompts")
+    print("Continuous-batching hard test")
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:
         print(t"failed to load tokenizer from {TOKENIZER_PATH}")
         return
     var tok = tok_opt.take()
 
-    var raw_all = sample_prompts()
-    var raw = List[String]()
-    raw.append(raw_all[0])
-    raw.append(raw_all[1])
+    var raw = sample_prompts()
     var prompts = List[List[Int32]]()
     for k in range(len(raw)):
         prompts.append(encode_prompt(tok, raw[k]))
