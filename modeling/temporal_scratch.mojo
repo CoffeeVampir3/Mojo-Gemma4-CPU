@@ -246,6 +246,17 @@ def co_live_buffers_overlap[T: ScratchPhaseSchema](
     return False
 
 
+def derive_checked_plan[T: ScratchPhaseSchema](
+    degree: Int, workers: Int,
+) -> ScratchPlan:
+    var plan = derive_scratch_plan[T](degree, workers)
+    debug_assert(
+        not co_live_buffers_overlap[T](plan, degree, workers),
+        "scratch plan overlaps co-live buffers",
+    )
+    return plan
+
+
 def aggregate_scratch_peak[T: AnyType](degree: Int, workers: Int) -> Int:
     var m = 0
     comptime for i in range(reflect[T].field_count()):

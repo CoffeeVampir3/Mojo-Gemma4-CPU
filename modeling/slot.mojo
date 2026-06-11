@@ -32,6 +32,9 @@ trait SlotLike:
     @always_inline
     def set_offset(mut self, off: Int): ...
 
+    @always_inline
+    def get_offset(self) -> Int: ...
+
 
 trait SlotGroup(FieldwiseDefault):
     pass
@@ -91,6 +94,10 @@ struct Slot[
     @always_inline
     def set_offset(mut self, off: Int):
         self.offset = off
+
+    @always_inline
+    def get_offset(self) -> Int:
+        return self.offset
 
     @always_inline
     def at(self, base: Int) -> UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin]:
