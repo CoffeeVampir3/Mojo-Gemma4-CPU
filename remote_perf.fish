@@ -108,6 +108,7 @@ rsync -av \
     --include='checkpoints/gemma-4-26B-A4B/*' \
     --include='checkpoints/gemma-4-26B-A4B-it/*' \
     --include='checkpoints/gemma-4-26B-A4B-bq/model.safetensors' \
+    --include='checkpoints/gemma-4-26B-A4B-it-bq/model.safetensors' \
     --exclude='checkpoints/**/*.safetensors' \
     . \
     $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/

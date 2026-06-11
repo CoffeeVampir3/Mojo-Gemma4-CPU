@@ -13,12 +13,38 @@ from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
 from continuous_batching.scheduler import ContinuousBatchScheduler
 
 
-comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
-comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-bq"
 comptime MAX_NEW_TOKENS = 128
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime BOS_TOKEN_ID = 2
 comptime EOS_TOKEN_ID = 1
+comptime TURN_START_TOKEN_ID = 105
+comptime TURN_END_TOKEN_ID = 106
+
+
+@fieldwise_init
+struct VariantSetup(Copyable, Movable):
+    var tokenizer_path: String
+    var model_dir: String
+    var stop_token_id: Int
+    var chat_format: Bool
+
+
+def base_setup() -> VariantSetup:
+    return VariantSetup(
+        "checkpoints/gemma-4-26B-A4B/tokenizer.json",
+        "checkpoints/gemma-4-26B-A4B-bq",
+        EOS_TOKEN_ID,
+        False,
+    )
+
+
+def instruct_setup() -> VariantSetup:
+    return VariantSetup(
+        "checkpoints/gemma-4-26B-A4B-it/tokenizer.json",
+        "checkpoints/gemma-4-26B-A4B-it-bq",
+        TURN_END_TOKEN_ID,
+        True,
+    )
 
 
 def elapsed_ms_since(start_ns: UInt) -> Int:
@@ -31,15 +57,32 @@ def tokens_per_second(token_count: Int, elapsed_ms: Int) -> Int:
     return token_count * 1000 // elapsed_ms
 
 
+def append_encoded(
+    mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
+    mut token_ids: List[Int32],
+    text: String,
+):
+    var encoded = tok.encode(text)
+    for i in range(len(encoded)):
+        token_ids.append(Int32(encoded[i]))
+
+
 def encode_prompt(
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
+    read setup: VariantSetup,
     prompt: String,
 ) -> List[Int32]:
     var token_ids = List[Int32]()
     token_ids.append(Int32(BOS_TOKEN_ID))
-    var encoded = tok.encode(prompt)
-    for i in range(len(encoded)):
-        token_ids.append(Int32(encoded[i]))
+    if setup.chat_format:
+        token_ids.append(Int32(TURN_START_TOKEN_ID))
+        append_encoded(tok, token_ids, "user\n" + prompt)
+        token_ids.append(Int32(TURN_END_TOKEN_ID))
+        append_encoded(tok, token_ids, "\n")
+        token_ids.append(Int32(TURN_START_TOKEN_ID))
+        append_encoded(tok, token_ids, "model\n")
+    else:
+        append_encoded(tok, token_ids, prompt)
     return token_ids^
 
 
@@ -68,12 +111,13 @@ def load_and_run[
 ](
     topo: NumaTopology,
     var pools: List[P],
+    read setup: VariantSetup,
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read token_ids: List[Int32],
 ):
     var t0 = perf_counter_ns()
     var model_opt = Gemma4[profile=True, Pool=P].load(
-        Path(MODEL_DIR), topo, pools^)
+        Path(setup.model_dir), topo, pools^)
     if not model_opt:
         return
     var model = model_opt.take()
@@ -85,7 +129,7 @@ def load_and_run[
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
         Gemma4[profile=True, Pool=P].POSITIONS_PER_PAGE,
-    ](model.batch_geometry(), STEP_BUDGET, Int32(EOS_TOKEN_ID))
+    ](model.batch_geometry(), STEP_BUDGET, Int32(setup.stop_token_id))
 
     var prompt_tokens = List[Int32](capacity=len(token_ids))
     for i in range(len(token_ids)):
@@ -127,9 +171,10 @@ def load_and_run[
 
 def main():
     print("Launching.")
-    var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
+    var setup = instruct_setup()
+    var tok_opt = load_tokenizer(Path(setup.tokenizer_path))
     if not tok_opt:
-        print(t"failed to load tokenizer from {TOKENIZER_PATH}")
+        print(t"failed to load tokenizer from {setup.tokenizer_path}")
         return
     var tok = tok_opt.take()
 
@@ -139,8 +184,40 @@ The earliest aqueduct in Rome, the Aqua Appia, was commissioned in 312 BC and ra
 
 Beyond Rome itself, provincial cities throughout Gaul, Hispania, and North Africa built their own aqueducts, many of which still stand today. The Pont du Gard in southern France and the aqueduct of Segovia in Spain remain among the best preserved, their multi-tiered arches a testament to the durability of Roman construction. Maintenance was the responsibility of a dedicated office, and a permanent staff of workers inspected the channels, cleared sediment, and repaired leaks.
 
+The decline of the aqueduct network paralleled the broader collapse of Roman administrative power in the West. As central authority weakened, the resources and expertise needed to maintain the channels disappeared, and many fell into disrepair or were deliberately cut during sieges. Nevertheless, the underlying principles of gradient flow and durable masonry influenced water engineering for centuries, and several aqueducts were restored and returned to service during the Renaissance.
+
+The Roman aqueducts were a system of engineering structures built by the ancient Romans to transport water from distant sources into cities and towns. Constructed from a combination of stone, brick, and a special volcanic cement known as pozzolana, these channels supplied public baths, latrines, fountains, and private households across the empire. The water flowed largely by gravity alone, descending along a very gentle gradient maintained over distances that sometimes exceeded a hundred kilometres.
+
+The earliest aqueduct in Rome, the Aqua Appia, was commissioned in 312 BC and ran almost entirely underground to protect it from contamination and enemy sabotage. As the city's population grew, later aqueducts such as the Aqua Marcia and the Aqua Claudia carried far greater volumes and rose onto towering arched bridges where the terrain dipped. At the height of the empire, eleven major aqueducts served the capital, together delivering an estimated one million cubic metres of water each day.
+
+Beyond Rome itself, provincial cities throughout Gaul, Hispania, and North Africa built their own aqueducts, many of which still stand today. The Pont du Gard in southern France and the aqueduct of Segovia in Spain remain among the best preserved, their multi-tiered arches a testament to the durability of Roman construction. Maintenance was the responsibility of a dedicated office, and a permanent staff of workers inspected the channels, cleared sediment, and repaired leaks.
+
+The decline of the aqueduct network paralleled the broader collapse of Roman administrative power in the West. As central authority weakened, the resources and expertise needed to maintain the channels disappeared, and many fell into disrepair or were deliberately cut during sieges. Nevertheless, the underlying principles of gradient flow and durable masonry influenced water engineering for centuries, and several aqueducts were restored and returned to service during the Renaissance.
+
+The Roman aqueducts were a system of engineering structures built by the ancient Romans to transport water from distant sources into cities and towns. Constructed from a combination of stone, brick, and a special volcanic cement known as pozzolana, these channels supplied public baths, latrines, fountains, and private households across the empire. The water flowed largely by gravity alone, descending along a very gentle gradient maintained over distances that sometimes exceeded a hundred kilometres.
+
+The earliest aqueduct in Rome, the Aqua Appia, was commissioned in 312 BC and ran almost entirely underground to protect it from contamination and enemy sabotage. As the city's population grew, later aqueducts such as the Aqua Marcia and the Aqua Claudia carried far greater volumes and rose onto towering arched bridges where the terrain dipped. At the height of the empire, eleven major aqueducts served the capital, together delivering an estimated one million cubic metres of water each day.
+
+Beyond Rome itself, provincial cities throughout Gaul, Hispania, and North Africa built their own aqueducts, many of which still stand today. The Pont du Gard in southern France and the aqueduct of Segovia in Spain remain among the best preserved, their multi-tiered arches a testament to the durability of Roman construction. Maintenance was the responsibility of a dedicated office, and a permanent staff of workers inspected the channels, cleared sediment, and repaired leaks.
+
+The decline of the aqueduct network paralleled the broader collapse of Roman administrative power in the West. As central authority weakened, the resources and expertise needed to maintain the channels disappeared, and many fell into disrepair or were deliberately cut during sieges. Nevertheless, the underlying principles of gradient flow and durable masonry influenced water engineering for centuries, and several aqueducts were restored and returned to service during the Renaissance.
+
+The Roman aqueducts were a system of engineering structures built by the ancient Romans to transport water from distant sources into cities and towns. Constructed from a combination of stone, brick, and a special volcanic cement known as pozzolana, these channels supplied public baths, latrines, fountains, and private households across the empire. The water flowed largely by gravity alone, descending along a very gentle gradient maintained over distances that sometimes exceeded a hundred kilometres.
+
+The earliest aqueduct in Rome, the Aqua Appia, was commissioned in 312 BC and ran almost entirely underground to protect it from contamination and enemy sabotage. As the city's population grew, later aqueducts such as the Aqua Marcia and the Aqua Claudia carried far greater volumes and rose onto towering arched bridges where the terrain dipped. At the height of the empire, eleven major aqueducts served the capital, together delivering an estimated one million cubic metres of water each day.
+
+Beyond Rome itself, provincial cities throughout Gaul, Hispania, and North Africa built their own aqueducts, many of which still stand today. The Pont du Gard in southern France and the aqueduct of Segovia in Spain remain among the best preserved, their multi-tiered arches a testament to the durability of Roman construction. Maintenance was the responsibility of a dedicated office, and a permanent staff of workers inspected the channels, cleared sediment, and repaired leaks.
+
+The decline of the aqueduct network paralleled the broader collapse of Roman administrative power in the West. As central authority weakened, the resources and expertise needed to maintain the channels disappeared, and many fell into disrepair or were deliberately cut during sieges. Nevertheless, the underlying principles of gradient flow and durable masonry influenced water engineering for centuries, and several aqueducts were restored and returned to service during the Renaissance.
+
+The Roman aqueducts were a system of engineering structures built by the ancient Romans to transport water from distant sources into cities and towns. Constructed from a combination of stone, brick, and a special volcanic cement known as pozzolana, these channels supplied public baths, latrines, fountains, and private households across the empire. The water flowed largely by gravity alone, descending along a very gentle gradient maintained over distances that sometimes exceeded a hundred kilometres.
+
+The earliest aqueduct in Rome, the Aqua Appia, was commissioned in 312 BC and ran almost entirely underground to protect it from contamination and enemy sabotage. As the city's population grew, later aqueducts such as the Aqua Marcia and the Aqua Claudia carried far greater volumes and rose onto towering arched bridges where the terrain dipped. At the height of the empire, eleven major aqueducts served the capital, together delivering an estimated one million cubic metres of water each day.
+
+Beyond Rome itself, provincial cities throughout Gaul, Hispania, and North Africa built their own aqueducts, many of which still stand today. The Pont du Gard in southern France and the aqueduct of Segovia in Spain remain among the best preserved, their multi-tiered arches a testament to the durability of Roman construction. Maintenance was the responsibility of a dedicated office, and a permanent staff of workers inspected the channels, cleared sediment, and repaired leaks.
+
 The decline of the aqueduct network paralleled the broader collapse of Roman administrative power in the West. As central authority weakened, the resources and expertise needed to maintain the channels disappeared, and many fell into disrepair or were deliberately cut during sieges. Nevertheless, the underlying principles of gradient flow and durable masonry influenced water engineering for centuries, and several aqueducts were restored and returned to service during the Renaissance."""
-    var token_ids = encode_prompt(tok, prompt)
+    var token_ids = encode_prompt(tok, setup, prompt)
     print_prompt(prompt, token_ids)
 
     var topo = NumaTopology()
@@ -152,7 +229,7 @@ The decline of the aqueduct network paralleled the broader collapse of Roman adm
     def dispatch_gemma4_tp[
         P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        load_and_run(topo, selected_pools^, tok, token_ids)
+        load_and_run(topo, selected_pools^, setup, tok, token_ids)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_gemma4_tp,
