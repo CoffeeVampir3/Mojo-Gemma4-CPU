@@ -106,6 +106,7 @@ rsync -av \
     --exclude='tp_param_bin' \
     --include='checkpoints/SmolLM2/model.safetensors' \
     --include='checkpoints/gemma-4-26B-A4B/*' \
+    --include='checkpoints/gemma-4-26B-A4B-it/*' \
     --include='checkpoints/gemma-4-26B-A4B-bq/model.safetensors' \
     --exclude='checkpoints/**/*.safetensors' \
     . \
