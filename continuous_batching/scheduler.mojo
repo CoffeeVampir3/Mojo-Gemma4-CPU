@@ -488,15 +488,23 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         for t in range(feed):
             self.schedule.tokens.append(
                 self.requests[request_id].tokens[base_pos + t])
-        self.schedule.slots.append(BatchSlot(
-            sid, base_pos, feed, emit, self.requests[request_id].sampling,
-            self.requests[request_id].cancel))
+        var prompt_len = (len(self.requests[request_id].tokens)
+                          - len(self.requests[request_id].generated))
+        var slot = BatchSlot(
+            sid, request_id, base_pos, feed, prompt_len, emit,
+            self.requests[request_id].sampling,
+            self.requests[request_id].cancel)
+        self.schedule.prefill_tokens += slot.prefill_count()
+        self.schedule.decode_tokens += slot.decode_count()
+        self.schedule.slots.append(slot)
         budget -= feed
 
     def preempt_last_slot(mut self, now: UInt):
         var dropped = self.schedule.slots.pop()
         for _ in range(dropped.n_tokens):
             _ = self.schedule.tokens.pop()
+        self.schedule.prefill_tokens -= dropped.prefill_count()
+        self.schedule.decode_tokens -= dropped.decode_count()
         var sid = dropped.seq_id
         var owner = self.registry.owner_of(sid)
         var adopted_record = -1

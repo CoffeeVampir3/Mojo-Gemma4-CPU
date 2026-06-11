@@ -126,7 +126,7 @@ def load_and_run[
 
 
 def main():
-    print("Launching.")
+    print("Launching single-sequence LONG prompt test.")
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:
         print(t"failed to load tokenizer from {TOKENIZER_PATH}")
@@ -140,7 +140,8 @@ The earliest aqueduct in Rome, the Aqua Appia, was commissioned in 312 BC and ra
 Beyond Rome itself, provincial cities throughout Gaul, Hispania, and North Africa built their own aqueducts, many of which still stand today. The Pont du Gard in southern France and the aqueduct of Segovia in Spain remain among the best preserved, their multi-tiered arches a testament to the durability of Roman construction. Maintenance was the responsibility of a dedicated office, and a permanent staff of workers inspected the channels, cleared sediment, and repaired leaks.
 
 The decline of the aqueduct network paralleled the broader collapse of Roman administrative power in the West. As central authority weakened, the resources and expertise needed to maintain the channels disappeared, and many fell into disrepair or were deliberately cut during sieges. Nevertheless, the underlying principles of gradient flow and durable masonry influenced water engineering for centuries, and several aqueducts were restored and returned to service during the Renaissance."""
-    var token_ids = encode_prompt(tok, prompt)
+    var long_prompt = prompt + "\n\n" + prompt + "\n\n" + prompt
+    var token_ids = encode_prompt(tok, long_prompt)
     print_prompt(prompt, token_ids)
 
     var topo = NumaTopology()

@@ -29,11 +29,26 @@ struct CancelToken(Copyable, Movable, ImplicitlyCopyable):
 @fieldwise_init
 struct BatchSlot(Copyable, Movable, ImplicitlyCopyable):
     var seq_id: Int
+    var request_id: Int
     var base_pos: Int
     var n_tokens: Int
+    var prompt_len: Int
     var emit: Bool
     var sampling: SamplingParams
     var cancel: CancelToken
+
+    @always_inline
+    def prefill_count(self) -> Int:
+        var prefill = self.prompt_len - self.base_pos
+        if prefill < 0:
+            return 0
+        if prefill > self.n_tokens:
+            return self.n_tokens
+        return prefill
+
+    @always_inline
+    def decode_count(self) -> Int:
+        return self.n_tokens - self.prefill_count()
 
 
 @fieldwise_init
@@ -49,16 +64,22 @@ struct Schedule(Movable):
     var slots: List[BatchSlot]
     var tokens: List[Int32]
     var copies: List[PageCopy]
+    var prefill_tokens: Int
+    var decode_tokens: Int
 
     def __init__(out self):
         self.slots = List[BatchSlot]()
         self.tokens = List[Int32]()
         self.copies = List[PageCopy]()
+        self.prefill_tokens = 0
+        self.decode_tokens = 0
 
     def clear(mut self):
         self.slots.clear()
         self.tokens.clear()
         self.copies.clear()
+        self.prefill_tokens = 0
+        self.decode_tokens = 0
 
     def fully_cancelled(self) -> Bool:
         if len(self.slots) == 0:

@@ -1,4 +1,5 @@
 from std.collections import InlineArray
+from std.memory import UnsafePointer
 
 from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
@@ -7,8 +8,8 @@ from kernels.helpers import (
     accumulate_scaled, scale_unrolled,
 )
 from kernels.attention_ops import (
-    KVSlot, RingKV, LinearKV, TILE, online_softmax_tile, zero_accumulators,
-    full_local_kv_count,
+    KVSlot, KVRunTable, PagedKV, TILE, online_softmax_tile, zero_accumulators,
+    full_local_kv_count, pow2_shift,
 )
 from kernels.attention_dispatch_kernels import (
     dispatch_flash_sliding, dispatch_flash_full,
@@ -30,9 +31,10 @@ def vnni_score_dot[head_dim: Int](k_i8: I8Ptr, q_i8: I8Ptr) -> Int32:
 
 @always_inline
 def bq_process_kv_tile[
-    max_q: Int, //,
-    KV: KVSlot, head_dim: Int, gqa_ratio: Int,
+    max_q: Int, KV: KVSlot, //,
+    head_dim: Int, gqa_ratio: Int,
 ](
+    kv: KV,
     read q_ptrs: InlineArray[I8Ptr, max_q],
     read qi_bias: InlineArray[Float32, max_q],
     read f_q: InlineArray[Float32, max_q],
@@ -49,7 +51,7 @@ def bq_process_kv_tile[
 
     var slots = InlineArray[Int, TILE](uninitialized=True)
     for t in range(tile_len):
-        slots[t] = KV.slot(start_pos, pos + t)
+        slots[t] = kv.slot(start_pos, pos + t)
 
     for q_idx in range(num_q):
         var kv_h = q_idx // gqa_ratio
@@ -84,6 +86,7 @@ struct BqFlashAttentionKernel[
     KV: KVSlot,
     head_dim: Int, max_q: Int, gqa_ratio: Int,
 ](WorkerRangePartitionedKernel):
+    var kv: Self.KV
     var q: I8Ptr
     var qi_bias: F32Ptr
     var f_q: F32Ptr
@@ -125,8 +128,8 @@ struct BqFlashAttentionKernel[
         while pos < self.end:
             var tile_len = min(TILE, self.end - pos)
             bq_process_kv_tile[
-                Self.KV, Self.head_dim, Self.gqa_ratio,
-            ](q_ptrs, qb, fq, self.k_base, self.v_base,
+                Self.head_dim, Self.gqa_ratio,
+            ](self.kv, q_ptrs, qb, fq, self.k_base, self.v_base,
               self.k_scale, self.v_scale,
               self.start_pos, pos, tile_len, m, l, acc_ptrs,
               self.num_q, self.num_kv, self.kv_stride)
@@ -146,8 +149,9 @@ struct BqFlashAttentionKernel[
 @fieldwise_init
 struct BqFlashPrefillSlidingKernel[
     head_dim: Int, max_q: Int, gqa_ratio: Int,
-    window: Int, cache_size: Int,
+    window: Int, cache_size: Int, page_len: Int,
 ](WorkerRangePartitionedKernel):
+    var runs: UnsafePointer[KVRunTable, MutAnyOrigin]
     var q: I8Ptr
     var qi_bias: F32Ptr
     var f_q: F32Ptr
@@ -161,13 +165,15 @@ struct BqFlashPrefillSlidingKernel[
     var num_kv: Int
     var kv_stride: Int
     var partial_stride: Int
-    var base_pos: Int
     var worker_id: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
         var q_stride = self.num_q * Self.head_dim
+        comptime page_shift = pow2_shift(Self.page_len)
+        comptime row_mask = Self.page_len - 1
+        comptime page_mask = Self.cache_size // Self.page_len - 1
 
         var scratch = self.partials + self.worker_id * self.partial_stride
         var acc_ptrs = InlineArray[F32Ptr, Self.max_q](uninitialized=True)
@@ -175,8 +181,23 @@ struct BqFlashPrefillSlidingKernel[
         for h in range(self.num_q):
             acc_ptrs[h] = scratch + h * Self.head_dim
 
+        ref run_list = self.runs[].runs
+        var num_runs = len(run_list)
+        var r = 0
+        var kv = PagedKV(
+            self.runs[].row_ptr(0), page_shift, row_mask, page_mask)
+        var run_start = Int(run_list[0].buf_start)
+        var run_pos = Int(run_list[0].base_pos)
+
         for t in range(self.start, self.end):
-            var abs_pos = self.base_pos + t
+            while r + 1 < num_runs and t >= Int(run_list[r + 1].buf_start):
+                r += 1
+                kv = PagedKV(
+                    self.runs[].row_ptr(r),
+                    page_shift, row_mask, page_mask)
+                run_start = Int(run_list[r].buf_start)
+                run_pos = Int(run_list[r].base_pos)
+            var abs_pos = run_pos + (t - run_start)
             var lo = max(0, abs_pos - Self.window + 1)
             var hi = abs_pos + 1
 
@@ -197,8 +218,8 @@ struct BqFlashPrefillSlidingKernel[
             while pos < hi:
                 var tile_len = min(TILE, hi - pos)
                 bq_process_kv_tile[
-                    RingKV[Self.cache_size], Self.head_dim, Self.gqa_ratio,
-                ](q_ptrs, qb, fq, self.k_base, self.v_base,
+                    Self.head_dim, Self.gqa_ratio,
+                ](kv, q_ptrs, qb, fq, self.k_base, self.v_base,
                   self.k_scale, self.v_scale,
                   0, pos, tile_len, m, l, acc_ptrs,
                   self.num_q, self.num_kv, self.kv_stride)
@@ -227,6 +248,7 @@ struct BqFlashPrefillFullKernel[
     head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
     partial_stride: Int,
 ](RangePartitionedKernel):
+    var runs: UnsafePointer[KVRunTable, MutAnyOrigin]
     var q: I8Ptr
     var qi_bias: F32Ptr
     var f_q: F32Ptr
@@ -237,8 +259,9 @@ struct BqFlashPrefillFullKernel[
     var partials: F32Ptr
     var kv_stride: Int
     var degree: Int
-    var base_pos: Int
     var rank: Int
+    var page_shift: Int
+    var row_mask: Int
     var start: Int
     var end: Int
 
@@ -250,8 +273,24 @@ struct BqFlashPrefillFullKernel[
         var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
         var q_ptrs = InlineArray[I8Ptr, Self.num_q](uninitialized=True)
 
+        ref run_list = self.runs[].runs
+        var num_runs = len(run_list)
+        var r = 0
+        var kv = PagedKV(
+            self.runs[].row_ptr(0),
+            self.page_shift, self.row_mask, -1)
+        var run_start = Int(run_list[0].buf_start)
+        var run_pos = Int(run_list[0].base_pos)
+
         for t in range(self.start, self.end):
-            var abs_pos = self.base_pos + t
+            while r + 1 < num_runs and t >= Int(run_list[r + 1].buf_start):
+                r += 1
+                kv = PagedKV(
+                    self.runs[].row_ptr(r),
+                    self.page_shift, self.row_mask, -1)
+                run_start = Int(run_list[r].buf_start)
+                run_pos = Int(run_list[r].base_pos)
+            var abs_pos = run_pos + (t - run_start)
             var local_kv_count = full_local_kv_count(
                 self.rank, abs_pos, self.degree)
 
@@ -274,8 +313,8 @@ struct BqFlashPrefillFullKernel[
             while pos < local_kv_count:
                 var tile_len = min(TILE, local_kv_count - pos)
                 bq_process_kv_tile[
-                    LinearKV, Self.head_dim, Self.gqa_ratio,
-                ](q_ptrs, qb, fq, self.k_base, self.v_base,
+                    Self.head_dim, Self.gqa_ratio,
+                ](kv, q_ptrs, qb, fq, self.k_base, self.v_base,
                   self.k_scale, self.v_scale,
                   0, pos, tile_len, m, l, acc_ptrs,
                   Self.num_q, Self.num_kv, self.kv_stride)
@@ -294,7 +333,7 @@ struct BqFlashPrefillFullKernel[
 def dispatch_bq_sliding_attention[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     head_dim: Int, max_q: Int, gqa_ratio: Int,
-    window: Int, cache_size: Int,
+    window: Int, cache_size: Int, page_len: Int,
     max_worker_count: Int = 128,
 ](
     q: Binding[Int8, o],
@@ -306,50 +345,66 @@ def dispatch_bq_sliding_attention[
     v_scale: Binding[Float32, o],
     output: Binding[BFloat16, o],
     partials: Binding[Float32, o],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     num_q: Int, num_kv: Int, partial_stride: Int, kv_stride: Int,
-    base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime DecodeK = BqFlashAttentionKernel[
-        RingKV[cache_size],
-        head_dim, max_q, gqa_ratio,
+        PagedKV, head_dim, max_q, gqa_ratio,
     ]
     comptime PrefillK = BqFlashPrefillSlidingKernel[
-        head_dim, max_q, gqa_ratio, window, cache_size,
+        head_dim, max_q, gqa_ratio, window, cache_size, page_len,
     ]
+    comptime page_shift = pow2_shift(page_len)
+    comptime row_mask = page_len - 1
+    comptime page_mask = cache_size // page_len - 1
     var nq = num_q
     var nkv = num_kv
     var ps = partial_stride
     var ks = kv_stride
-    var bp = base_pos
 
     @parameter
     def make_decode(r: Int, start_pos: Int) -> DecodeK:
-        return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+        var kv = PagedKV(
+            runs[].row_ptr(0),
+            page_shift, row_mask, page_mask)
+        return DecodeK(kv, q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
                        v_base[r], v_scale[r], partials[r],
                        nq, nkv, ks, ps, 0, start_pos, 0, 0)
 
     @parameter
     def make_prefill(r: Int) -> PrefillK:
-        return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+        return PrefillK(runs, q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
                         v_base[r], v_scale[r], output[r], partials[r],
-                        nq, nkv, ks, ps, bp, 0, 0, 0)
+                        nq, nkv, ks, ps, 0, 0, 0)
+
+    @parameter
+    def make_decode_run(r: Int, run_idx: Int, start_pos: Int) -> DecodeK:
+        var kv = PagedKV(
+            runs[].row_ptr(run_idx),
+            page_shift, row_mask, page_mask)
+        var q_off = Int(runs[].runs[run_idx].buf_start) * nq * head_dim
+        var b_off = Int(runs[].runs[run_idx].buf_start) * nq
+        return DecodeK(kv, q[r] + q_off, qi_bias[r] + b_off, f_q[r] + b_off,
+                       k_base[r], k_scale[r], v_base[r], v_scale[r],
+                       partials[r], nq, nkv, ks, ps, 0, start_pos, 0, 0)
 
     dispatch_flash_sliding[
         head_dim, window, 1,
-        make_decode, make_prefill,
-        "sliding_attention.decode", "sliding_attention.prefill",
+        make_decode, make_prefill, make_decode_run,
+        "bq_sliding_attn.flash", "bq_sliding_attn.prefill",
+        "bq_sliding_attn.flash_batched",
         max_worker_count=max_worker_count,
-    ](output, partials, num_q, partial_stride, kv_stride, base_pos, seq_len,
+    ](output, partials, runs, num_q, partial_stride, kv_stride, seq_len,
       pools, prof)
 
 
 def dispatch_bq_full_attention[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     head_dim: Int, num_q: Int, num_kv: Int, gqa_ratio: Int,
-    kv_stride: Int, partial_stride: Int,
+    kv_stride: Int, partial_stride: Int, page_len: Int,
     max_worker_count: Int = 128,
 ](
     q: Binding[Int8, o],
@@ -362,47 +417,65 @@ def dispatch_bq_full_attention[
     q_local_output: Binding[BFloat16, o],
     partials: Binding[Float32, o],
     segment_scratch: Binding[MergeSegment, o],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     local_num_q: Int,
-    base_pos: Int,
     seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime DecodeK = BqFlashAttentionKernel[
-        LinearKV, head_dim, num_q, gqa_ratio,
+        PagedKV, head_dim, num_q, gqa_ratio,
     ]
     comptime PrefillK = BqFlashPrefillFullKernel[
         head_dim, num_q, num_kv, gqa_ratio, partial_stride,
     ]
-    var bp = base_pos
     var degree = len(pools)
+    var rows_per_page = page_len // degree
+    var page_shift = pow2_shift(rows_per_page)
+    var row_mask = rows_per_page - 1
 
     @parameter
     def make_decode(r: Int) -> DecodeK:
-        return DecodeK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+        var kv = PagedKV(
+            runs[].row_ptr(0), page_shift, row_mask, -1)
+        return DecodeK(kv, q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
                        v_base[r], v_scale[r], partials[r],
                        num_q, num_kv, kv_stride, partial_stride, 0, 0, 0, 0)
 
     @parameter
     def make_prefill(r: Int) -> PrefillK:
-        return PrefillK(q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
+        return PrefillK(runs, q[r], qi_bias[r], f_q[r], k_base[r], k_scale[r],
                         v_base[r], v_scale[r], partials[r],
-                        kv_stride, degree, bp, r, 0, 0)
+                        kv_stride, degree, r, page_shift, row_mask, 0, 0)
+
+    @parameter
+    def make_decode_run(r: Int, run_idx: Int) -> DecodeK:
+        var kv = PagedKV(
+            runs[].row_ptr(run_idx),
+            page_shift, row_mask, -1)
+        var q_off = Int(runs[].runs[run_idx].buf_start) * num_q * head_dim
+        var b_off = Int(runs[].runs[run_idx].buf_start) * num_q
+        return DecodeK(kv, q[r] + q_off, qi_bias[r] + b_off, f_q[r] + b_off,
+                       k_base[r], k_scale[r], v_base[r], v_scale[r],
+                       partials[r], num_q, num_kv, kv_stride, partial_stride,
+                       0, 0, 0, 0)
 
     dispatch_flash_full[
         head_dim, kv_stride, 1,
-        make_decode, make_prefill,
-        "full_attention.decode", "full_attention.prefill",
+        make_decode, make_prefill, make_decode_run,
+        "bq_full_attn.flash", "bq_full_attn.prefill",
+        "bq_full_attn.flash_batched",
         max_worker_count=max_worker_count,
-    ](q_local_output, partials, segment_scratch,
-      num_q, local_num_q, partial_stride, base_pos, seq_len, pools, prof)
+    ](q_local_output, partials, segment_scratch, runs,
+      num_q, local_num_q, partial_stride, seq_len, pools, prof)
 
 
 @fieldwise_init
 struct BqAttnPrepKernel[
     head_dim: Int, rope_half: Int, pair_stride: Int,
-    slot_mask: Int, sqrt_n: Float32, n_eps: Float32,
+    sqrt_n: Float32, n_eps: Float32,
 ](RangePartitionedKernel):
+    var runs: UnsafePointer[KVRunTable, MutAnyOrigin]
     var q_src: BF16Ptr
     var k_src: BF16Ptr
     var v_src: BF16Ptr
@@ -420,16 +493,33 @@ struct BqAttnPrepKernel[
     var num_q: Int
     var num_kv: Int
     var cache_degree: Int
-    var base_pos: Int
     var rank: Int
+    var page_shift: Int
+    var row_mask: Int
+    var page_mask: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
         var q_stride = self.num_q * Self.head_dim
         var kv_stride = self.num_kv * Self.head_dim
+        ref run_list = self.runs[].runs
+        var num_runs = len(run_list)
+        var r = 0
+        var kv = PagedKV(
+            self.runs[].row_ptr(0),
+            self.page_shift, self.row_mask, self.page_mask)
+        var run_start = Int(run_list[0].buf_start)
+        var run_pos = Int(run_list[0].base_pos)
         for tok in range(self.start, self.end):
-            var pos = self.base_pos + tok
+            while r + 1 < num_runs and tok >= Int(run_list[r + 1].buf_start):
+                r += 1
+                kv = PagedKV(
+                    self.runs[].row_ptr(r),
+                    self.page_shift, self.row_mask, self.page_mask)
+                run_start = Int(run_list[r].buf_start)
+                run_pos = Int(run_list[r].base_pos)
+            var pos = run_pos + (tok - run_start)
             var cos_row = self.cos_table + pos * Self.rope_half
             var sin_row = self.sin_table + pos * Self.rope_half
 
@@ -445,7 +535,7 @@ struct BqAttnPrepKernel[
                 (self.f_q + tok * self.num_q + h)[] = res[0]
 
             if pos % self.cache_degree == self.rank:
-                var slot = (pos // self.cache_degree) & Self.slot_mask
+                var slot = kv.slot(0, pos // self.cache_degree)
                 var k_tok = self.k_src + tok * kv_stride
                 var v_tok = self.v_src + tok * kv_stride
                 var k_dst = self.k_cache + slot * kv_stride
@@ -473,7 +563,7 @@ struct BqAttnPrepKernel[
 def dispatch_bq_attn_prep[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
     head_dim: Int, rope_half: Int, pair_stride: Int,
-    slot_mask: Int, sqrt_n: Float32, n_eps: Float32,
+    sqrt_n: Float32, n_eps: Float32,
     max_worker_count: Int = 128,
 ](
     q_src: Binding[BFloat16, o],
@@ -490,23 +580,30 @@ def dispatch_bq_attn_prep[
     v_scale: Binding[Float32, o],
     cos_table: Binding[Float32, o],
     sin_table: Binding[Float32, o],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     num_q: Int, num_kv: Int, cache_degree: Int,
-    base_pos: Int, seq_len: Int,
+    page_shift: Int, row_mask: Int, page_mask: Int,
+    seq_len: Int,
     mut pools: List[P],
     mut prof: Profiler[Profile, N],
 ):
     comptime K = BqAttnPrepKernel[
-        head_dim, rope_half, pair_stride, slot_mask, sqrt_n, n_eps]
+        head_dim, rope_half, pair_stride, sqrt_n, n_eps]
     var row_bytes = (num_q + 2 * num_kv) * head_dim * 6
+    var nq = num_q
+    var nkv = num_kv
+    var cd = cache_degree
+    var ps = page_shift
+    var rm = row_mask
+    var pm = page_mask
 
     @parameter
     def make(r: Int) -> K:
-        return K(q_src[r], k_src[r], v_src[r], q_norm[r], k_norm[r],
+        return K(runs, q_src[r], k_src[r], v_src[r], q_norm[r], k_norm[r],
                  q_i8[r], qi_bias[r], f_q[r],
                  k_cache[r], k_scale[r], v_cache[r], v_scale[r],
                  cos_table[r], sin_table[r],
-                 num_q, num_kv, cache_degree,
-                 base_pos, r % cache_degree, 0, 0)
+                 nq, nkv, cd, r % cd, ps, rm, pm, 0, 0)
 
     fanout_dispatch[make, max_worker_count=max_worker_count, label="bq_attn_prep"](
         pools, prof, seq_len, seq_len * row_bytes,

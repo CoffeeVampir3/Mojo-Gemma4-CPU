@@ -65,7 +65,8 @@ def merge_segments[
                 var sp = base + (batch_start + b) * stride
                 deltas[b] = (sp + m_off + h)[] - global_m
                 batch_ls[b] = (sp + l_off + h)[]
-            var corrs = fast_exp_softmax_biased[W](deltas)
+            var corrs = fast_exp_softmax_biased[W](
+                max(SIMD[DType.float32, W](-87.0), deltas))
             corrs = batch_ls.gt(SIMD[DType.float32, W](0)).select(
                 corrs, SIMD[DType.float32, W](0))
             global_l += (batch_ls * corrs).reduce_add()

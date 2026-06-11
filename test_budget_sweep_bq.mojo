@@ -70,6 +70,7 @@ def load_and_run[
     var pools: List[P],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read token_ids: List[Int32],
+    read token_ids_4x: List[Int32],
 ):
     var t0 = perf_counter_ns()
     var model_opt = Gemma4[profile=True, Pool=P].load(
@@ -83,50 +84,48 @@ def load_and_run[
 
     var greedy = SamplingParams(
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
-    var sched = ContinuousBatchScheduler[
-        Gemma4[profile=True, Pool=P].POSITIONS_PER_PAGE,
-    ](model.batch_geometry(), STEP_BUDGET, Int32(EOS_TOKEN_ID))
 
-    var prompt_tokens = List[Int32](capacity=len(token_ids))
-    for i in range(len(token_ids)):
-        prompt_tokens.append(token_ids[i])
-    var request_id = sched.submit(prompt_tokens^, greedy, MAX_NEW_TOKENS).value()
-
-    var prompt_len = len(token_ids)
-    var t1 = perf_counter_ns()
-    var prefill_ms = 0
-    while len(sched.requests[request_id].generated) == 0:
-        if sched.step(model) == 0:
-            print("scheduler stalled during prefill")
-            return
-        prefill_ms = elapsed_ms_since(t1)
-    model.profiler.report("prefill")
-    model.profiler.reset()
-
-    var decode_start = perf_counter_ns()
-    while sched.pending_work():
-        if sched.step(model) == 0:
-            print("scheduler stalled during decode")
-            return
-    model.profiler.report("decode")
-
-    var prefill_tps = tokens_per_second(prompt_len, prefill_ms)
-    print(t"prompt  | {prompt_len} tokens | {prefill_ms} ms | {prefill_tps} t/s")
-
-    var decode_elapsed_ms = elapsed_ms_since(decode_start)
-    var decode_tokens = len(sched.requests[request_id].generated) - 1
-    var decode_tps = tokens_per_second(decode_tokens, decode_elapsed_ms)
-    print(t"decode  | {decode_tokens} tokens | {decode_elapsed_ms} ms | {decode_tps} t/s")
-
-    var n_generated = len(sched.requests[request_id].generated)
-    var full_text = decode_int32(tok, sched.requests[request_id].tokens)
-    print()
-    print(t"=== generated {n_generated} tokens ===")
-    print(full_text)
+    var prefix_lens = List[Int]()
+    var case_budgets = List[Int]()
+    prefix_lens.append(1098)
+    case_budgets.append(940)
+    prefix_lens.append(940)
+    case_budgets.append(940)
+    prefix_lens.append(940)
+    case_budgets.append(940)
+    prefix_lens.append(1015)
+    case_budgets.append(940)
+    prefix_lens.append(1098)
+    case_budgets.append(939)
+    prefix_lens.append(939)
+    case_budgets.append(939)
+    for c in range(len(prefix_lens)):
+        var prompt_len = prefix_lens[c]
+        var budget = case_budgets[c]
+        var sched = ContinuousBatchScheduler[
+            Gemma4[profile=True, Pool=P].POSITIONS_PER_PAGE,
+        ](model.batch_geometry(), budget, Int32(EOS_TOKEN_ID))
+        var prompt_tokens = List[Int32](capacity=prompt_len)
+        for i in range(prompt_len):
+            prompt_tokens.append(token_ids[i])
+        var request_id = sched.submit(prompt_tokens^, greedy, 8).value()
+        while sched.pending_work():
+            if sched.step(model) == 0:
+                print("scheduler stalled")
+                return
+        var n_gen = len(sched.requests[request_id].generated)
+        var id_line = String(
+            t"prefix {prompt_len} budget {budget}: {n_gen} tokens | ids:")
+        for g in range(n_gen):
+            var tid = sched.requests[request_id].generated[g]
+            id_line += String(t" {tid}")
+        print(id_line)
+        var text = decode_int32(tok, sched.requests[request_id].generated)
+        print(t"  text: {text}")
 
 
 def main():
-    print("Launching.")
+    print("Budget sweep, single long prompt.")
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:
         print(t"failed to load tokenizer from {TOKENIZER_PATH}")
@@ -140,8 +139,13 @@ The earliest aqueduct in Rome, the Aqua Appia, was commissioned in 312 BC and ra
 Beyond Rome itself, provincial cities throughout Gaul, Hispania, and North Africa built their own aqueducts, many of which still stand today. The Pont du Gard in southern France and the aqueduct of Segovia in Spain remain among the best preserved, their multi-tiered arches a testament to the durability of Roman construction. Maintenance was the responsibility of a dedicated office, and a permanent staff of workers inspected the channels, cleared sediment, and repaired leaks.
 
 The decline of the aqueduct network paralleled the broader collapse of Roman administrative power in the West. As central authority weakened, the resources and expertise needed to maintain the channels disappeared, and many fell into disrepair or were deliberately cut during sieges. Nevertheless, the underlying principles of gradient flow and durable masonry influenced water engineering for centuries, and several aqueducts were restored and returned to service during the Renaissance."""
-    var token_ids = encode_prompt(tok, prompt)
-    print_prompt(prompt, token_ids)
+    var long_prompt = prompt + "\n\n" + prompt + "\n\n" + prompt
+    var token_ids = encode_prompt(tok, long_prompt)
+    var longer_prompt = long_prompt + "\n\n" + prompt
+    var token_ids_4x = encode_prompt(tok, longer_prompt)
+    var n3 = len(token_ids)
+    var n4 = len(token_ids_4x)
+    print(t"prompts: {n3} and {n4} tokens")
 
     var topo = NumaTopology()
     var nodes = topo.num_nodes()
@@ -152,7 +156,7 @@ The decline of the aqueduct network paralleled the broader collapse of Roman adm
     def dispatch_gemma4_tp[
         P: BurstThreadPool, //,
     ](var selected_pools: List[P]):
-        load_and_run(topo, selected_pools^, tok, token_ids)
+        load_and_run(topo, selected_pools^, tok, token_ids, token_ids_4x)
 
     with_topological_rank_dispatch[
         dispatch=dispatch_gemma4_tp,

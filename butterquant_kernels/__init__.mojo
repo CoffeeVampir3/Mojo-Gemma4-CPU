@@ -2,7 +2,7 @@ from .embedding import (
     dispatch_bq_embed_lookup,
 )
 from .head import (
-    dispatch_bq_head_prep, dispatch_bq_head_gemv,
+    dispatch_bq_head_prep, dispatch_bq_flash_sample,
 )
 from .linear import (
     dispatch_bq_norm_quant, dispatch_bq_linear,
