@@ -58,8 +58,6 @@ struct ScratchBuffer[T: AnyType, base_elems: Int, scale: Int = ScaleClass.FIXED]
 ):
     comptime Element = Self.T
     comptime ELEMENT_SIZE = size_of[Self.T]()
-    comptime BASE_ELEMS = Self.base_elems
-    comptime SCALE = Self.scale
 
     @staticmethod
     @always_inline

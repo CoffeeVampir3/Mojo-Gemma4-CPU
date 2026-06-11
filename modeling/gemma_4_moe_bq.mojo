@@ -152,8 +152,6 @@ struct Gemma4StateShapes[
     comptime FullKVScale    = ContextRowSharded[
         Self.batching_seq_len, C.NUM_KV_HEADS_FULL,
     ]
-    comptime SlidingRope = Replicated[Self.max_seq_len, C.ROPE_HALF_SLIDING]
-    comptime FullRope    = Replicated[Self.max_seq_len, C.ROPE_HALF_FULL]
 
 
 struct Gemma4TailShapes:

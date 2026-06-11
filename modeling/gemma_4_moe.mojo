@@ -134,8 +134,6 @@ struct Gemma4StateShapes[
         Self.max_resident_seqs * SLIDING_RING_PAGES * PAGE_LEN, C.KV_DIM_SLIDING,
     ]
     comptime FullKV      = ContextRowSharded[Self.batching_seq_len, C.KV_DIM_FULL]
-    comptime SlidingRope = Replicated[Self.max_seq_len, C.ROPE_HALF_SLIDING]
-    comptime FullRope    = Replicated[Self.max_seq_len, C.ROPE_HALF_FULL]
 
 
 struct Gemma4TailShapes:
