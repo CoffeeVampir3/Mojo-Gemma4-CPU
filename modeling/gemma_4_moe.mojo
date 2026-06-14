@@ -49,6 +49,9 @@ from modeling.gemma4_common import (
 from modeling.modeling_common import (
     pack_slot_starts, collect_emit_plan, stage_sampling_inputs,
 )
+from modeling.steer import (
+    SteerState, InjectOp, dispatch_steer_point, dispatch_steer_add,
+)
 from modeling.slot import (
     Slot, BindContext,
 )
@@ -640,6 +643,8 @@ struct Gemma4[
     var sliding_runs: KVRunTable
     var full_runs: KVRunTable
     var profiler: Profiler[Self.profile, Self.profile_slots]
+    var steer: SteerState
+    var tokens_processed: Int
 
     def __init__(out self,
         var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
@@ -669,11 +674,20 @@ struct Gemma4[
         self.sliding_runs = KVRunTable()
         self.full_runs = KVRunTable()
         self.profiler = Profiler[Self.profile, Self.profile_slots]()
+        self.steer = SteerState(CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM)
+        self.tokens_processed = 0
 
     def model_init(mut self):
         prime_fp_environment(self.pools)
         gemma4_bake_router_scales(self.layout, self.arena_bases)
         gemma4_init_rope_tables(self.layout, self.arena_bases)
+
+    def set_steer_vector(mut self, idx: Int, read vec: List[BFloat16]):
+        for r in range(self.degree):
+            var base = self.arena_bases[r]
+            var p = self.layout.steer.v.at(base) + idx * C.HIDDEN
+            for j in range(C.HIDDEN):
+                p[j] = vec[j]
 
     def batch_geometry(self) -> BatchGeometry:
         return BatchGeometry(
@@ -723,6 +737,7 @@ struct Gemma4[
             total <= C.SLIDING_WINDOW,
             "execute packed tokens exceed SLIDING_WINDOW",
         )
+        self.tokens_processed += total
 
         var ctx = BindContext(RankView(Span(self.arena_bases)), 0)
         var tail_ctx = ctx.with_layer(layout.tail.base(0))
@@ -746,6 +761,8 @@ struct Gemma4[
         ](ctx, self.head_plan)
 
         var buf_starts = pack_slot_starts(schedule)
+        if self.steer.armed:
+            self.steer.record_step(schedule, buf_starts, num_slots)
         self.run_prefix_copies(schedule)
         self.bind_step_runs(schedule, pages)
         var full_runs = UnsafePointer(to=self.full_runs)
@@ -808,6 +825,25 @@ struct Gemma4[
             dispatch_ffn(
                 body, layer_ctx, x_main_ranks, x_res_ranks, total,
                 self.scratch, self.ffn_plan, self.pools, self.profiler)
+
+            if self.steer.armed:
+                for k in range(len(self.steer.inject_ops)):
+                    var op = self.steer.inject_ops[k]
+                    if op.layer == i:
+                        var v = layout.steer.v.state_binding(ctx).shifted(
+                            op.vec_idx * C.HIDDEN)
+                        dispatch_steer_add[hidden=C.HIDDEN](
+                            x_main_ranks, v, op.alpha, total,
+                            self.pools, self.profiler)
+                var tp = self.steer.tap_index(i)
+                if tp >= 0:
+                    var sink = self.steer.sink_ptr()
+                    var mism = dispatch_steer_point[hidden=C.HIDDEN](
+                        x_main_ranks, self.steer.last_rows,
+                        self.steer.last_num_slots, tp,
+                        sink, self.steer.max_slots,
+                        self.steer.verify_rank)
+                    self.steer.mismatch_count += mism
 
         var outcomes = List[SampleOutcome[MAXIMUM_SAMPLING_LOGITS]]()
         var emit_plan = collect_emit_plan(schedule, buf_starts)

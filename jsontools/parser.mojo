@@ -334,6 +334,18 @@ struct Parser[origin: Origin, simd_width: Int = 16, max_depth: Int = 256]:
             v = v * 10 + Int(self.data[start + i] - DIGIT_0)
         return v
 
+    def parse_number(mut self) raises ParseError -> Float64:
+        self.skip_whitespace()
+        if not self.has_more() or not is_number_start(self.peek()):
+            raise ParseError("expected number", self.pos)
+        var start = self.pos
+        self.skip_number()
+        try:
+            return atof(String(unsafe_from_utf8=self.data.unsafe_subspan(
+                offset=start, length=self.pos - start)))
+        except:
+            raise ParseError("invalid number", start)
+
     def skip_value(mut self) raises ParseError:
         self.skip_whitespace()
         if not self.has_more():

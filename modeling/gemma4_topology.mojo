@@ -38,6 +38,7 @@ comptime CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM = 32
 comptime SLIDING_POOL = 0
 comptime FULL_POOL = 1
 comptime SLIDING_RING_PAGES = 2
+comptime MAX_STEER_VECTORS = 16
 
 
 trait Gemma4Recipes:
@@ -172,6 +173,10 @@ struct RopeSlots[half: Int, max_seq_len: Int](Copyable, ImplicitlyCopyable, Slot
     var sin: Slot[F32, Replicated[Self.max_seq_len, Self.half]]
 
 
+struct SteerVectorSlots(Copyable, ImplicitlyCopyable, SlotGroup):
+    var v: Slot[BF16, Replicated[MAX_STEER_VECTORS, C.HIDDEN]]
+
+
 struct ActivationSlots(Copyable, ImplicitlyCopyable, SlotGroup):
     var x_main:     Slot[BF16, Shape[C.SLIDING_WINDOW, C.HIDDEN]]
     var x_residual: Slot[BF16, Shape[C.SLIDING_WINDOW, C.HIDDEN]]
@@ -196,6 +201,7 @@ struct Gemma4Layout[
     var activations: ActivationSlots
     var sliding_rope: RopeSlots[C.ROPE_HALF_SLIDING, Self.max_seq_len]
     var full_rope: RopeSlots[C.ROPE_HALF_FULL, Self.max_seq_len]
+    var steer: SteerVectorSlots
 
     var tail: Repeated[TailRefs[Self.R]]
 
@@ -280,6 +286,9 @@ def build_gemma4_plan[
     var full_rope = RopeSlots[C.ROPE_HALF_FULL, max_seq_len]()
     state_cursor = stamp_offsets(full_rope, degree, state_cursor)
 
+    var steer = SteerVectorSlots()
+    state_cursor = stamp_offsets(steer, degree, state_cursor)
+
     var arena = ArenaLayout(
         distributed_bytes=distributed,
         state_bytes=state_cursor - distributed,
@@ -295,6 +304,7 @@ def build_gemma4_plan[
         sliding_kv=sliding_kv, full_kv=full_kv,
         activations=activations,
         sliding_rope=sliding_rope, full_rope=full_rope,
+        steer=steer,
         tail=tail)
 
 
