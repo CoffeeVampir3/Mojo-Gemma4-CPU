@@ -6,6 +6,7 @@ validation/
 checkpoints/
 quantized_models/
 Minimax-M2.7/
+steering_data/
 
 # Compiled executables
 test_linux_threading

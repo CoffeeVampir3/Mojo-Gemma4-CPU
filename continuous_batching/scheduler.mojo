@@ -36,11 +36,12 @@ struct Request(Movable):
     var seq_id: Int
     var done: Bool
     var live: Bool
+    var no_share: Bool
     var cancel: CancelToken
 
     def __init__(
         out self, var tokens: List[Int32], sampling: SamplingParams,
-        max_new_tokens: Int,
+        max_new_tokens: Int, no_share: Bool = False,
     ):
         self.tokens = tokens^
         self.chain = List[UInt64]()
@@ -50,6 +51,7 @@ struct Request(Movable):
         self.seq_id = -1
         self.done = False
         self.live = True
+        self.no_share = no_share
         self.cancel = CancelToken()
 
     def rehash[positions_per_page: Int](mut self):
@@ -75,6 +77,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
     var reuse_copies: List[PageCopy]
     var pins: List[PagePin]
     var reuse_dirty: List[Bool]
+    var unsharable: List[Bool]
 
     def __init__(
         out self, read geometry: BatchGeometry, step_budget: Int,
@@ -114,6 +117,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         self.reuse_copies = List[PageCopy]()
         self.pins = List[PagePin]()
         self.reuse_dirty = List[Bool](length=geometry.max_seqs, fill=False)
+        self.unsharable = List[Bool](length=geometry.max_seqs, fill=False)
 
     def __init__(
         out self, read geometry: BatchGeometry, step_budget: Int,
@@ -132,7 +136,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
 
     def submit(
         mut self, var tokens: List[Int32], sampling: SamplingParams,
-        max_new_tokens: Int,
+        max_new_tokens: Int, no_share: Bool = False,
     ) -> Optional[Int]:
         if len(tokens) == 0 or len(tokens) > self.seq_ceiling:
             return None
@@ -140,10 +144,11 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         if len(self.free_slots) > 0:
             request_id = self.free_slots.pop()
             self.requests[request_id] = Request(
-                tokens^, sampling, max_new_tokens)
+                tokens^, sampling, max_new_tokens, no_share)
         else:
             request_id = len(self.requests)
-            self.requests.append(Request(tokens^, sampling, max_new_tokens))
+            self.requests.append(
+                Request(tokens^, sampling, max_new_tokens, no_share))
         self.requests[request_id].rehash[Self.positions_per_page]()
         self.pending.append(request_id)
         return request_id
@@ -180,6 +185,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
             return False
         self.pages.release(victim)
         self.registry.close(victim)
+        self.unsharable[victim] = False
         return True
 
     @always_inline
@@ -210,6 +216,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
             return False
         self.pages.release(victim)
         self.registry.close(victim)
+        self.unsharable[victim] = False
         return True
 
     def chained_warm_victim(self) -> Int:
@@ -271,6 +278,8 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         var best_lcp = 0
         for sid in range(self.registry.max_seqs):
             if not self.registry.is_resident(sid):
+                continue
+            if self.unsharable[sid]:
                 continue
             if self.reuse_dirty[sid]:
                 continue
@@ -379,6 +388,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                 or (take == req_len
                     and take % Self.positions_per_page == 0)):
             self.reuse_dirty[sid] = True
+        self.unsharable[sid] = self.requests[request_id].no_share
         self.requests[request_id].seq_id = sid
         return True
 
@@ -447,6 +457,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         self.registry.seed(
             sid, Span(self.requests[request_id].tokens), lcp, now)
         self.ring_floor[sid] = live_start
+        self.unsharable[sid] = self.requests[request_id].no_share
         self.requests[request_id].seq_id = sid
         self.reuse.append(PrefixReuse(
             sid, False, 0, copy_start,
@@ -525,6 +536,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
         elif fork_record >= 0:
             self.pages.release(sid)
             self.registry.close(sid)
+            self.unsharable[sid] = False
         else:
             self.registry.set_warm(sid)
         self.requests[owner].seq_id = -1
@@ -547,6 +559,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                     self.requests[owner].seq_id = -1
                 self.pages.release(sid)
                 self.registry.close(sid)
+                self.unsharable[sid] = False
         self.reuse.clear()
         self.reuse_copies.clear()
         self.release_copy_pins()
@@ -575,30 +588,32 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
             var i = self.pending[k]
             if self.requests[i].seq_id >= 0:
                 continue
-            var warm_match = self.best_reusable(i, False)
-            var active_match = self.best_reusable(i, True)
-            var warm_sid = warm_match[0]
-            var warm_lcp = warm_match[1]
-            var active_sid = active_match[0]
-            var active_lcp = active_match[1]
-            var can_adopt = warm_sid >= 0 and warm_lcp >= 1
-            var can_fork = (active_sid >= 0
-                            and active_lcp >= Self.positions_per_page)
-            var matched = False
-            if can_adopt and (not can_fork
-                              or warm_lcp + Self.positions_per_page
-                              > active_lcp):
-                matched = self.adopt_prefix(warm_sid, i, warm_lcp, now)
-                if not matched and can_fork:
-                    matched = self.fork_prefix(active_sid, i, active_lcp, now)
-            elif can_fork:
-                matched = self.fork_prefix(active_sid, i, active_lcp, now)
-                if not matched and can_adopt:
+            if not self.requests[i].no_share:
+                var warm_match = self.best_reusable(i, False)
+                var active_match = self.best_reusable(i, True)
+                var warm_sid = warm_match[0]
+                var warm_lcp = warm_match[1]
+                var active_sid = active_match[0]
+                var active_lcp = active_match[1]
+                var can_adopt = warm_sid >= 0 and warm_lcp >= 1
+                var can_fork = (active_sid >= 0
+                                and active_lcp >= Self.positions_per_page)
+                var matched = False
+                if can_adopt and (not can_fork
+                                  or warm_lcp + Self.positions_per_page
+                                  > active_lcp):
                     matched = self.adopt_prefix(warm_sid, i, warm_lcp, now)
-            if matched:
-                continue
-            if self.dirty_donor_exists(i):
-                continue
+                    if not matched and can_fork:
+                        matched = self.fork_prefix(
+                            active_sid, i, active_lcp, now)
+                elif can_fork:
+                    matched = self.fork_prefix(active_sid, i, active_lcp, now)
+                    if not matched and can_adopt:
+                        matched = self.adopt_prefix(warm_sid, i, warm_lcp, now)
+                if matched:
+                    continue
+                if self.dirty_donor_exists(i):
+                    continue
             var sid = self.pages.admit()
             if sid < 0:
                 if not self.evict_warm():
@@ -607,6 +622,7 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                 if sid < 0:
                     continue
             self.registry.open(sid, i, now)
+            self.unsharable[sid] = self.requests[i].no_share
             self.ring_floor[sid] = 0
             self.requests[i].seq_id = sid
 
@@ -684,6 +700,23 @@ struct ContinuousBatchScheduler[positions_per_page: Int](Movable):
                         self.pages.page_holds(
                             p, self.pages.page_index(p, sid, ordinal)) == 1,
                         "schedule: write range crosses a held page",
+                    )
+
+        for s in range(len(self.schedule.slots)):
+            var sid = self.schedule.slots[s].seq_id
+            if not self.unsharable[sid]:
+                continue
+            var last_ordinal = ((self.schedule.slots[s].base_pos
+                                 + self.schedule.slots[s].n_tokens - 1)
+                                // Self.positions_per_page)
+            for p in range(self.pages.pool_count()):
+                if self.pages.pool_fixed_pages(p) > 0:
+                    continue
+                for ordinal in range(last_ordinal + 1):
+                    debug_assert(
+                        self.pages.page_holds(
+                            p, self.pages.page_index(p, sid, ordinal)) == 1,
+                        "schedule: unsharable seq holds a shared page",
                     )
 
         for k in range(len(self.reuse)):

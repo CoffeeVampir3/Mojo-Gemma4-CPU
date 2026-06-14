@@ -827,14 +827,31 @@ struct Gemma4[
                 self.scratch, self.ffn_plan, self.pools, self.profiler)
 
             if self.steer.armed:
-                for k in range(len(self.steer.inject_ops)):
-                    var op = self.steer.inject_ops[k]
-                    if op.layer == i:
-                        var v = layout.steer.v.state_binding(ctx).shifted(
-                            op.vec_idx * C.HIDDEN)
-                        dispatch_steer_add[hidden=C.HIDDEN](
-                            x_main_ranks, v, op.alpha, total,
-                            self.pools, self.profiler)
+                if self.steer.per_request:
+                    for s in range(num_slots):
+                        var rid = schedule.slots[s].request_id
+                        if rid >= len(self.steer.req_ops):
+                            continue
+                        var sstart = buf_starts[s]
+                        var sn = schedule.slots[s].n_tokens
+                        for k in range(len(self.steer.req_ops[rid])):
+                            var op = self.steer.req_ops[rid][k]
+                            if op.layer == i:
+                                var v = layout.steer.v.state_binding(
+                                    ctx).shifted(op.vec_idx * C.HIDDEN)
+                                dispatch_steer_add[hidden=C.HIDDEN](
+                                    x_main_ranks.shifted(sstart * C.HIDDEN),
+                                    v, op.alpha, sn,
+                                    self.pools, self.profiler)
+                else:
+                    for k in range(len(self.steer.inject_ops)):
+                        var op = self.steer.inject_ops[k]
+                        if op.layer == i:
+                            var v = layout.steer.v.state_binding(ctx).shifted(
+                                op.vec_idx * C.HIDDEN)
+                            dispatch_steer_add[hidden=C.HIDDEN](
+                                x_main_ranks, v, op.alpha, total,
+                                self.pools, self.profiler)
                 var tp = self.steer.tap_index(i)
                 if tp >= 0:
                     var sink = self.steer.sink_ptr()

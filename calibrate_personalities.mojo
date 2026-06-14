@@ -32,7 +32,10 @@ comptime TURN_END_TOKEN_ID = 106
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime FIRST_TAP_LAYER = 5
 comptime NUM_TAP_LAYERS = 20
-comptime WAVE_SIZE = 4
+comptime CB_RESIDENT = 5
+comptime CB_BATCH_LEN = 8192
+comptime WAVE_SIZE = CB_RESIDENT
+comptime WAVE_STEP_GUARD = 64
 comptime USER_CAP = 80
 comptime MODEL_CAP = 112
 comptime SHIFT_SIGMA_MIN = 1.0
@@ -109,8 +112,8 @@ struct EvalCaptures(Movable):
 def extract_train[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[Pool=P].POSITIONS_PER_PAGE],
+    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
+    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read inputs: List[String],
     read outputs: List[String],
@@ -125,7 +128,8 @@ def extract_train[
         var harvested = List[Bool]()
         for j in range(cursor, cursor + count):
             var rid = sched.submit(
-                encode_turn(tok, inputs[j], outputs[j]), greedy, 1).value()
+                encode_turn(tok, inputs[j], outputs[j]), greedy, 1,
+                no_share=True).value()
             wave_rids.append(rid)
             harvested.append(False)
 
@@ -138,7 +142,7 @@ def extract_train[
             if all_done:
                 break
             guard += 1
-            if guard > 16:
+            if guard > WAVE_STEP_GUARD:
                 return False
             if sched.step(model) == 0:
                 return False
@@ -166,8 +170,8 @@ def extract_train[
 def extract_eval[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[Pool=P].POSITIONS_PER_PAGE],
+    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
+    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read inputs: List[String],
     read outputs: List[String],
@@ -183,7 +187,8 @@ def extract_eval[
         var harvested = List[Bool]()
         for j in range(cursor, cursor + count):
             var rid = sched.submit(
-                encode_turn(tok, inputs[j], outputs[j]), greedy, 1).value()
+                encode_turn(tok, inputs[j], outputs[j]), greedy, 1,
+                no_share=True).value()
             wave_rids.append(rid)
             harvested.append(False)
 
@@ -196,7 +201,7 @@ def extract_eval[
             if all_done:
                 break
             guard += 1
-            if guard > 16:
+            if guard > WAVE_STEP_GUARD:
                 return False
             if sched.step(model) == 0:
                 return False
@@ -250,8 +255,8 @@ def sample_inject_ops(
 def extract_shifted[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[Pool=P].POSITIONS_PER_PAGE],
+    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
+    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read inputs: List[String],
     read outputs: List[String],
@@ -265,12 +270,14 @@ def extract_shifted[
     var cursor = 0
     while cursor < len(inputs):
         var count = min(WAVE_SIZE, len(inputs) - cursor)
-        model.steer.set_inject(sample_inject_ops(predecessors, rng))
         var wave_rids = List[Int]()
         var harvested = List[Bool]()
         for j in range(cursor, cursor + count):
             var rid = sched.submit(
-                encode_turn(tok, inputs[j], outputs[j]), greedy, 1).value()
+                encode_turn(tok, inputs[j], outputs[j]), greedy, 1,
+                no_share=True).value()
+            model.steer.set_request_inject(
+                rid, sample_inject_ops(predecessors, rng))
             wave_rids.append(rid)
             harvested.append(False)
 
@@ -283,7 +290,7 @@ def extract_shifted[
             if all_done:
                 break
             guard += 1
-            if guard > 16:
+            if guard > WAVE_STEP_GUARD:
                 return False
             if sched.step(model) == 0:
                 return False
@@ -361,8 +368,8 @@ struct TraitRecord(Movable):
 def select_layer[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[Pool=P].POSITIONS_PER_PAGE],
+    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
+    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read trait_name: String,
     greedy: SamplingParams,
@@ -383,7 +390,7 @@ def select_layer[
     for _ in range(NUM_TAP_LAYERS):
         dataset.append(ContrastSet[C.HIDDEN](cap))
 
-    model.steer.inject_ops = List[InjectOp]()
+    model.steer.clear_inject()
     if not extract_train(
             model, sched, tok, hi_train_in, hi_train_out, True, greedy, dataset):
         print("  high-class extraction failed")
@@ -440,8 +447,8 @@ def select_layer[
 def finalize_trait[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[Pool=P].POSITIONS_PER_PAGE],
+    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
+    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     mut rec: TraitRecord,
     slot: Int,
@@ -461,15 +468,15 @@ def finalize_trait[
                 model, sched, tok, hi_train_in, hi_train_out, True, greedy,
                 rec.best_k, rec.data, predecessors, rng):
             print("  shifted high extraction failed")
-            model.steer.inject_ops = List[InjectOp]()
+            model.steer.clear_inject()
             return outcome^
         if not extract_shifted(
                 model, sched, tok, lo_train_in, lo_train_out, False, greedy,
                 rec.best_k, rec.data, predecessors, rng):
             print("  shifted low extraction failed")
-            model.steer.inject_ops = List[InjectOp]()
+            model.steer.clear_inject()
             return outcome^
-        model.steer.inject_ops = List[InjectOp]()
+        model.steer.clear_inject()
 
     var mean_high = List[Float32](length=C.HIDDEN, fill=Float32(0))
     var mean_low = List[Float32](length=C.HIDDEN, fill=Float32(0))
@@ -480,7 +487,7 @@ def finalize_trait[
     var composite_ptr: BF16Ptr = composite.unsafe_ptr()
 
     model.set_steer_vector(slot, composite)
-    model.steer.inject_ops = List[InjectOp]()
+    model.steer.clear_inject()
 
     var hi_eval_in = read_lines(Path(prefix + "_high_eval_in.txt"))
     var hi_eval_out = read_lines(Path(prefix + "_high_eval_out.txt"))
@@ -529,9 +536,9 @@ def finalize_trait[
             model, sched, tok, lo_eval_in, lo_eval_out, greedy,
             MEASURE_K, steered):
         print("  steered measure extraction failed")
-        model.steer.inject_ops = List[InjectOp]()
+        model.steer.clear_inject()
         return outcome^
-    model.steer.inject_ops = List[InjectOp]()
+    model.steer.clear_inject()
     var shift_max = (
         (mean_projection(steered, measure_ptr) - base_proj) / rec.measure_std
         if rec.measure_std > Float64(0) else Float64(0))
@@ -565,7 +572,7 @@ def run[
     var pools: List[P],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
 ):
-    var model_opt = Gemma4[Pool=P].load(Path(MODEL_DIR), topo, pools^)
+    var model_opt = Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].load(Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         print("model load failed")
         return
@@ -580,7 +587,7 @@ def run[
     var greedy = SamplingParams(
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
-        Gemma4[Pool=P].POSITIONS_PER_PAGE,
+        Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE,
     ](model.batch_geometry(), STEP_BUDGET, Int32(TURN_END_TOKEN_ID))
     var rng = Random[rounds=10](
         seed=SAS_SEED, subsequence=UInt64(0), offset=UInt64(0))

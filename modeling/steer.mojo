@@ -32,6 +32,8 @@ struct SteerState(Movable):
     var verify_rank: Int
     var mismatch_count: Int
     var inject_ops: List[InjectOp]
+    var per_request: Bool
+    var req_ops: List[List[InjectOp]]
 
     def __init__(out self, max_slots: Int):
         self.armed = False
@@ -45,6 +47,8 @@ struct SteerState(Movable):
         self.verify_rank = -1
         self.mismatch_count = 0
         self.inject_ops = List[InjectOp]()
+        self.per_request = False
+        self.req_ops = List[List[InjectOp]]()
 
     def arm(mut self, var layers: List[Int], verify_rank: Int = -1):
         self.tap_layers = layers^
@@ -59,7 +63,22 @@ struct SteerState(Movable):
 
     def set_inject(mut self, var ops: List[InjectOp]):
         self.inject_ops = ops^
+        self.per_request = False
         self.armed = True
+
+    def set_request_inject(
+        mut self, request_id: Int, var ops: List[InjectOp]
+    ):
+        while len(self.req_ops) <= request_id:
+            self.req_ops.append(List[InjectOp]())
+        self.req_ops[request_id] = ops^
+        self.per_request = True
+        self.armed = True
+
+    def clear_inject(mut self):
+        self.inject_ops = List[InjectOp]()
+        self.req_ops = List[List[InjectOp]]()
+        self.per_request = False
 
     def disarm(mut self):
         self.armed = False
