@@ -18,15 +18,16 @@ from modeling.probe import (
     ContrastSet, ProbeResult, build_probe, mean_row_norm, projection_stats,
 )
 from modeling.slider_pack import write_pack, SliderConfig, SliderCalibration
-from kernels.helpers import BF16Ptr, F32Ptr
+from kernels.helpers import BF16Ptr, F32Ptr, W
 from kernels.dot_products import dot_to_scalar
 from kernels.flash_sample import SamplingParams
+from simd_math.ops import sqrt
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
 from continuous_batching.scheduler import ContinuousBatchScheduler
 
 
 comptime C = Gemma4BaseConfig
-comptime DATA_DIR = "steering_data"
+comptime DATA_DIR = "steering_data_big"
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime FIRST_TAP_LAYER = 5
 comptime NUM_TAP_LAYERS = 20
@@ -36,9 +37,12 @@ comptime WAVE_SIZE = CB_RESIDENT
 comptime WAVE_STEP_GUARD = 64
 comptime USER_CAP = 80
 comptime MODEL_CAP = 112
-comptime SHIFT_SIGMA_MIN = 1.0
-comptime STABILITY_FRACTION = 0.6
 comptime HELDOUT_SIGMA_MIN = 1.0
+comptime EFFECT_SIGMA_MIN = 0.5
+comptime BUDGET_FRACTION = 0.4
+comptime SINK_ENERGY_FACTOR = 20.0
+comptime SELECT_LO_LAYER = 12
+comptime SELECT_HI_LAYER = 22
 comptime SAS_SEED = UInt64(0x5A5C0FFEE)
 comptime MEASURE_K = NUM_TAP_LAYERS - 1
 
@@ -235,6 +239,114 @@ def mean_projection(mut sink: EvalCaptures, direction: BF16Ptr) -> Float64:
     return s / Float64(sink.count)
 
 
+@always_inline
+def row_norm(p: BF16Ptr) -> Float64:
+    return Float64(sqrt[DType.float32, 1](dot_to_scalar[C.HIDDEN](p, p))[0])
+
+
+def accumulate_energy(rows: BF16Ptr, n: Int, acc: F32Ptr):
+    for i in range(n):
+        var p = rows + i * C.HIDDEN
+        for off in range(0, C.HIDDEN, W):
+            var x = (p + off).load[width=W]().cast[DType.float32]()
+            var a = (acc + off).load[width=W]()
+            (acc + off).store(x.fma(x, a))
+
+
+def find_sinks(energy: F32Ptr, factor: Float64) -> List[Int]:
+    var total = Float64(0)
+    for j in range(C.HIDDEN):
+        total += Float64(energy[j])
+    var thresh = factor * total / Float64(C.HIDDEN)
+    var sinks = List[Int]()
+    for j in range(C.HIDDEN):
+        if Float64(energy[j]) > thresh:
+            sinks.append(j)
+    return sinks^
+
+
+def semantic_norm_rows(rows: BF16Ptr, n: Int, read sink: List[Int]) -> Float64:
+    if n <= 0:
+        return Float64(0)
+    var total = Float64(0)
+    for i in range(n):
+        var p = rows + i * C.HIDDEN
+        var full_sq = Float64(dot_to_scalar[C.HIDDEN](p, p))
+        var drop = Float64(0)
+        for t in range(len(sink)):
+            var v = Float64((p + sink[t]).load[width=1]().cast[DType.float32]()[0])
+            drop += v * v
+        var rem = full_sq - drop
+        if rem < Float64(0):
+            rem = Float64(0)
+        total += sqrt[DType.float64, 1](rem)[0]
+    return total / Float64(n)
+
+
+def semantic_norm(mut data: ContrastSet[C.HIDDEN]) -> Float64:
+    var n = data.n_high + data.n_low
+    if n <= 0:
+        return Float64(0)
+    var energy = List[Float32](length=C.HIDDEN, fill=Float32(0))
+    var e_ptr: F32Ptr = energy.unsafe_ptr()
+    accumulate_energy(data.high_ptr(0), data.n_high, e_ptr)
+    accumulate_energy(data.low_ptr(0), data.n_low, e_ptr)
+    var sink = find_sinks(e_ptr, Float64(SINK_ENERGY_FACTOR))
+    var sem_hi = semantic_norm_rows(data.high_ptr(0), data.n_high, sink)
+    var sem_lo = semantic_norm_rows(data.low_ptr(0), data.n_low, sink)
+    return (
+        sem_hi * Float64(data.n_high) + sem_lo * Float64(data.n_low)
+    ) / Float64(n)
+
+
+@always_inline
+def chord(pa: BF16Ptr, pb: BF16Ptr) -> Float64:
+    var na = row_norm(pa)
+    var nb = row_norm(pb)
+    if na <= Float64(0) or nb <= Float64(0):
+        return Float64(0)
+    var cos = Float64(dot_to_scalar[C.HIDDEN](pa, pb)) / (na * nb)
+    if cos > Float64(1):
+        cos = Float64(1)
+    if cos < Float64(-1):
+        cos = Float64(-1)
+    var v = Float64(2) * (Float64(1) - cos)
+    if v < Float64(0):
+        v = Float64(0)
+    return sqrt[DType.float64, 1](v)[0]
+
+
+def layer_drift(
+    a_high: BF16Ptr, a_low: BF16Ptr, b_high: BF16Ptr, b_low: BF16Ptr,
+    n_high: Int, n_low: Int,
+) -> Float64:
+    var total = Float64(0)
+    var count = 0
+    for i in range(n_high):
+        total += chord(a_high + i * C.HIDDEN, b_high + i * C.HIDDEN)
+        count += 1
+    for i in range(n_low):
+        total += chord(a_low + i * C.HIDDEN, b_low + i * C.HIDDEN)
+        count += 1
+    if count == 0:
+        return Float64(0)
+    return total / Float64(count)
+
+
+def alpha_safe_at(
+    lk: Int, read n_sem: List[Float64], read drift: List[Float64],
+) -> Float64:
+    var s1 = Float64(0)
+    var nat = Float64(0)
+    for m in range(lk + 1, NUM_TAP_LAYERS):
+        if n_sem[m] > Float64(0):
+            s1 += Float64(1) / n_sem[m]
+        nat += drift[m - 1]
+    if s1 <= Float64(0):
+        return Float64(0)
+    return Float64(BUDGET_FRACTION) * nat / s1
+
+
 def sample_inject_ops(
     read predecessors: List[SliderConfig], mut rng: Random[rounds=10],
 ) -> List[InjectOp]:
@@ -344,6 +456,7 @@ struct TraitRecord(Movable):
     var best_k: Int
     var layer: Int
     var steer_norm: Float64
+    var alpha_safe: Float64
     var measure_layer: Int
     var measure_std: Float64
     var fisher_ratio: Float64
@@ -356,6 +469,7 @@ struct TraitRecord(Movable):
         self.best_k = -1
         self.layer = -1
         self.steer_norm = Float64(0)
+        self.alpha_safe = Float64(0)
         self.measure_layer = -1
         self.measure_std = Float64(0)
         self.fisher_ratio = Float64(0)
@@ -405,16 +519,39 @@ def select_layer[
     var directions = List[BFloat16](
         length=NUM_TAP_LAYERS * C.HIDDEN, fill=BFloat16(0))
     var results = List[ProbeResult]()
-    var best_k = -1
-    var best_fr = Float64(0)
+    var n_sem = List[Float64](length=NUM_TAP_LAYERS, fill=Float64(0))
+    var drift = List[Float64](length=NUM_TAP_LAYERS, fill=Float64(0))
     for k in range(NUM_TAP_LAYERS):
         var dir_ptr: BF16Ptr = directions.unsafe_ptr() + k * C.HIDDEN
         var r = build_probe[C.HIDDEN](
             dataset[k], model.steer.tap_layers[k], mh_ptr, ml_ptr, dir_ptr)
         results.append(r)
-        if r.fr > best_fr:
-            best_fr = r.fr
+        n_sem[k] = semantic_norm(dataset[k])
+    for k in range(NUM_TAP_LAYERS - 1):
+        var a_high = dataset[k].high_ptr(0)
+        var a_low = dataset[k].low_ptr(0)
+        var dn_high = dataset[k].n_high
+        var dn_low = dataset[k].n_low
+        var b_high = dataset[k + 1].high_ptr(0)
+        var b_low = dataset[k + 1].low_ptr(0)
+        drift[k] = layer_drift(a_high, a_low, b_high, b_low, dn_high, dn_low)
+
+    var lo_k = SELECT_LO_LAYER - FIRST_TAP_LAYER
+    var hi_k = SELECT_HI_LAYER - FIRST_TAP_LAYER
+    if lo_k < 0:
+        lo_k = 0
+    if hi_k > NUM_TAP_LAYERS - 1:
+        hi_k = NUM_TAP_LAYERS - 1
+    var best_k = -1
+    var best_score = Float64(0)
+    var best_safe = Float64(0)
+    for k in range(lo_k, hi_k + 1):
+        var safe = alpha_safe_at(k, n_sem, drift)
+        var score = results[k].fr * safe
+        if score > best_score:
+            best_score = score
             best_k = k
+            best_safe = safe
     if best_k < 0:
         print("  no valid probe")
         return rec^
@@ -432,13 +569,15 @@ def select_layer[
     rec.best_k = best_k
     rec.layer = results[best_k].layer
     rec.steer_norm = mean_row_norm[C.HIDDEN](dataset[best_k])
+    rec.alpha_safe = best_safe
     rec.measure_layer = results[MEASURE_K].layer
     rec.measure_std = results[MEASURE_K].pooled_std()
-    rec.fisher_ratio = best_fr
+    rec.fisher_ratio = results[best_k].fr
     rec.measure_dir = mdir^
     rec.data = keep^
     rec.valid = True
-    print(t"  fisher {best_fr} | steer layer {rec.layer}")
+    print(t"  fisher {results[best_k].fr} | steer layer {rec.layer} "
+          t"| alpha_safe {best_safe}")
     return rec^
 
 
@@ -525,7 +664,7 @@ def finalize_trait[
         return outcome^
     var base_proj = mean_projection(base_low, measure_ptr)
 
-    var alpha_max = Float32(rec.steer_norm * Float64(STABILITY_FRACTION))
+    var alpha_max = Float32(rec.alpha_safe)
     var probe_ops = List[InjectOp]()
     probe_ops.append(InjectOp(rec.layer, slot, alpha_max))
     model.steer.set_inject(probe_ops^)
@@ -537,23 +676,20 @@ def finalize_trait[
         model.steer.clear_inject()
         return outcome^
     model.steer.clear_inject()
-    var shift_max = (
+    var effect = (
         (mean_projection(steered, measure_ptr) - base_proj) / rec.measure_std
         if rec.measure_std > Float64(0) else Float64(0))
 
-    var alpha_min = Float32(-1)
-    if shift_max >= Float64(SHIFT_SIGMA_MIN) and alpha_max > Float32(0):
-        var amin = Float64(SHIFT_SIGMA_MIN) * Float64(alpha_max) / shift_max
-        alpha_min = Float32(amin)
-        if alpha_min > alpha_max:
-            alpha_min = alpha_max
-
-    print(t"  holdout {holdout_effect} sigma | corridor [{alpha_min}, {alpha_max}]")
-    if holdout_effect > Float64(HELDOUT_SIGMA_MIN):
+    print(t"  holdout {holdout_effect} sigma | effect@safe {effect} sigma "
+          t"| ceiling {alpha_max}")
+    if (
+        holdout_effect > Float64(HELDOUT_SIGMA_MIN)
+        and effect >= Float64(EFFECT_SIGMA_MIN)
+    ):
         outcome.passed = True
         outcome.direction = composite^
         outcome.layer = rec.layer
-        outcome.alpha_min = alpha_min
+        outcome.alpha_min = Float32(0)
         outcome.alpha_max = alpha_max
         outcome.fisher_ratio = rec.fisher_ratio
         outcome.holdout_sigma = holdout_effect

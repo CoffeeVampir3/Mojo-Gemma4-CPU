@@ -63,8 +63,6 @@ struct SliderBank(Movable):
         if pos < Float32(0) and not cfg.bidirectional:
             return Float32(0)
         var mag = abs(pos)
-        if mag > Float32(1):
-            mag = Float32(1)
         var a = cfg.alpha_min + mag * (cfg.alpha_max - cfg.alpha_min)
         return a if pos > Float32(0) else -a
 

@@ -64,23 +64,35 @@ def build_direction[cols: Int](
     mean_high: F32Ptr, mean_low: F32Ptr, direction: BF16Ptr,
 ) -> Float32:
     comptime assert cols % W == 0, "build_direction requires cols % W == 0"
-    var acc = SIMD[DType.float32, W](0)
+    var acc_hh = SIMD[DType.float32, W](0)
+    var acc_ll = SIMD[DType.float32, W](0)
+    var acc_hl = SIMD[DType.float32, W](0)
     for off in range(0, cols, W):
-        var d = (
-            (mean_high + off).load[width=W]()
-            - (mean_low + off).load[width=W]()
-        )
-        acc = d.fma(d, acc)
-    var norm = sqrt[DType.float32, 1](acc.reduce_add())
+        var h = (mean_high + off).load[width=W]()
+        var l = (mean_low + off).load[width=W]()
+        acc_hh = h.fma(h, acc_hh)
+        acc_ll = l.fma(l, acc_ll)
+        acc_hl = h.fma(l, acc_hl)
+    var shh = acc_hh.reduce_add()
+    var sll = acc_ll.reduce_add()
+    var shl = acc_hl.reduce_add()
+    var d_dot_mu = Float32(0.5) * (shh - sll)
+    var mu_sq = Float32(0.25) * (shh + sll + Float32(2) * shl)
+    var d_sq = shh + sll - Float32(2) * shl
+    var beta = Float32(0)
+    if mu_sq > Float32(0):
+        beta = d_dot_mu / mu_sq
+    var norm = sqrt[DType.float32, 1](d_sq - beta * d_dot_mu)
     if norm[0] <= Float32(0):
         return Float32(0)
     var inv = SIMD[DType.float32, W](Float32(1) / norm[0])
+    var hi_scale = SIMD[DType.float32, W](Float32(1) - Float32(0.5) * beta)
+    var lo_scale = SIMD[DType.float32, W](Float32(1) + Float32(0.5) * beta)
     for off in range(0, cols, W):
-        var d = (
-            (mean_high + off).load[width=W]()
-            - (mean_low + off).load[width=W]()
-        )
-        (direction + off).store((d * inv).cast[DType.bfloat16]())
+        var h = (mean_high + off).load[width=W]()
+        var l = (mean_low + off).load[width=W]()
+        var dp = hi_scale * h - lo_scale * l
+        (direction + off).store((dp * inv).cast[DType.bfloat16]())
     return norm[0]
 
 

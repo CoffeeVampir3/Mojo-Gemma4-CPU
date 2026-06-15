@@ -97,9 +97,11 @@ def append_user_turn(
 
 def print_help():
     print("commands:")
-    print("  /<trait> <value>   set a trait, value in [-1, 1] (0 = off)")
+    print("  /<trait> <value>   set a trait; [-1, 1] is the safe range, "
+          "|value| > 1 overdrives past the corridor (0 = off)")
     print("  /sliders           list traits and current doses")
     print("  /reset             clear the conversation context")
+    print("  /rewind            undo the last turn (you + model)")
     print("  /help              show this help")
     print("  /quit              exit")
 
@@ -159,6 +161,7 @@ def run[
 
     var history = List[Int32]()
     history.append(Int32(BOS_TOKEN_ID))
+    var turn_starts = List[Int]()
     var stdin = StdinReader()
 
     while True:
@@ -185,7 +188,16 @@ def run[
             elif cmd == "/reset":
                 history = List[Int32]()
                 history.append(Int32(BOS_TOKEN_ID))
+                turn_starts = List[Int]()
                 print("  context cleared")
+            elif cmd == "/rewind" or cmd == "/undo":
+                if len(turn_starts) == 0:
+                    print("  nothing to rewind")
+                else:
+                    var mark = turn_starts.pop()
+                    while len(history) > mark:
+                        _ = history.pop()
+                    print(t"  rewound last turn ({len(turn_starts)} left)")
             elif cmd == "/sliders" or cmd == "/list":
                 print_sliders(bank)
             else:
@@ -196,7 +208,8 @@ def run[
                 if matched < 0:
                     print(t"  unknown command {cmd} (try /help)")
                 elif len(parts) < 2:
-                    print("  usage: /<trait> <value in [-1, 1]>")
+                    print("  usage: /<trait> <value>  ([-1, 1] safe, "
+                          "beyond overdrives)")
                 else:
                     var val = Float32(0)
                     var bad = False
@@ -271,6 +284,7 @@ def run[
             history.append(gen[i])
         append_encoded(tok, history, "\n")
         _ = sched.retire(rid)
+        turn_starts.append(pre_len)
 
     model.steer.disarm()
     print("bye")
