@@ -28,7 +28,9 @@ struct KernelSigInfoX86_64(TrivialRegisterPassable):
     var si_addr: Int
 
 struct X86_64LinuxSys(LinuxSys):
+    comptime NR_read = 0
     comptime NR_write = 1
+    comptime NR_ioctl = 16
     comptime NR_mmap = 9
     comptime NR_mprotect = 10
     comptime NR_munmap = 11

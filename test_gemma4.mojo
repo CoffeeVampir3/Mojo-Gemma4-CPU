@@ -68,7 +68,7 @@ def load_and_run[
     print()
 
     var greedy = SamplingParams(
-        Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
+        Float32(1.0), Float32(0.0), 0, 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
         Model[profile=True, Pool=P].POSITIONS_PER_PAGE,
     ](model.batch_geometry(), STEP_BUDGET, stop_tokens())

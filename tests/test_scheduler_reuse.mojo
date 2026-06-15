@@ -96,7 +96,7 @@ def main():
     var failures = 0
     var model = StubModel()
     var greedy = SamplingParams(
-        Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
+        Float32(1.0), Float32(0.0), 0, 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[PPP](
         model.batch_geometry(), 8, Int32(-1))
 

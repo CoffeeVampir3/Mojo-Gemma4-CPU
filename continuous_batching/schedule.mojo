@@ -6,7 +6,7 @@ from kernels.flash_sample import SamplingParams, SampleOutcome
 from .paging import KVPageAccountant, BatchGeometry
 
 
-comptime MAXIMUM_SAMPLING_LOGITS = 64
+comptime MAXIMUM_SAMPLING_LOGITS = 256
 
 
 struct CancelToken(Copyable, Movable, ImplicitlyCopyable):

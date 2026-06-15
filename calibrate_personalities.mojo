@@ -719,7 +719,7 @@ def run[
     model.steer.arm(tap^)
 
     var greedy = SamplingParams(
-        Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
+        Float32(1.0), Float32(0.0), 0, 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].POSITIONS_PER_PAGE,
     ](model.batch_geometry(), STEP_BUDGET, stop_tokens())

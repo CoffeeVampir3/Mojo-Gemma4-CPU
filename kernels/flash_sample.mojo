@@ -21,6 +21,7 @@ comptime NEG_INF = Float32(-1.0e30)
 struct SamplingParams(Copyable, ImplicitlyCopyable):
     var temperature: Float32
     var min_p: Float32
+    var top_k: Int
     var seed: UInt64
     var n_keep: Int
     var greedy: Bool
@@ -237,11 +238,18 @@ def finalize_outcomes[
         var p = (prow + j)[]
         var n_out = final.n if final.n < p.n_keep else p.n_keep
         var token = final.samp_idx
-        if p.min_p > 0.0 and final.n > 0:
-            var thr = final.topn_val[0] + p.temperature * log_f32[1](p.min_p)
+        var use_min_p = p.min_p > 0.0
+        var use_top_k = p.top_k > 0
+        if (use_min_p or use_top_k) and final.n > 0:
+            var limit = final.n
+            if use_top_k and p.top_k < limit:
+                limit = p.top_k
+            var thr = NEG_INF
+            if use_min_p:
+                thr = final.topn_val[0] + p.temperature * log_f32[1](p.min_p)
             var best_idx = final.topn_idx[0]
             var best_g = final.topn_g[0]
-            for k in range(1, final.n):
+            for k in range(1, limit):
                 if final.topn_val[k] >= thr and final.topn_g[k] > best_g:
                     best_g = final.topn_g[k]
                     best_idx = final.topn_idx[k]
