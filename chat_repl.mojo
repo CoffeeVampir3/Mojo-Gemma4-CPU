@@ -23,6 +23,17 @@ from continuous_batching.scheduler import ContinuousBatchScheduler
 comptime PACK_PATH = "sliders/ocean.json"
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime MAX_CONTEXT = 65536
+comptime CLEAR_SCREEN = "\x1b[2J\x1b[3J\x1b[H"
+comptime YOU_PROMPT = "\n\n\x1b[32myou> \x1b[0m"
+comptime MODEL_PROMPT = "\x1b[38;5;211mmodel> \x1b[0m"
+comptime CYAN = "\x1b[36m"
+comptime RESET = "\x1b[0m"
+
+
+@fieldwise_init
+struct ChatTurn(Copyable, Movable):
+    var user: String
+    var reply: String
 
 
 struct StdinReader(Movable):
@@ -102,6 +113,7 @@ def print_help():
     print("  /sliders           list traits and current doses")
     print("  /reset             clear the conversation context")
     print("  /rewind            undo the last turn (you + model)")
+    print("  /retry             undo the last turn without clearing the screen")
     print("  /help              show this help")
     print("  /quit              exit")
 
@@ -115,6 +127,14 @@ def print_sliders(read bank: SliderBank):
         print(t"  {bank.names[i]}: alpha {bank.alphas[i]} "
               t"(layer {cfg.layer}, corridor [{cfg.alpha_min}, "
               t"{cfg.alpha_max}])")
+
+
+def render_chat(read transcript: List[ChatTurn]):
+    print(CLEAR_SCREEN, end="", flush=True)
+    print("gemma personality chat")
+    for i in range(len(transcript)):
+        print(YOU_PROMPT + transcript[i].user)
+        print(MODEL_PROMPT + transcript[i].reply)
 
 
 def park[T: SleepableThreadPool, //](mut pool: T):
@@ -162,12 +182,13 @@ def run[
     var history = List[Int32]()
     history.append(Int32(BOS_TOKEN_ID))
     var turn_starts = List[Int]()
+    var transcript = List[ChatTurn]()
     var stdin = StdinReader()
 
     while True:
         for i in range(len(model.pools)):
             park(model.pools[i])
-        print("\nyou> ", end="", flush=True)
+        print(YOU_PROMPT, end="", flush=True)
         var line_opt = stdin.read_line()
         if not line_opt:
             print()
@@ -189,6 +210,8 @@ def run[
                 history = List[Int32]()
                 history.append(Int32(BOS_TOKEN_ID))
                 turn_starts = List[Int]()
+                transcript = List[ChatTurn]()
+                render_chat(transcript)
                 print("  context cleared")
             elif cmd == "/rewind" or cmd == "/undo":
                 if len(turn_starts) == 0:
@@ -197,6 +220,17 @@ def run[
                     var mark = turn_starts.pop()
                     while len(history) > mark:
                         _ = history.pop()
+                    _ = transcript.pop()
+                    render_chat(transcript)
+                    print(t"  rewound last turn ({len(turn_starts)} left)")
+            elif cmd == "/retry" or cmd == "/regen":
+                if len(turn_starts) == 0:
+                    print("  nothing to retry")
+                else:
+                    var mark = turn_starts.pop()
+                    while len(history) > mark:
+                        _ = history.pop()
+                    _ = transcript.pop()
                     print(t"  rewound last turn ({len(turn_starts)} left)")
             elif cmd == "/sliders" or cmd == "/list":
                 print_sliders(bank)
@@ -222,9 +256,9 @@ def run[
                     else:
                         bank.set_position(matched, val)
                         bank.apply(model)
-                        print(t"  {bank.names[matched]} -> position {val}, "
+                        print(t"{CYAN}  {bank.names[matched]} -> position {val}, "
                               t"alpha {bank.alphas[matched]} at layer "
-                              t"{bank.configs[matched].layer}")
+                              t"{bank.configs[matched].layer}{RESET}")
             continue
 
         var pre_len = len(history)
@@ -247,7 +281,8 @@ def run[
         var consumed = 0
         var guard = 0
         var stalled = False
-        print("model> ", end="", flush=True)
+        var reply = String("")
+        print(MODEL_PROMPT, end="", flush=True)
         while not sched.requests[rid].done:
             guard += 1
             if guard > 8 * reply_budget:
@@ -266,6 +301,7 @@ def run[
                     continue
                 var piece = detok.push(tok, tid)
                 if piece.byte_length() > 0:
+                    reply += piece
                     print(piece, end="", flush=True)
 
         if stalled:
@@ -276,6 +312,7 @@ def run[
 
         var tail = detok.flush()
         if tail.byte_length() > 0:
+            reply += tail
             print(tail, end="", flush=True)
         print()
 
@@ -285,6 +322,7 @@ def run[
         append_encoded(tok, history, "\n")
         _ = sched.retire(rid)
         turn_starts.append(pre_len)
+        transcript.append(ChatTurn(s.copy(), reply^))
 
     model.steer.disarm()
     print("bye")
