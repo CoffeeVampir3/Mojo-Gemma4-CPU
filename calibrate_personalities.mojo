@@ -8,7 +8,10 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
-from modeling.gemma_4_moe import Gemma4
+from modeling_config import (
+    Model, TOKENIZER_PATH, MODEL_DIR, stop_tokens,
+    BOS_TOKEN_ID, TURN_START_TOKEN_ID, TURN_END_TOKEN_ID,
+)
 from modeling.gemma4_common import Gemma4BaseConfig
 from modeling.steer import InjectOp
 from modeling.probe import (
@@ -23,12 +26,7 @@ from continuous_batching.scheduler import ContinuousBatchScheduler
 
 
 comptime C = Gemma4BaseConfig
-comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B-it/tokenizer.json"
-comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-it"
 comptime DATA_DIR = "steering_data"
-comptime BOS_TOKEN_ID = 2
-comptime TURN_START_TOKEN_ID = 105
-comptime TURN_END_TOKEN_ID = 106
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime FIRST_TAP_LAYER = 5
 comptime NUM_TAP_LAYERS = 20
@@ -112,8 +110,8 @@ struct EvalCaptures(Movable):
 def extract_train[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
+    mut model: Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P],
+    mut sched: ContinuousBatchScheduler[Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read inputs: List[String],
     read outputs: List[String],
@@ -170,8 +168,8 @@ def extract_train[
 def extract_eval[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
+    mut model: Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P],
+    mut sched: ContinuousBatchScheduler[Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read inputs: List[String],
     read outputs: List[String],
@@ -255,8 +253,8 @@ def sample_inject_ops(
 def extract_shifted[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
+    mut model: Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P],
+    mut sched: ContinuousBatchScheduler[Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read inputs: List[String],
     read outputs: List[String],
@@ -368,8 +366,8 @@ struct TraitRecord(Movable):
 def select_layer[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
+    mut model: Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P],
+    mut sched: ContinuousBatchScheduler[Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read trait_name: String,
     greedy: SamplingParams,
@@ -447,8 +445,8 @@ def select_layer[
 def finalize_trait[
     P: BurstThreadPool, //,
 ](
-    mut model: Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P],
-    mut sched: ContinuousBatchScheduler[Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE],
+    mut model: Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P],
+    mut sched: ContinuousBatchScheduler[Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     mut rec: TraitRecord,
     slot: Int,
@@ -572,7 +570,7 @@ def run[
     var pools: List[P],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
 ):
-    var model_opt = Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].load(Path(MODEL_DIR), topo, pools^)
+    var model_opt = Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].load(Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         print("model load failed")
         return
@@ -587,8 +585,8 @@ def run[
     var greedy = SamplingParams(
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
-        Gemma4[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, Pool=P].POSITIONS_PER_PAGE,
-    ](model.batch_geometry(), STEP_BUDGET, Int32(TURN_END_TOKEN_ID))
+        Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT, steer_vectors=16, Pool=P].POSITIONS_PER_PAGE,
+    ](model.batch_geometry(), STEP_BUDGET, stop_tokens())
     var rng = Random[rounds=10](
         seed=SAS_SEED, subsequence=UInt64(0), offset=UInt64(0))
 

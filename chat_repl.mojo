@@ -5,8 +5,14 @@ from numa import NumaTopology
 from threading.threading_traits import BurstThreadPool, SleepableThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
-from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
-from modeling.gemma_4_moe import Gemma4
+from tokenizer import (
+    load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform,
+    StreamDetokenizer,
+)
+from modeling_config import (
+    Model, TOKENIZER_PATH, MODEL_DIR, stop_tokens,
+    BOS_TOKEN_ID, TURN_START_TOKEN_ID, TURN_END_TOKEN_ID,
+)
 from modeling.gemma4_common import Gemma4BaseConfig
 from modeling.slider_pack import load_pack, SliderBank
 from kernels.flash_sample import SamplingParams
@@ -14,15 +20,9 @@ from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
 from continuous_batching.scheduler import ContinuousBatchScheduler
 
 
-comptime C = Gemma4BaseConfig
-comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B-it/tokenizer.json"
-comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-it"
 comptime PACK_PATH = "sliders/ocean.json"
-comptime BOS_TOKEN_ID = 2
-comptime TURN_START_TOKEN_ID = 105
-comptime TURN_END_TOKEN_ID = 106
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
-comptime MAX_REPLY_TOKENS = 256
+comptime MAX_CONTEXT = 65536
 
 
 struct StdinReader(Movable):
@@ -95,18 +95,6 @@ def append_user_turn(
     append_encoded(tok, history, "model\n")
 
 
-def decode_response(
-    mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
-    read gen: List[Int32],
-) -> String:
-    var ids = List[Int]()
-    for i in range(len(gen)):
-        if i == len(gen) - 1 and gen[i] == Int32(TURN_END_TOKEN_ID):
-            continue
-        ids.append(Int(gen[i]))
-    return tok.decode(ids)
-
-
 def print_help():
     print("commands:")
     print("  /<trait> <value>   set a trait, value in [-1, 1] (0 = off)")
@@ -142,7 +130,7 @@ def run[
     var pools: List[P],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
 ):
-    var model_opt = Gemma4[Pool=P].load(Path(MODEL_DIR), topo, pools^)
+    var model_opt = Model[steer_vectors=16, max_seq_len=MAX_CONTEXT, batching_seq_len=MAX_CONTEXT, Pool=P].load(Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         print("model load failed")
         return
@@ -162,8 +150,8 @@ def run[
     var greedy = SamplingParams(
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
-        Gemma4[Pool=P].POSITIONS_PER_PAGE,
-    ](model.batch_geometry(), STEP_BUDGET, Int32(TURN_END_TOKEN_ID))
+        Model[steer_vectors=16, max_seq_len=MAX_CONTEXT, batching_seq_len=MAX_CONTEXT, Pool=P].POSITIONS_PER_PAGE,
+    ](model.batch_geometry(), STEP_BUDGET, stop_tokens())
 
     print()
     print_help()
@@ -228,7 +216,13 @@ def run[
 
         var pre_len = len(history)
         append_user_turn(tok, history, s)
-        var rid_opt = sched.submit(history.copy(), greedy, MAX_REPLY_TOKENS)
+        var reply_budget = MAX_CONTEXT - len(history)
+        if reply_budget < 1:
+            print("  (context full — use /reset to clear)")
+            while len(history) > pre_len:
+                _ = history.pop()
+            continue
+        var rid_opt = sched.submit(history.copy(), greedy, reply_budget)
         if not rid_opt:
             print("  (context full — use /reset to clear)")
             while len(history) > pre_len:
@@ -236,18 +230,30 @@ def run[
             continue
         var rid = rid_opt.value()
 
+        var detok = StreamDetokenizer()
+        var consumed = 0
         var guard = 0
         var stalled = False
+        print("model> ", end="", flush=True)
         while not sched.requests[rid].done:
             guard += 1
-            if guard > 8 * MAX_REPLY_TOKENS:
-                print("  (generation stalled)")
+            if guard > 8 * reply_budget:
+                print("\n  (generation stalled)")
                 stalled = True
                 break
             if sched.step(model) == 0:
-                print("  (scheduler stalled)")
+                print("\n  (scheduler stalled)")
                 stalled = True
                 break
+            ref cur_gen = sched.requests[rid].generated
+            while consumed < len(cur_gen):
+                var tid = cur_gen[consumed]
+                consumed += 1
+                if sched.is_stop_token(tid):
+                    continue
+                var piece = detok.push(tok, tid)
+                if piece.byte_length() > 0:
+                    print(piece, end="", flush=True)
 
         if stalled:
             _ = sched.retire(rid)
@@ -255,8 +261,12 @@ def run[
                 _ = history.pop()
             continue
 
+        var tail = detok.flush()
+        if tail.byte_length() > 0:
+            print(tail, end="", flush=True)
+        print()
+
         ref gen = sched.requests[rid].generated
-        print(t"model> {decode_response(tok, gen)}")
         for i in range(len(gen)):
             history.append(gen[i])
         append_encoded(tok, history, "\n")

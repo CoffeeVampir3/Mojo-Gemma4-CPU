@@ -108,6 +108,13 @@ struct SteerState(Movable):
         return self.sink_ptr() + (tap_pos * self.max_slots + slot) * C.HIDDEN
 
 
+trait Steerable:
+    comptime STEER_VECTORS: Int
+    def set_steer_vector(mut self, idx: Int, read vec: List[BFloat16]): ...
+    def set_inject_ops(mut self, var ops: List[InjectOp]): ...
+    def disarm_steer(mut self): ...
+
+
 @always_inline
 def copy_row[hidden: Int](src: BF16Ptr, dst: BF16Ptr):
     def step[width: Int](idx: Int) {read}:

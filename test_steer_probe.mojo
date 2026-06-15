@@ -5,7 +5,10 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
-from modeling.gemma_4_moe import Gemma4
+from modeling_config import (
+    Model, TOKENIZER_PATH, MODEL_DIR, stop_tokens,
+    BOS_TOKEN_ID, TURN_START_TOKEN_ID, TURN_END_TOKEN_ID, format_prompt,
+)
 from modeling.gemma4_common import Gemma4BaseConfig
 from modeling.steer import InjectOp
 from modeling.probe import (
@@ -18,11 +21,6 @@ from continuous_batching.scheduler import ContinuousBatchScheduler
 
 
 comptime C = Gemma4BaseConfig
-comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B-it/tokenizer.json"
-comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-it"
-comptime BOS_TOKEN_ID = 2
-comptime TURN_START_TOKEN_ID = 105
-comptime TURN_END_TOKEN_ID = 106
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 comptime FIRST_TAP_LAYER = 5
 comptime NUM_TAP_LAYERS = 20
@@ -90,27 +88,6 @@ def encode_statement(
     return ids^
 
 
-def encode_chat(
-    mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
-    read prompt: String,
-) -> List[Int32]:
-    var ids = List[Int32]()
-    ids.append(Int32(BOS_TOKEN_ID))
-    ids.append(Int32(TURN_START_TOKEN_ID))
-    var user = tok.encode("user\n" + prompt)
-    for i in range(len(user)):
-        ids.append(Int32(user[i]))
-    ids.append(Int32(TURN_END_TOKEN_ID))
-    var sep = tok.encode("\n")
-    for i in range(len(sep)):
-        ids.append(Int32(sep[i]))
-    ids.append(Int32(TURN_START_TOKEN_ID))
-    var model_turn = tok.encode("model\n")
-    for i in range(len(model_turn)):
-        ids.append(Int32(model_turn[i]))
-    return ids^
-
-
 def decode_int32(
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read ids: List[Int32],
@@ -128,7 +105,7 @@ def run[
     var pools: List[P],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
 ):
-    var model_opt = Gemma4[Pool=P].load(Path(MODEL_DIR), topo, pools^)
+    var model_opt = Model[steer_vectors=16, Pool=P].load(Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         print("model load failed")
         return
@@ -143,8 +120,8 @@ def run[
     var greedy = SamplingParams(
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
-        Gemma4[Pool=P].POSITIONS_PER_PAGE,
-    ](model.batch_geometry(), STEP_BUDGET, Int32(TURN_END_TOKEN_ID))
+        Model[steer_vectors=16, Pool=P].POSITIONS_PER_PAGE,
+    ](model.batch_geometry(), STEP_BUDGET, stop_tokens())
 
     var dataset = List[ContrastSet[C.HIDDEN]](capacity=NUM_TAP_LAYERS)
     for _ in range(NUM_TAP_LAYERS):
@@ -275,7 +252,7 @@ def run[
             print("--- steered (-alpha, toward low) ---")
 
         var rid = sched.submit(
-            encode_chat(tok, demo), greedy, DEMO_NEW_TOKENS).value()
+            format_prompt(tok, demo), greedy, DEMO_NEW_TOKENS).value()
         var guard = 0
         while not sched.requests[rid].done:
             guard += 1

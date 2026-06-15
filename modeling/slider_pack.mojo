@@ -7,10 +7,8 @@ from threading.threading_traits import BurstThreadPool
 from jsontools.parser import Parser, ParseError, LBRACE, RBRACE, LBRACKET, RBRACKET
 from safetensors.parser import parse_safetensors_header, TensorMeta
 from safetensors.writer import OutputEntry, write_safetensors
-from modeling.gemma_4_moe import Gemma4
 from modeling.gemma4_common import Gemma4BaseConfig
-from modeling.gemma4_topology import MAX_STEER_VECTORS
-from modeling.steer import InjectOp
+from modeling.steer import InjectOp, Steerable
 
 
 comptime C = Gemma4BaseConfig
@@ -103,12 +101,12 @@ struct SliderBank(Movable):
                     self.alphas[i]))
         return ops^
 
-    def apply[P: BurstThreadPool, //](self, mut model: Gemma4[Pool=P]):
+    def apply[M: Steerable, //](self, mut model: M):
         var ops = self.build_ops()
         if len(ops) == 0:
-            model.steer.disarm()
+            model.disarm_steer()
         else:
-            model.steer.set_inject(ops^)
+            model.set_inject_ops(ops^)
 
 
 def basename(read p: String) -> String:
@@ -365,9 +363,9 @@ def read_vector(
 
 
 def load_pack[
-    P: BurstThreadPool, //,
+    M: Steerable, //,
 ](
-    mut model: Gemma4[Pool=P], read json_path: String,
+    mut model: M, read json_path: String,
 ) -> Optional[SliderBank]:
     var data: List[Byte]
     try:
@@ -391,9 +389,9 @@ def load_pack[
     if len(manifest.sliders) == 0:
         print("load_pack: manifest has no sliders")
         return None
-    if len(manifest.sliders) > MAX_STEER_VECTORS:
+    if len(manifest.sliders) > M.STEER_VECTORS:
         print(t"load_pack: too many sliders ({len(manifest.sliders)} > "
-              t"{MAX_STEER_VECTORS})")
+              t"{M.STEER_VECTORS})")
         return None
 
     var weights_path = Path(dirname(json_path) + "/" + manifest.weights)

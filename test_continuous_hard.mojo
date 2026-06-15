@@ -6,7 +6,9 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
-from modeling.gemma_4_moe import Gemma4
+from modeling_config import (
+    Model, TOKENIZER_PATH, MODEL_DIR, stop_tokens, format_prompt,
+)
 from modeling.gemma4_common import Gemma4BaseConfig
 from kernels.flash_sample import SamplingParams
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
@@ -14,12 +16,8 @@ from continuous_batching.scheduler import ContinuousBatchScheduler
 from test_sequences import sample_prompts
 
 
-comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
-comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B"
 comptime MAX_NEW_TOKENS = 128
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
-comptime BOS_TOKEN_ID = 2
-comptime EOS_TOKEN_ID = 1
 
 
 def ns_to_ms(elapsed_ns: Int) -> Int:
@@ -30,18 +28,6 @@ def tokens_per_second(token_count: Int, elapsed_ns: Int) -> Int:
     if elapsed_ns == 0:
         return 0
     return token_count * 1_000_000_000 // elapsed_ns
-
-
-def encode_prompt(
-    mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
-    prompt: String,
-) -> List[Int32]:
-    var token_ids = List[Int32]()
-    token_ids.append(Int32(BOS_TOKEN_ID))
-    var encoded = tok.encode(prompt)
-    for i in range(len(encoded)):
-        token_ids.append(Int32(encoded[i]))
-    return token_ids^
 
 
 def decode_int32(
@@ -63,7 +49,7 @@ def load_and_run[
     read prompts: List[List[Int32]],
 ):
     var t0 = perf_counter_ns()
-    var model_opt = Gemma4[profile=True, Pool=P].load(
+    var model_opt = Model[profile=True, Pool=P].load(
         Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         return
@@ -80,8 +66,8 @@ def load_and_run[
     var greedy = SamplingParams(
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
-        Gemma4[profile=True, Pool=P].POSITIONS_PER_PAGE,
-    ](geometry, STEP_BUDGET, Int32(EOS_TOKEN_ID))
+        Model[profile=True, Pool=P].POSITIONS_PER_PAGE,
+    ](geometry, STEP_BUDGET, stop_tokens())
 
     var request_ids = List[Int](capacity=num_requests)
     var total_prompt_tokens = 0
@@ -170,7 +156,7 @@ def main():
     var raw = sample_prompts()
     var prompts = List[List[Int32]]()
     for k in range(len(raw)):
-        prompts.append(encode_prompt(tok, raw[k]))
+        prompts.append(format_prompt(tok, raw[k]))
         var n_tokens = len(prompts[k])
         print(t"sequence {k}: {n_tokens} prompt tokens")
 

@@ -6,7 +6,9 @@ from threading.topological_dispatch import with_topological_rank_dispatch
 
 from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
 from kernels.helpers import BF16Ptr
-from modeling.gemma_4_moe import Gemma4
+from modeling_config import (
+    Model, TOKENIZER_PATH, MODEL_DIR, stop_tokens, BOS_TOKEN_ID,
+)
 from modeling.gemma4_common import Gemma4BaseConfig
 from kernels.flash_sample import SamplingParams
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
@@ -14,10 +16,6 @@ from continuous_batching.scheduler import ContinuousBatchScheduler
 
 
 comptime C = Gemma4BaseConfig
-comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B-it/tokenizer.json"
-comptime MODEL_DIR = "checkpoints/gemma-4-26B-A4B-it"
-comptime BOS_TOKEN_ID = 2
-comptime STOP_TOKEN_ID = 106
 comptime STEP_BUDGET = Gemma4BaseConfig.SLIDING_WINDOW
 
 
@@ -59,7 +57,7 @@ def run[
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
 ):
-    var model_opt = Gemma4[Pool=P].load(Path(MODEL_DIR), topo, pools^)
+    var model_opt = Model[Pool=P].load(Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         print("model load failed")
         return
@@ -75,8 +73,8 @@ def run[
     var greedy = SamplingParams(
         Float32(1.0), Float32(0.0), 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
-        Gemma4[Pool=P].POSITIONS_PER_PAGE,
-    ](model.batch_geometry(), STEP_BUDGET, Int32(STOP_TOKEN_ID))
+        Model[Pool=P].POSITIONS_PER_PAGE,
+    ](model.batch_geometry(), STEP_BUDGET, stop_tokens())
 
     var rids = List[Int]()
     for i in range(len(prompts)):

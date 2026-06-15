@@ -173,8 +173,8 @@ struct RopeSlots[half: Int, max_seq_len: Int](Copyable, ImplicitlyCopyable, Slot
     var sin: Slot[F32, Replicated[Self.max_seq_len, Self.half]]
 
 
-struct SteerVectorSlots(Copyable, ImplicitlyCopyable, SlotGroup):
-    var v: Slot[BF16, Replicated[MAX_STEER_VECTORS, C.HIDDEN]]
+struct SteerVectorSlots[capacity: Int](Copyable, ImplicitlyCopyable, SlotGroup):
+    var vectors: Slot[BF16, Replicated[Self.capacity, C.HIDDEN]]
 
 
 struct ActivationSlots(Copyable, ImplicitlyCopyable, SlotGroup):
@@ -191,6 +191,7 @@ struct TailRefs[R: Gemma4Recipes](Copyable, ImplicitlyCopyable, SlotGroup):
 @fieldwise_init
 struct Gemma4Layout[
     R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup, max_seq_len: Int,
+    steer_vectors: Int,
 ](Copyable, ImplicitlyCopyable):
     var arena: ArenaLayout
     var sliding: Repeated[SlidingLayerRefs[Self.R]]
@@ -201,7 +202,7 @@ struct Gemma4Layout[
     var activations: ActivationSlots
     var sliding_rope: RopeSlots[C.ROPE_HALF_SLIDING, Self.max_seq_len]
     var full_rope: RopeSlots[C.ROPE_HALF_FULL, Self.max_seq_len]
-    var steer: SteerVectorSlots
+    var steer: SteerVectorSlots[Self.steer_vectors]
 
     var tail: Repeated[TailRefs[Self.R]]
 
@@ -209,10 +210,11 @@ struct Gemma4Layout[
 def build_gemma4_plan[
     R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
+    steer_vectors: Int,
 ](
     degree: Int, max_workers: Int, scratch_cap: Int,
     mut descs: List[WeightDesc],
-) -> Gemma4Layout[R, SKV, FKV, max_seq_len]:
+) -> Gemma4Layout[R, SKV, FKV, max_seq_len, steer_vectors]:
     if not degree_contracts_ok(degree):
         abort(t"gemma4: degree {degree} does not divide the model dimensions")
     if not paging_contracts_ok[
@@ -286,7 +288,7 @@ def build_gemma4_plan[
     var full_rope = RopeSlots[C.ROPE_HALF_FULL, max_seq_len]()
     state_cursor = stamp_offsets(full_rope, degree, state_cursor)
 
-    var steer = SteerVectorSlots()
+    var steer = SteerVectorSlots[steer_vectors]()
     state_cursor = stamp_offsets(steer, degree, state_cursor)
 
     var arena = ArenaLayout(
@@ -295,7 +297,7 @@ def build_gemma4_plan[
         host_bytes=align_up(state_cursor),
         scratch_off=scratch_off,
     )
-    return Gemma4Layout[R, SKV, FKV, max_seq_len](
+    return Gemma4Layout[R, SKV, FKV, max_seq_len, steer_vectors](
         arena=arena,
         sliding=Repeated[SlidingLayerRefs[R]](
             sl_proto, sl_off, sl_stride, C.NUM_SLIDING_LAYERS),
@@ -309,10 +311,11 @@ def build_gemma4_plan[
 
 
 def gemma4_kv_mirrors[
-    R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup, max_seq_len: Int, //,
+    R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup, max_seq_len: Int,
+    steer_vectors: Int, //,
     batching_seq_len: Int, max_resident_seqs: Int,
 ](
-    read layout: Gemma4Layout[R, SKV, FKV, max_seq_len], degree: Int,
+    read layout: Gemma4Layout[R, SKV, FKV, max_seq_len, steer_vectors], degree: Int,
 ) -> List[KVPoolMirror]:
     var mirrors = List[KVPoolMirror]()
     mirrors.append(KVPoolMirror(
@@ -341,9 +344,10 @@ def gemma4_kv_mirrors[
 
 
 def gemma4_bake_router_scales[
-    R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup, max_seq_len: Int, //,
+    R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup, max_seq_len: Int,
+    steer_vectors: Int, //,
 ](
-    read layout: Gemma4Layout[R, SKV, FKV, max_seq_len],
+    read layout: Gemma4Layout[R, SKV, FKV, max_seq_len, steer_vectors],
     read arena_bases: List[Int],
 ):
     comptime width = simd_width_of[DType.float32]()
@@ -367,9 +371,10 @@ def gemma4_bake_router_scales[
 
 
 def gemma4_init_rope_tables[
-    R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup, max_seq_len: Int, //,
+    R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup, max_seq_len: Int,
+    steer_vectors: Int, //,
 ](
-    read layout: Gemma4Layout[R, SKV, FKV, max_seq_len],
+    read layout: Gemma4Layout[R, SKV, FKV, max_seq_len, steer_vectors],
     read arena_bases: List[Int],
 ):
     for rank in range(len(arena_bases)):
@@ -389,6 +394,7 @@ def gemma4_init_rope_tables[
 def gemma4_load_arenas[
     R: Gemma4Recipes, SKV: KVSlotGroup, FKV: KVSlotGroup,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
+    steer_vectors: Int,
 ](
     dir_path: Path,
     topo: NumaTopology,
@@ -396,7 +402,7 @@ def gemma4_load_arenas[
     max_workers: Int,
     scratch_cap: Int,
     mut arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
-) -> Optional[Gemma4Layout[R, SKV, FKV, max_seq_len]]:
+) -> Optional[Gemma4Layout[R, SKV, FKV, max_seq_len, steer_vectors]]:
     var shards = discover_shards(dir_path)
     if len(shards) == 0:
         print(t"no safetensors shards found in {dir_path}")
@@ -407,7 +413,7 @@ def gemma4_load_arenas[
     var descs = List[WeightDesc]()
     var layout = build_gemma4_plan[
         R, SKV, FKV,
-        max_seq_len, batching_seq_len, max_resident_seqs,
+        max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors,
     ](degree, max_workers, scratch_cap, descs)
 
     var size = layout.arena.host_arena_bytes()

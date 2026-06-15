@@ -52,6 +52,9 @@ from modeling.gemma4_common import (
 from modeling.modeling_common import (
     pack_slot_starts, collect_emit_plan, stage_sampling_inputs,
 )
+from modeling.steer import (
+    SteerState, Steerable, InjectOp, dispatch_steer_point, dispatch_steer_add,
+)
 from modeling.slot import (
     Slot, BindContext, emit_pack_tasks,
 )
@@ -151,11 +154,12 @@ comptime R = ButterquantRecipes
 comptime SH = Gemma4Shapes[R.FFN_BLOCK]
 comptime Layout[
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
+    steer_vectors: Int,
 ] = Gemma4Layout[
     ButterquantRecipes,
     SlidingKVSlots[max_resident_seqs],
     FullKVSlots[batching_seq_len],
-    max_seq_len,
+    max_seq_len, steer_vectors,
 ]
 
 
@@ -412,11 +416,12 @@ def calculate_peak_scratch(degree: Int, max_workers: Int) -> Int:
 
 
 def dispatch_bq_sliding_attention_qkv[
-    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
+    steer_vectors: Int, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
-    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs],
+    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors],
     ctx: BindContext[o],
     act: ButterquantActivation[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
@@ -431,7 +436,7 @@ def dispatch_bq_sliding_attention_qkv[
     comptime head_dim = C.HEAD_DIM_SLIDING
     comptime gqa_ratio = C.NUM_HEADS // C.NUM_KV_HEADS_SLIDING
     comptime sqrt_hd = sqrt[DType.float32, 1](head_dim)
-    comptime hd_eps = Float32(head_dim) * Float32(C.RMS_NORM_EPS)
+    comptime hd_eps = Float32(head_dim) * C.RMS_NORM_EPS
     comptime rope_half = C.ROPE_HALF_SLIDING
     comptime cache_size = SLIDING_RING_PAGES * PAGE_LEN
     comptime max_q = SLIDING_NUM_Q_MAX
@@ -517,11 +522,12 @@ def dispatch_bq_sliding_attention_qkv[
 
 
 def dispatch_bq_full_attention_qkv[
-    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
+    steer_vectors: Int, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
-    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs],
+    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors],
     ctx: BindContext[o],
     act: ButterquantActivation[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
@@ -540,7 +546,7 @@ def dispatch_bq_full_attention_qkv[
     comptime num_kv_heads = k_rows // head_dim
     comptime gqa_ratio = C.NUM_HEADS // C.NUM_KV_HEADS_FULL
     comptime sqrt_hd = sqrt[DType.float32, 1](head_dim)
-    comptime hd_eps = Float32(head_dim) * Float32(C.RMS_NORM_EPS)
+    comptime hd_eps = Float32(head_dim) * C.RMS_NORM_EPS
     comptime rope_half = C.ROPE_HALF_FULL
     comptime pair_stride = head_dim // 2
     comptime partial_stride = FULL_PARTIAL_STRIDE
@@ -632,7 +638,7 @@ def dispatch_bq_moe[
     var degree = ctx.degree()
     var experts_per_rank = C.NUM_EXPERTS // degree
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
-    comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
+    comptime n_eps = Float32(C.HIDDEN) * C.RMS_NORM_EPS
 
     var router_scaled = scratch.binding[Gemma4FfnMoeScratch, "moe_router_scaled"](ctx, plan)
     var cands = scratch.binding[Gemma4FfnMoeScratch, "moe_cands"](ctx, plan)
@@ -717,7 +723,7 @@ def dispatch_bq_ffn[
 ):
     var degree = ctx.degree()
     comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
-    comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
+    comptime n_eps = Float32(C.HIDDEN) * C.RMS_NORM_EPS
     var intermediate_per_rank = SH.GateUp.data_n(degree)
 
     var layer_scalar_ptr = body.layer_scalar.at(ctx.layer_address())
@@ -798,14 +804,17 @@ struct Gemma4[
     batching_seq_len: Int = 8192,
     max_resident_seqs: Int = 4,
     Pool: BurstThreadPool = BurstPool[],
+    steer_vectors: Int = 0,
     profile: Bool = False, profile_slots: Int = 64,
-](Movable, ScheduledModel):
+](Movable, ScheduledModel, Steerable):
     comptime POSITIONS_PER_PAGE = PAGE_LEN
+    comptime STEER_VECTORS = Self.steer_vectors
 
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
     var layout: Layout[
         Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+        Self.steer_vectors,
     ]
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
@@ -818,12 +827,15 @@ struct Gemma4[
     var sliding_runs: KVRunTable
     var full_runs: KVRunTable
     var profiler: Profiler[Self.profile, Self.profile_slots]
+    var steer: SteerState
+    var tokens_processed: Int
 
     def __init__(out self,
         var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]],
         var pools: List[Self.Pool],
         layout: Layout[
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+            Self.steer_vectors,
         ],
         degree: Int,
         max_workers: Int,
@@ -847,6 +859,8 @@ struct Gemma4[
         self.sliding_runs = KVRunTable()
         self.full_runs = KVRunTable()
         self.profiler = Profiler[Self.profile, Self.profile_slots]()
+        self.steer = SteerState(CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM)
+        self.tokens_processed = 0
 
     def init_state(mut self):
         var tasks = List[PackColsumTask]()
@@ -896,6 +910,20 @@ struct Gemma4[
         gemma4_bake_router_scales(self.layout, self.arena_bases)
         gemma4_init_rope_tables(self.layout, self.arena_bases)
 
+    def set_steer_vector(mut self, idx: Int, read vec: List[BFloat16]):
+        comptime if Self.steer_vectors > 0:
+            for r in range(self.degree):
+                var base = self.arena_bases[r]
+                var p = self.layout.steer.vectors.at(base) + idx * C.HIDDEN
+                for j in range(C.HIDDEN):
+                    p[j] = vec[j]
+
+    def set_inject_ops(mut self, var ops: List[InjectOp]):
+        self.steer.set_inject(ops^)
+
+    def disarm_steer(mut self):
+        self.steer.disarm()
+
     def batch_geometry(self) -> BatchGeometry:
         return BatchGeometry(
             max_seqs=Self.max_resident_seqs,
@@ -926,7 +954,7 @@ struct Gemma4[
         ref layout = self.layout
         var degree = self.degree
         comptime sqrt_n = sqrt[DType.float32, 1](C.HIDDEN)
-        comptime n_eps = Float32(C.HIDDEN) * Float32(C.RMS_NORM_EPS)
+        comptime n_eps = Float32(C.HIDDEN) * C.RMS_NORM_EPS
         comptime embed_scale = Float64(sqrt[DType.float32, 1](C.HIDDEN)
             .cast[DType.bfloat16]().cast[DType.float32]())
         var vocab_per_rank = C.VOCAB_SIZE // degree
@@ -944,6 +972,7 @@ struct Gemma4[
             total <= C.SLIDING_WINDOW,
             "execute packed tokens exceed SLIDING_WINDOW",
         )
+        self.tokens_processed += total
 
         var ctx = BindContext(RankView(Span(self.arena_bases)), 0)
         var tail_ctx = ctx.with_layer(layout.tail.base(0))
@@ -979,6 +1008,8 @@ struct Gemma4[
         ](ctx, self.head_plan)
 
         var buf_starts = pack_slot_starts(schedule)
+        if self.steer.armed:
+            self.steer.record_step(schedule, buf_starts, num_slots)
         self.run_prefix_copies(schedule)
         self.bind_step_runs(schedule, pages)
         var full_runs = UnsafePointer(to=self.full_runs)
@@ -1067,6 +1098,42 @@ struct Gemma4[
                 body, layer_ctx, x_main_ranks, x_res_ranks, total,
                 self.scratch, self.ffn_plan, self.pools, self.profiler)
 
+            if self.steer.armed:
+                if self.steer.per_request:
+                    for s in range(num_slots):
+                        var rid = schedule.slots[s].request_id
+                        if rid >= len(self.steer.req_ops):
+                            continue
+                        var sstart = buf_starts[s]
+                        var sn = schedule.slots[s].n_tokens
+                        for k in range(len(self.steer.req_ops[rid])):
+                            var op = self.steer.req_ops[rid][k]
+                            if op.layer == i:
+                                var vec = layout.steer.vectors.state_binding(
+                                    ctx).shifted(op.vec_idx * C.HIDDEN)
+                                dispatch_steer_add[hidden=C.HIDDEN](
+                                    x_main_ranks.shifted(sstart * C.HIDDEN),
+                                    vec, op.alpha, sn,
+                                    self.pools, self.profiler)
+                else:
+                    for k in range(len(self.steer.inject_ops)):
+                        var op = self.steer.inject_ops[k]
+                        if op.layer == i:
+                            var vec = layout.steer.vectors.state_binding(ctx).shifted(
+                                op.vec_idx * C.HIDDEN)
+                            dispatch_steer_add[hidden=C.HIDDEN](
+                                x_main_ranks, vec, op.alpha, total,
+                                self.pools, self.profiler)
+                var tp = self.steer.tap_index(i)
+                if tp >= 0:
+                    var sink = self.steer.sink_ptr()
+                    var mism = dispatch_steer_point[hidden=C.HIDDEN](
+                        x_main_ranks, self.steer.last_rows,
+                        self.steer.last_num_slots, tp,
+                        sink, self.steer.max_slots,
+                        self.steer.verify_rank)
+                    self.steer.mismatch_count += mism
+
         var outcomes = List[SampleOutcome[MAXIMUM_SAMPLING_LOGITS]]()
         var emit_plan = collect_emit_plan(schedule, buf_starts)
         var num_emit = emit_plan.count()
@@ -1120,6 +1187,7 @@ struct Gemma4[
             SlidingKVSlots[Self.max_resident_seqs],
             FullKVSlots[Self.batching_seq_len],
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
+            Self.steer_vectors,
         ](dir_path, topo, degree, max_workers,
           calculate_peak_scratch(degree, max_workers), arenas)
         if not layout_opt:
