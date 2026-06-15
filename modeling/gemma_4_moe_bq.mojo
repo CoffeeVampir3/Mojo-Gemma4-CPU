@@ -1012,8 +1012,8 @@ struct Gemma4[
             self.steer.record_step(schedule, buf_starts, num_slots)
         self.run_prefix_copies(schedule)
         self.bind_step_runs(schedule, pages)
-        var full_runs = UnsafePointer(to=self.full_runs)
-        var sliding_runs = UnsafePointer(to=self.sliding_runs)
+        var full_runs = UnsafePointer(to=self.full_runs).as_unsafe_any_origin()
+        var sliding_runs = UnsafePointer(to=self.sliding_runs).as_unsafe_any_origin()
 
         dispatch_bq_embed_lookup[
             hidden=C.HIDDEN, scale=embed_scale,

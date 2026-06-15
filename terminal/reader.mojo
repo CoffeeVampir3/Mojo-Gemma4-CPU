@@ -105,7 +105,7 @@ struct TerminalReader(Movable):
         var old = len(self.buf)
         self.buf.resize(unsafe_uninit_length=old + READ_CHUNK)
         var sys = linux.linux_sys()
-        var got = 0
+        var got: Int
         while True:
             var rc = sys.sys_read(
                 self.fd, Int(self.buf.unsafe_ptr() + old), READ_CHUNK)

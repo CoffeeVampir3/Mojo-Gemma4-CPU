@@ -16,7 +16,7 @@ trait SleepableThreadPool:
     def sleep(mut self): ...
 
 
-trait BurstThreadPool(Movable, ImplicitlyDestructible, SleepableThreadPool):
+trait BurstThreadPool(Movable, ImplicitlyDeletable, SleepableThreadPool):
     def get_capacity(self) -> Int: ...
 
     def dispatch[K: BurstKernel, origin: MutOrigin](

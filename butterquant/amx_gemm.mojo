@@ -28,8 +28,9 @@ def amx_b_tile_base(t: Int, k_off: Int, k_dim: Int) -> Int:
 @always_inline
 def dequant_fused[
     write: def(Int, Int, SIMD[DType.float32, WIDTH]) capturing [_] -> None,
+    origin: MutOrigin,
 ](
-    c: I32Ptr, row_base: Int, n_base: Int, m_rows: Int,
+    c: UnsafePointer[Int32, origin], row_base: Int, n_base: Int, m_rows: Int,
     act_scale: F32Ptr, wsc: F32Ptr,
 ):
     for r in range(m_rows):
@@ -44,8 +45,11 @@ def dequant_fused[
 
 
 @always_inline
-def block_accumulate(
-    c: I32Ptr, facc: F32Ptr, row_base: Int, b: Int, nb: Int, m_rows: Int,
+def block_accumulate[
+    c_origin: MutOrigin, f_origin: MutOrigin,
+](
+    c: UnsafePointer[Int32, c_origin], facc: UnsafePointer[Float32, f_origin],
+    row_base: Int, b: Int, nb: Int, m_rows: Int,
     act_scale: F32Ptr,
 ):
     for r in range(m_rows):
@@ -62,8 +66,10 @@ def block_accumulate(
 @always_inline
 def block_finalize[
     write: def(Int, Int, SIMD[DType.float32, WIDTH]) capturing [_] -> None,
+    origin: MutOrigin,
 ](
-    facc: F32Ptr, row_base: Int, n_base: Int, m_rows: Int, wsc: F32Ptr,
+    facc: UnsafePointer[Float32, origin], row_base: Int, n_base: Int,
+    m_rows: Int, wsc: F32Ptr,
 ):
     for r in range(m_rows):
         var nj = 0

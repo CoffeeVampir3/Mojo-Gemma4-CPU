@@ -55,7 +55,7 @@ def request_amx_xstate() -> Bool:
 
 
 @always_inline
-def ldtilecfg(cfg: UnsafePointer[TileConfig, MutAnyOrigin]):
+def ldtilecfg[origin: MutOrigin](cfg: UnsafePointer[TileConfig, origin]):
     llvm_intrinsic["llvm.x86.ldtilecfg", NoneType](cfg)
 
 
@@ -71,8 +71,8 @@ def tilezero[tile: Int]():
 
 
 @always_inline
-def tileload[tile: Int, dtype: DType](
-    ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+def tileload[tile: Int, dtype: DType, origin: MutOrigin](
+    ptr: UnsafePointer[Scalar[dtype], origin],
     stride: Int,
 ):
     comptime assert tile >= 0 and tile < 8, "tile must be 0-7"
@@ -81,8 +81,8 @@ def tileload[tile: Int, dtype: DType](
 
 
 @always_inline
-def tilestore[tile: Int, dtype: DType](
-    ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+def tilestore[tile: Int, dtype: DType, origin: MutOrigin](
+    ptr: UnsafePointer[Scalar[dtype], origin],
     stride: Int,
 ):
     comptime assert tile >= 0 and tile < 8, "tile must be 0-7"

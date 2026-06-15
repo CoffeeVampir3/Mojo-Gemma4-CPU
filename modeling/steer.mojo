@@ -101,7 +101,7 @@ struct SteerState(Movable):
 
     @always_inline
     def sink_ptr(mut self) -> BF16Ptr:
-        return self.sink.unsafe_ptr()
+        return self.sink.unsafe_ptr().as_unsafe_any_origin()
 
     @always_inline
     def captured_ptr(mut self, tap_pos: Int, slot: Int) -> BF16Ptr:

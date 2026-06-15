@@ -270,7 +270,7 @@ def run_load[
             return None
 
     var pools_span = Span[BurstPool[mask_size], MutAnyOrigin](
-        ptr=load_pools.unsafe_ptr(), length=len(load_pools))
+        ptr=load_pools.unsafe_ptr().as_unsafe_any_origin(), length=len(load_pools))
     run_reads_multi[io_depth, mask_size](pools_span, paths, ops_per_rank)
 
     return LoadResult(total_bytes, total_ops)

@@ -85,7 +85,7 @@ def install_burst_sigsegv_handler():
     _ = sys.sys_rt_sigaction(linux.Signal.SEGV, UnsafePointer(to=act))
 
 
-struct WorkerSlot(Movable, ImplicitlyDestructible):
+struct WorkerSlot(Movable, ImplicitlyDeletable):
     var base: UnsafePointer[UInt8, MutAnyOrigin]
     var child_tid: UnsafePointer[Int32, MutAnyOrigin]
     var stack_top: UnsafePointer[UInt8, MutAnyOrigin]

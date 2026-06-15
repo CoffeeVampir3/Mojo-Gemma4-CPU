@@ -57,7 +57,7 @@ def gpt2_to_bytes(text: String) -> List[Byte]:
     return out^
 
 
-trait ByteTransformCapability(Movable, ImplicitlyDestructible):
+trait ByteTransformCapability(Movable, ImplicitlyDeletable):
     def encode_bytes(self, data: Span[Byte, _]) -> String:
         return bytes_to_gpt2(data)
 
@@ -65,7 +65,7 @@ trait ByteTransformCapability(Movable, ImplicitlyDestructible):
         return gpt2_to_bytes(text)
 
 
-trait PreTokenizerCapability(Movable, ImplicitlyDestructible):
+trait PreTokenizerCapability(Movable, ImplicitlyDeletable):
     def pre_tokenize(self, text: String) -> List[String]:
         ...
 

@@ -27,7 +27,7 @@ struct ArenaLayout(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Repeated[T: ImplicitlyCopyable & ImplicitlyDestructible](Copyable, ImplicitlyCopyable):
+struct Repeated[T: ImplicitlyCopyable & ImplicitlyDeletable](Copyable, ImplicitlyCopyable):
     var proto: Self.T
     var off: Int
     var stride: Int

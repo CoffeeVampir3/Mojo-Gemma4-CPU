@@ -135,8 +135,8 @@ def dispatch_flash_sliding[
 
             dispatch_merge_batched_flash_partials[
                 head_dim, max_worker_count=max_worker_count,
-            ](output, partials, flat_bands.unsafe_ptr(), num_runs, num_q,
-              partial_stride, pools, prof)
+            ](output, partials, flat_bands.unsafe_ptr().as_unsafe_any_origin(),
+              num_runs, num_q, partial_stride, pools, prof)
             return
 
         # Token count saturates the worker budget: the token-partitioned prefill
@@ -261,8 +261,8 @@ def dispatch_flash_full[
             dispatch_merge_batched_context_partials[
                 head_dim, max_worker_count=max_worker_count,
             ](q_local_output, partials, segment_scratch,
-              flat_bands.unsafe_ptr(), num_runs, num_q, local_num_q,
-              partial_stride, pools, prof)
+              flat_bands.unsafe_ptr().as_unsafe_any_origin(), num_runs, num_q,
+              local_num_q, partial_stride, pools, prof)
             return
 
         # Token count saturates the worker budget: fall back to the

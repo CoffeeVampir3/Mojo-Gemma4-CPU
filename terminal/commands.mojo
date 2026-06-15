@@ -16,7 +16,7 @@ struct CmdResult(Equatable, ImplicitlyCopyable, Copyable, Movable):
         return self.code != other.code
 
 
-trait ArgLike(Copyable, Movable, Defaultable, ImplicitlyDestructible):
+trait ArgLike(Copyable, Movable, Defaultable, ImplicitlyDeletable):
     @staticmethod
     def parse(token: String) -> Optional[Self]: ...
 
@@ -27,7 +27,7 @@ trait ArgLike(Copyable, Movable, Defaultable, ImplicitlyDestructible):
     def usage() -> String: ...
 
 
-trait Parsable(Copyable, Movable, Defaultable, ImplicitlyDestructible):
+trait Parsable(Copyable, Movable, Defaultable, ImplicitlyDeletable):
     pass
 
 

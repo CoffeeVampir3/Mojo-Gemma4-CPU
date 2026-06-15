@@ -457,16 +457,16 @@ trait ArchLinux:
     def arch_thread_pointer(self) -> Int: ...
     def arch_tls_load_i64[offset: Int](self) -> Int: ...
 
-    def sys_clone3_with_entry(
+    def sys_clone3_with_entry[origin: MutOrigin](
         self,
-        clone_args_ptr: UnsafePointer[Clone3Args, MutAnyOrigin],
+        clone_args_ptr: UnsafePointer[Clone3Args, origin],
         clone_args_size: Int,
     ) -> Int: ...
 
-    def sys_rt_sigaction(
+    def sys_rt_sigaction[act_origin: MutOrigin](
         self,
         signum: Int,
-        act: UnsafePointer[RtSigAction, MutAnyOrigin],
+        act: UnsafePointer[RtSigAction, act_origin],
         old: Optional[UnsafePointer[RtSigAction, MutAnyOrigin]] = None,
     ) -> Int: ...
 
@@ -525,18 +525,18 @@ trait LinuxSys(ArchLinux):
     def sys_ioctl(self, fd: Int, request: Int, arg: Int) -> Int:
         return self.syscall(Self.NR_ioctl, fd, request, arg)
 
-    def sys_tcgetattr(self, fd: Int, t: UnsafePointer[Termios, MutAnyOrigin]) -> Int:
+    def sys_tcgetattr[origin: MutOrigin](self, fd: Int, t: UnsafePointer[Termios, origin]) -> Int:
         return self.sys_ioctl(fd, TermIoctl.TCGETS, Int(t))
 
-    def sys_tcsetattr(self, fd: Int, t: UnsafePointer[Termios, MutAnyOrigin]) -> Int:
+    def sys_tcsetattr[origin: MutOrigin](self, fd: Int, t: UnsafePointer[Termios, origin]) -> Int:
         return self.sys_ioctl(fd, TermIoctl.TCSETS, Int(t))
 
-    def sys_get_winsize(self, fd: Int, w: UnsafePointer[Winsize, MutAnyOrigin]) -> Int:
+    def sys_get_winsize[origin: MutOrigin](self, fd: Int, w: UnsafePointer[Winsize, origin]) -> Int:
         return self.sys_ioctl(fd, TermIoctl.TIOCGWINSZ, Int(w))
 
-    def sys_sigaltstack(
+    def sys_sigaltstack[ss_origin: MutOrigin](
         self,
-        ss: UnsafePointer[StackT, MutAnyOrigin],
+        ss: UnsafePointer[StackT, ss_origin],
         old: Optional[UnsafePointer[StackT, MutAnyOrigin]] = None,
     ) -> Int:
         return self.syscall(Self.NR_sigaltstack, Int(ss),

@@ -56,7 +56,7 @@ trait Gemma4Recipes:
 
 
 trait KVSlotGroup(
-    SlotGroup, Copyable, ImplicitlyCopyable, ImplicitlyDestructible,
+    SlotGroup, Copyable, ImplicitlyCopyable, ImplicitlyDeletable,
 ):
     pass
 

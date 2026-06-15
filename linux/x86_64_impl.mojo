@@ -94,10 +94,10 @@ struct X86_64LinuxSys(LinuxSys):
         comptime asm = "mov %fs:" + String(offset) + ", $0"
         return Int(inlined_assembly[asm, Int, constraints="=r"]())
 
-    def sys_rt_sigaction(
+    def sys_rt_sigaction[act_origin: MutOrigin](
         self,
         signum: Int,
-        act: UnsafePointer[RtSigAction, MutAnyOrigin],
+        act: UnsafePointer[RtSigAction, act_origin],
         old: Optional[UnsafePointer[RtSigAction, MutAnyOrigin]] = None,
     ) -> Int:
         var restorer_copy = rt_sigreturn_restorer
@@ -140,9 +140,9 @@ struct X86_64LinuxSys(LinuxSys):
             _ = kact_ptr[]
             return result
 
-    def sys_clone3_with_entry(
+    def sys_clone3_with_entry[origin: MutOrigin](
         self,
-        clone_args_ptr: UnsafePointer[Clone3Args, MutAnyOrigin],
+        clone_args_ptr: UnsafePointer[Clone3Args, origin],
         clone_args_size: Int,
     ) -> Int:
         comptime asm = (
