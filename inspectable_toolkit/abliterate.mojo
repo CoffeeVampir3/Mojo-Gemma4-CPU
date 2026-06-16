@@ -90,3 +90,11 @@ trait AbliterableModel:
         read down: AbliterationParameters,
         mut ws: AbliterateWorkspace,
     ): ...
+
+    def abliterate_schedule(
+        mut self,
+        read directions: List[BFloat16],
+        read attn_alpha: List[Float32],
+        read down_alpha: List[Float32],
+        mut ws: AbliterateWorkspace,
+    ): ...

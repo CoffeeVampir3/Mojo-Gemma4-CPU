@@ -803,6 +803,20 @@ struct Gemma4[
         read down: AbliterationParameters,
         mut ws: AbliterateWorkspace,
     ):
+        var attn_alpha = List[Float32](length=C.NUM_LAYERS, fill=Float32(0))
+        var down_alpha = List[Float32](length=C.NUM_LAYERS, fill=Float32(0))
+        for i in range(C.NUM_LAYERS):
+            attn_alpha[i] = attn.strength(i)
+            down_alpha[i] = down.strength(i)
+        self.abliterate_schedule(directions, attn_alpha, down_alpha, ws)
+
+    def abliterate_schedule(
+        mut self,
+        read directions: List[BFloat16],
+        read attn_alpha: List[Float32],
+        read down_alpha: List[Float32],
+        mut ws: AbliterateWorkspace,
+    ):
         comptime if Self.abliterate_training:
             ref layout = self.layout
             var actx = BindContext(RankView(Span(self.arena_bases)), 0)
@@ -812,8 +826,8 @@ struct Gemma4[
             var a = ws_view.bind(ws.a_ptr())
             var p = ws_view.bind(ws.p_ptr())
             for i in range(C.NUM_LAYERS):
-                var a_alpha = attn.strength(i)
-                var d_alpha = down.strength(i)
+                var a_alpha = attn_alpha[i]
+                var d_alpha = down_alpha[i]
                 if a_alpha == Float32(0) and d_alpha == Float32(0):
                     continue
                 var db = (i + 1) * C.HIDDEN
