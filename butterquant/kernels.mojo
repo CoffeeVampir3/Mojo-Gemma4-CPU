@@ -89,7 +89,7 @@ def fwht_rotate_columns[head_dim: Int](work: PtrF32, rows: Int, cols: Int):
     if rows % head_dim != 0:
         abort(t"butterquant: rows={rows} not divisible by M-axis FWHT block={head_dim}")
     var scratch_buf = List[Float32](length=head_dim, fill=Float32(0))
-    var scratch = scratch_buf.unsafe_ptr().as_any_origin()
+    var scratch = scratch_buf.unsafe_ptr().as_unsafe_any_origin()
     var num_heads = rows // head_dim
     for h in range(num_heads):
         var base = h * head_dim

@@ -60,6 +60,8 @@ from inspectable_toolkit.flash_kl import dispatch_flash_kl
 from inspectable_toolkit.abliterate import (
     AbliterableModel, AbliterationParameters, AbliterateWorkspace,
 )
+from inspectable_toolkit.checkpoint_writer import copy_checkpoint, patch_slot
+from safetensors.parser import SafetensorsHeader, parse_safetensors_header
 from kernels.copy_kernels import dispatch_copy_slot
 from kernels.abliterate_kernels import (
     dispatch_abliterate_dense, dispatch_abliterate_experts,
@@ -70,6 +72,7 @@ from modeling.slot import (
 from modeling.kv_policy import (
     KVPoolMirror, pool_specs, dispatch_prefix_copies, bind_pool_run_table,
 )
+from modeling.loader import discover_shards
 from modeling.gemma4_topology import (
     MAX_WORKERS, PAGE_LEN, CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM,
     SLIDING_POOL, FULL_POOL, SLIDING_RING_PAGES,
@@ -875,6 +878,65 @@ struct Gemma4[
                             pr.experts_down, body.experts_down, pctx, lctx,
                             v, m, a, p, C.HIDDEN, d_alpha,
                             self.pools, self.profiler)
+
+    def save_abliterated(
+        self, source_dir: Path, dest_dir: Path,
+    ) -> Bool:
+        """Write the current (edited) weights to a new checkpoint: copy the
+        source checkpoint verbatim, then overwrite only the abliteration-
+        touched tensors (o_proj, down_proj, experts_down per layer) in place
+        with their global tensors gathered from the live arenas. Shapes and
+        dtypes are preserved, so the source header stays valid."""
+        if String(source_dir) == String(dest_dir):
+            print("save_abliterated: dest_dir must differ from source_dir")
+            return False
+        if not copy_checkpoint(source_dir, dest_dir):
+            return False
+        var shard_paths = discover_shards(dest_dir)
+        if len(shard_paths) == 0:
+            print(t"save_abliterated: no shards in {dest_dir}")
+            return False
+        var headers = List[SafetensorsHeader]()
+        for i in range(len(shard_paths)):
+            var h = parse_safetensors_header(shard_paths[i])
+            if not h:
+                var p = shard_paths[i]
+                print(t"save_abliterated: failed to parse {p}")
+                return False
+            headers.append(h.take())
+
+        ref layout = self.layout
+        for i in range(C.NUM_LAYERS):
+            var entry = LAYER_SCHEDULE[i]
+            var prefix = String(t"model.language_model.layers.{entry.idx}.")
+            if entry.kind == LayerKind.FULL:
+                var lb = layout.full.base(entry.local_idx)
+                var attn = layout.full.proto.attn
+                var body = layout.full.proto.body
+                if not patch_slot(attn.o_proj, lb, prefix, self.degree,
+                    self.arena_bases, headers, shard_paths):
+                    return False
+                if not patch_slot(body.down_proj, lb, prefix, self.degree,
+                    self.arena_bases, headers, shard_paths):
+                    return False
+                if not patch_slot(body.experts_down, lb, prefix, self.degree,
+                    self.arena_bases, headers, shard_paths):
+                    return False
+            else:
+                var lb = layout.sliding.base(entry.local_idx)
+                var attn = layout.sliding.proto.attn
+                var body = layout.sliding.proto.body
+                if not patch_slot(attn.o_proj, lb, prefix, self.degree,
+                    self.arena_bases, headers, shard_paths):
+                    return False
+                if not patch_slot(body.down_proj, lb, prefix, self.degree,
+                    self.arena_bases, headers, shard_paths):
+                    return False
+                if not patch_slot(body.experts_down, lb, prefix, self.degree,
+                    self.arena_bases, headers, shard_paths):
+                    return False
+        print(t"save_abliterated: wrote {dest_dir}")
+        return True
 
     def batch_geometry(self) -> BatchGeometry:
         return BatchGeometry(

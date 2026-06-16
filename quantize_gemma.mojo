@@ -1,5 +1,4 @@
 from std.pathlib import Path
-from std.sys import argv
 from std.time import perf_counter_ns
 
 from numa import NumaTopology
@@ -7,21 +6,11 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
 from modeling.gemma_4_moe_bq import Gemma4
-
-
-def print_usage(program: String):
-    print(t"usage: {program} <checkpoint-folder>")
-    print("example: mojo quantize_gemma_bq.mojo gemma-4-26B-A4B-it")
+from modeling_config import MODEL_DIR
 
 
 def main():
-    var args = argv()
-    if len(args) != 2:
-        print_usage(String(args[0]))
-        return
-
-    var checkpoint_folder = String(args[1])
-    var source = String("checkpoints/") + checkpoint_folder
+    var source = String(MODEL_DIR)
     var output = source + "-bq/model.safetensors"
     print(t"source: {source}")
     print(t"output: {output}")

@@ -154,12 +154,12 @@ comptime R = ButterquantRecipes
 comptime SH = Gemma4Shapes[R.FFN_BLOCK]
 comptime Layout[
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
-    steer_vectors: Int,
+    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool,
 ] = Gemma4Layout[
     ButterquantRecipes,
     SlidingKVSlots[max_resident_seqs],
     FullKVSlots[batching_seq_len],
-    max_seq_len, steer_vectors,
+    max_seq_len, steer_vectors, measure_rows, abliterate_training,
 ]
 
 
@@ -417,11 +417,14 @@ def calculate_peak_scratch(degree: Int, max_workers: Int) -> Int:
 
 def dispatch_bq_sliding_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
-    steer_vectors: Int, //,
+    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
-    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors],
+    layout: Layout[
+        max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors,
+        measure_rows, abliterate_training,
+    ],
     ctx: BindContext[o],
     act: ButterquantActivation[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
@@ -523,11 +526,14 @@ def dispatch_bq_sliding_attention_qkv[
 
 def dispatch_bq_full_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
-    steer_vectors: Int, //,
+    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
-    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors],
+    layout: Layout[
+        max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors,
+        measure_rows, abliterate_training,
+    ],
     ctx: BindContext[o],
     act: ButterquantActivation[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
@@ -805,6 +811,8 @@ struct Gemma4[
     max_resident_seqs: Int = 4,
     Pool: BurstThreadPool = BurstPool[],
     steer_vectors: Int = 0,
+    measure_rows: Int = 0,
+    abliterate_training: Bool = False,
     profile: Bool = False, profile_slots: Int = 64,
 ](Movable, ScheduledModel, Steerable):
     comptime POSITIONS_PER_PAGE = PAGE_LEN
@@ -814,7 +822,7 @@ struct Gemma4[
     var pools: List[Self.Pool]
     var layout: Layout[
         Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-        Self.steer_vectors,
+        Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
     ]
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
@@ -835,7 +843,7 @@ struct Gemma4[
         var pools: List[Self.Pool],
         layout: Layout[
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-            Self.steer_vectors,
+            Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
         ],
         degree: Int,
         max_workers: Int,
@@ -1187,7 +1195,7 @@ struct Gemma4[
             SlidingKVSlots[Self.max_resident_seqs],
             FullKVSlots[Self.batching_seq_len],
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-            Self.steer_vectors,
+            Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
         ](dir_path, topo, degree, max_workers,
           calculate_peak_scratch(degree, max_workers), arenas)
         if not layout_opt:
