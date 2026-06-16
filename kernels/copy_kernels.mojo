@@ -1,6 +1,7 @@
 from std.sys.info import simd_width_of, size_of
 
 from threading.threading_traits import BurstThreadPool
+from modeling.slot import SlotLike, BindContext
 from .helpers import RangePartitionedKernel, Binding, fanout_dispatch
 from .profiling import Profiler
 
@@ -46,3 +47,26 @@ def dispatch_copy[
 
     fanout_dispatch[make, max_worker_count=max_worker_count, label="copy"](
         pools, prof, count, count * size_of[Scalar[T]]() * 2)
+
+
+@always_inline
+def dispatch_copy_slot[
+    S: SlotLike, P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    max_worker_count: Int = 128,
+](
+    read src: S,
+    read dst: S,
+    src_ctx: BindContext[o],
+    dst_ctx: BindContext[o],
+    mut pools: List[P],
+    mut prof: Profiler[Profile, N],
+):
+    comptime WT = S.ENCODING.DTYPE
+    var degree = src_ctx.degree()
+    var n = S.SHAPE.data_n(degree) * S.SHAPE.data_m(degree)
+    var s0 = UnsafePointer[Scalar[WT], MutAnyOrigin](
+        unsafe_from_address=src_ctx.layer_address() + src.get_offset())
+    var d0 = UnsafePointer[Scalar[WT], MutAnyOrigin](
+        unsafe_from_address=dst_ctx.layer_address() + dst.get_offset())
+    dispatch_copy[max_worker_count=max_worker_count](
+        src_ctx.bind(s0), dst_ctx.bind(d0), n, pools, prof)

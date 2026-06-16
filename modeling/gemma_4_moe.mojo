@@ -57,8 +57,13 @@ from inspectable_toolkit.measure import (
     MEASURE_RESIDUAL, MEASURE_BASELINE, MEASURE_MODIFIED,
 )
 from inspectable_toolkit.flash_kl import dispatch_flash_kl
-from inspectable_toolkit.abliterate import AbliterableModel
-from kernels.copy_kernels import dispatch_copy
+from inspectable_toolkit.abliterate import (
+    AbliterableModel, AbliterationParameters, AbliterateWorkspace,
+)
+from kernels.copy_kernels import dispatch_copy_slot
+from kernels.abliterate_kernels import (
+    dispatch_abliterate_dense, dispatch_abliterate_experts,
+)
 from modeling.slot import (
     Slot, BindContext,
 )
@@ -760,14 +765,7 @@ struct Gemma4[
     def restore_abliterated_layers(mut self):
         comptime if Self.abliterate_training:
             ref layout = self.layout
-            var degree = self.degree
             var ctx = BindContext(RankView(Span(self.arena_bases)), 0)
-            var n_down = SH.Down.data_n(degree) * SH.Down.data_m(degree)
-            var n_exp = SH.ExpertsDown.data_n(degree) * SH.ExpertsDown.data_m(
-                degree)
-            var n_o_sliding = SH.SlidingO.data_n(degree) * SH.SlidingO.data_m(
-                degree)
-            var n_o_full = SH.FullO.data_n(degree) * SH.FullO.data_m(degree)
             for i in range(C.NUM_LAYERS):
                 var entry = LAYER_SCHEDULE[i]
                 if entry.kind == LayerKind.FULL:
@@ -777,15 +775,12 @@ struct Gemma4[
                     var attn = layout.full.proto.attn
                     var body = layout.full.proto.body
                     var pr = layout.pristine_full.proto
-                    dispatch_copy(pr.o_proj.binding(pctx),
-                        attn.o_proj.binding(lctx), n_o_full,
+                    dispatch_copy_slot(pr.o_proj, attn.o_proj, pctx, lctx,
                         self.pools, self.profiler)
-                    dispatch_copy(pr.down_proj.binding(pctx),
-                        body.down_proj.binding(lctx), n_down,
-                        self.pools, self.profiler)
-                    dispatch_copy(pr.experts_down.binding(pctx),
-                        body.experts_down.binding(lctx), n_exp,
-                        self.pools, self.profiler)
+                    dispatch_copy_slot(pr.down_proj, body.down_proj, pctx,
+                        lctx, self.pools, self.profiler)
+                    dispatch_copy_slot(pr.experts_down, body.experts_down,
+                        pctx, lctx, self.pools, self.profiler)
                 else:
                     var lctx = ctx.with_layer(
                         layout.sliding.base(entry.local_idx))
@@ -794,15 +789,78 @@ struct Gemma4[
                     var attn = layout.sliding.proto.attn
                     var body = layout.sliding.proto.body
                     var pr = layout.pristine_sliding.proto
-                    dispatch_copy(pr.o_proj.binding(pctx),
-                        attn.o_proj.binding(lctx), n_o_sliding,
+                    dispatch_copy_slot(pr.o_proj, attn.o_proj, pctx, lctx,
                         self.pools, self.profiler)
-                    dispatch_copy(pr.down_proj.binding(pctx),
-                        body.down_proj.binding(lctx), n_down,
-                        self.pools, self.profiler)
-                    dispatch_copy(pr.experts_down.binding(pctx),
-                        body.experts_down.binding(lctx), n_exp,
-                        self.pools, self.profiler)
+                    dispatch_copy_slot(pr.down_proj, body.down_proj, pctx,
+                        lctx, self.pools, self.profiler)
+                    dispatch_copy_slot(pr.experts_down, body.experts_down,
+                        pctx, lctx, self.pools, self.profiler)
+
+    def abliterate_layers(
+        mut self,
+        read directions: List[BFloat16],
+        read attn: AbliterationParameters,
+        read down: AbliterationParameters,
+        mut ws: AbliterateWorkspace,
+    ):
+        comptime if Self.abliterate_training:
+            ref layout = self.layout
+            var actx = BindContext(RankView(Span(self.arena_bases)), 0)
+            var ws_view = RankView(Span(ws.bases))
+            var v = ws_view.bind(ws.v_ptr())
+            var m = ws_view.bind(ws.m_ptr())
+            var a = ws_view.bind(ws.a_ptr())
+            var p = ws_view.bind(ws.p_ptr())
+            for i in range(C.NUM_LAYERS):
+                var a_alpha = attn.strength(i)
+                var d_alpha = down.strength(i)
+                if a_alpha == Float32(0) and d_alpha == Float32(0):
+                    continue
+                var db = (i + 1) * C.HIDDEN
+                for r in range(self.degree):
+                    var vp = v[r]
+                    for j in range(C.HIDDEN):
+                        vp[j] = directions[db + j].cast[DType.float32]()
+                var entry = LAYER_SCHEDULE[i]
+                if entry.kind == LayerKind.FULL:
+                    var lctx = actx.with_layer(layout.full.base(entry.local_idx))
+                    var pctx = actx.with_layer(
+                        layout.pristine_full.base(entry.local_idx))
+                    var attn_r = layout.full.proto.attn
+                    var body = layout.full.proto.body
+                    var pr = layout.pristine_full.proto
+                    if a_alpha != Float32(0):
+                        dispatch_abliterate_dense[reduce=True](
+                            pr.o_proj, attn_r.o_proj, pctx, lctx, v, m, a, p,
+                            a_alpha, self.pools, self.profiler)
+                    if d_alpha != Float32(0):
+                        dispatch_abliterate_dense[reduce=True](
+                            pr.down_proj, body.down_proj, pctx, lctx, v, m, a, p,
+                            d_alpha, self.pools, self.profiler)
+                        dispatch_abliterate_experts(
+                            pr.experts_down, body.experts_down, pctx, lctx,
+                            v, m, a, p, C.HIDDEN, d_alpha,
+                            self.pools, self.profiler)
+                else:
+                    var lctx = actx.with_layer(
+                        layout.sliding.base(entry.local_idx))
+                    var pctx = actx.with_layer(
+                        layout.pristine_sliding.base(entry.local_idx))
+                    var attn_r = layout.sliding.proto.attn
+                    var body = layout.sliding.proto.body
+                    var pr = layout.pristine_sliding.proto
+                    if a_alpha != Float32(0):
+                        dispatch_abliterate_dense[reduce=True](
+                            pr.o_proj, attn_r.o_proj, pctx, lctx, v, m, a, p,
+                            a_alpha, self.pools, self.profiler)
+                    if d_alpha != Float32(0):
+                        dispatch_abliterate_dense[reduce=True](
+                            pr.down_proj, body.down_proj, pctx, lctx, v, m, a, p,
+                            d_alpha, self.pools, self.profiler)
+                        dispatch_abliterate_experts(
+                            pr.experts_down, body.experts_down, pctx, lctx,
+                            v, m, a, p, C.HIDDEN, d_alpha,
+                            self.pools, self.profiler)
 
     def batch_geometry(self) -> BatchGeometry:
         return BatchGeometry(

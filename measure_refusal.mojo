@@ -16,6 +16,9 @@ from kernels.flash_sample import SamplingParams
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
 from continuous_batching.scheduler import ContinuousBatchScheduler
 from simd_math.ops import sqrt
+from inspectable_toolkit.abliterate import (
+    AbliterationParameters, AbliterateWorkspace,
+)
 
 
 comptime C = Gemma4BaseConfig
@@ -86,10 +89,10 @@ def wave_run[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, Pool=P],
+        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     sampling: SamplingParams,
@@ -131,10 +134,10 @@ def residual_pass[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, Pool=P],
+        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     is_bad: Bool,
@@ -151,10 +154,10 @@ def baseline_pass[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, Pool=P],
+        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     greedy: SamplingParams,
@@ -173,10 +176,10 @@ def kl_zero_pass[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, Pool=P],
+        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     greedy: SamplingParams,
@@ -290,10 +293,10 @@ def count_refusals[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, Pool=P],
+        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     read markers: List[List[Byte]],
@@ -409,7 +412,7 @@ def run[
 ):
     var model_opt = Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, Pool=P].load(Path(MODEL_DIR), topo, pools^)
+        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].load(Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         print("model load failed")
         return
@@ -420,7 +423,7 @@ def run[
         Float32(1.0), Float32(0.0), 0, 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE,
+              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE,
     ](model.batch_geometry(), STEP_BUDGET, stop_tokens())
 
     var harmless = read_lines(Path(String(DATA_DIR) + "/harmless_train.txt"))
@@ -461,13 +464,20 @@ def run[
         directions, model.measure.good_acc, model.measure.good_count,
         model.measure.bad_acc, model.measure.bad_count)
 
+    var markers_s = default_markers()
+    var markers = List[List[Byte]]()
+    for m in range(len(markers_s)):
+        markers.append(norm_bytes(markers_s[m]))
+    var kl0 = Float64(-1)
+    var base_refusals = -1
+
     if len(harmless_eval) > 0:
         print()
         print("--- A2: baseline first-token state ---")
         var k2 = model.tokens_processed
         var t2 = perf_counter_ns()
         var rows = baseline_pass(model, sched, tok, harmless_eval, greedy)
-        var kl0 = kl_zero_pass(model, sched, tok, harmless_eval, greedy)
+        kl0 = kl_zero_pass(model, sched, tok, harmless_eval, greedy)
         tok_total[1] = model.tokens_processed - k2
         ns_total[1] = Int(perf_counter_ns() - t2)
         print(t"  stored {rows} baseline rows (of {len(harmless_eval)} prompts)")
@@ -481,18 +491,36 @@ def run[
         print("--- A3: baseline refusal count ---")
         var k3 = model.tokens_processed
         var t3 = perf_counter_ns()
-        var markers_s = default_markers()
-        var markers = List[List[Byte]]()
-        for m in range(len(markers_s)):
-            markers.append(norm_bytes(markers_s[m]))
-        var refusals = count_refusals(
+        base_refusals = count_refusals(
             model, sched, tok, harmful_eval, markers, greedy, 8)
         tok_total[2] = model.tokens_processed - k3
         ns_total[2] = Int(perf_counter_ns() - t3)
-        print(t"  baseline refusals: {refusals}/{len(harmful_eval)}")
+        print(t"  baseline refusals: {base_refusals}/{len(harmful_eval)}")
     else:
         print()
         print("no harmful_eval data; skipping A3")
+
+    if len(harmless_eval) > 0 and len(harmful_eval) > 0:
+        print()
+        print("--- B: trial abliteration (hand-picked schedule) ---")
+        var ws = AbliterateWorkspace(
+            topo, model.degree, C.HIDDEN, C.Q_DIM_FULL)
+        if not ws.ok():
+            print("  workspace allocation failed")
+        else:
+            var pos = Float32(C.NUM_LAYERS) * Float32(0.6)
+            var attn_p = AbliterationParameters(
+                Float32(1.0), pos, Float32(0.0), Float32(C.NUM_LAYERS))
+            var down_p = AbliterationParameters(
+                Float32(1.0), pos, Float32(0.0), Float32(C.NUM_LAYERS))
+            model.abliterate_layers(directions, attn_p, down_p, ws)
+            var kl_mod = kl_zero_pass(model, sched, tok, harmless_eval, greedy)
+            var refusals_mod = count_refusals(
+                model, sched, tok, harmful_eval, markers, greedy, 8)
+            model.restore_abliterated_layers()
+            print(t"  KL(base||mod) after edit: {kl_mod}  (was {kl0})")
+            print(t"  refusals after edit: {refusals_mod}/{len(harmful_eval)}"
+                  t"  (was {base_refusals})")
 
     var grand_ns = Int(perf_counter_ns() - grand_t0)
     var ns_per_s = Float64(1_000_000_000)
