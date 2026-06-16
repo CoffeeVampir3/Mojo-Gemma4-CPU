@@ -2,7 +2,7 @@ from std.algorithm import vectorize
 
 from threading.threading_traits import BurstThreadPool
 from kernels.helpers import (
-    Binding, BF16Ptr, BW, W, RangePartitionedKernel, fanout_dispatch,
+    Binding, BF16Ptr, BW, W, RangePartitionedKernel, fanout_dispatch, copy_row,
 )
 from kernels.dispatch_heuristics import SCALAR_MUL_INLINE_TOKENS
 from kernels.profiling import Profiler
@@ -113,14 +113,6 @@ trait Steerable:
     def set_steer_vector(mut self, idx: Int, read vec: List[BFloat16]): ...
     def set_inject_ops(mut self, var ops: List[InjectOp]): ...
     def disarm_steer(mut self): ...
-
-
-@always_inline
-def copy_row[hidden: Int](src: BF16Ptr, dst: BF16Ptr):
-    def step[width: Int](idx: Int) {read}:
-        (dst + idx).store((src + idx).load[width=width]())
-
-    vectorize[BW](hidden, step)
 
 
 @always_inline

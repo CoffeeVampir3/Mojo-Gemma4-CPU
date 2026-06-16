@@ -9,7 +9,7 @@ from modeling_config import (
     Model, TOKENIZER_PATH, MODEL_DIR, stop_tokens, BOS_TOKEN_ID,
 )
 from modeling.gemma4_common import Gemma4BaseConfig
-from modeling.steer import InjectOp
+from inspectable_toolkit.steer import InjectOp
 from kernels.flash_sample import SamplingParams
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
 from continuous_batching.scheduler import ContinuousBatchScheduler

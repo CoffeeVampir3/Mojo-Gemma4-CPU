@@ -1,3 +1,4 @@
+from std.algorithm import vectorize
 from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
@@ -81,6 +82,14 @@ def scale_unrolled[
         comptime for p in range(PU):
             var off = i * STRIDE + p * width
             (acc + off).store((acc + off).load[width=width]() * f)
+
+
+@always_inline
+def copy_row[hidden: Int](src: BF16Ptr, dst: BF16Ptr):
+    def step[width: Int](idx: Int) {read}:
+        (dst + idx).store((src + idx).load[width=width]())
+
+    vectorize[BW](hidden, step)
 
 
 @fieldwise_init

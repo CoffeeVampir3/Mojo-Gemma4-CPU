@@ -13,11 +13,11 @@ from modeling_config import (
     BOS_TOKEN_ID, TURN_START_TOKEN_ID, TURN_END_TOKEN_ID,
 )
 from modeling.gemma4_common import Gemma4BaseConfig
-from modeling.steer import InjectOp
-from modeling.probe import (
+from inspectable_toolkit.steer import InjectOp
+from inspectable_toolkit.probe import (
     ContrastSet, ProbeResult, build_probe, mean_row_norm, projection_stats,
 )
-from modeling.slider_pack import write_pack, SliderConfig, SliderCalibration
+from inspectable_toolkit.slider_pack import write_pack, SliderConfig, SliderCalibration
 from kernels.helpers import BF16Ptr, F32Ptr, W
 from kernels.dot_products import dot_to_scalar
 from kernels.flash_sample import SamplingParams

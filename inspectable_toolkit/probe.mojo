@@ -2,10 +2,9 @@ from std.algorithm import vectorize
 
 from simd_math.ops import sqrt
 from kernels.helpers import (
-    BF16Ptr, F32Ptr, W, accumulate_scaled, scale_unrolled,
+    BF16Ptr, F32Ptr, W, accumulate_scaled, scale_unrolled, copy_row,
 )
 from kernels.dot_products import dot_to_scalar
-from modeling.steer import copy_row
 
 
 struct ContrastSet[cols: Int](Movable):

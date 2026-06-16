@@ -52,7 +52,7 @@ from modeling.gemma4_common import (
 from modeling.modeling_common import (
     pack_slot_starts, collect_emit_plan, stage_sampling_inputs,
 )
-from modeling.steer import (
+from inspectable_toolkit.steer import (
     SteerState, Steerable, InjectOp, dispatch_steer_point, dispatch_steer_add,
 )
 from modeling.slot import (

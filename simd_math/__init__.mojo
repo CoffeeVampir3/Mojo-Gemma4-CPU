@@ -1,4 +1,5 @@
 from .matrixops import *
+from .winsorize import *
 from .fast_flags import *
 from .features_gates import *
 from .exponential import *

@@ -8,7 +8,7 @@ from jsontools.parser import Parser, ParseError, LBRACE, RBRACE, LBRACKET, RBRAC
 from safetensors.parser import parse_safetensors_header, TensorMeta
 from safetensors.writer import OutputEntry, write_safetensors
 from modeling.gemma4_common import Gemma4BaseConfig
-from modeling.steer import InjectOp, Steerable
+from inspectable_toolkit.steer import InjectOp, Steerable
 
 
 comptime C = Gemma4BaseConfig

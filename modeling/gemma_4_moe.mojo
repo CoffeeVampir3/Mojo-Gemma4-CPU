@@ -6,7 +6,7 @@ from simd_math.ops import sqrt
 from numa import NumaArena, NumaTopology
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
-from kernels.helpers import RankView, Binding, prime_fp_environment
+from kernels.helpers import RankView, Binding, prime_fp_environment, copy_row
 from kernels.attention_ops import KVRunTable, pow2_shift
 from kernels.reductions import dispatch_allreduce_inplace
 from kernels.embedding import dispatch_embed_lookup
@@ -49,9 +49,16 @@ from modeling.gemma4_common import (
 from modeling.modeling_common import (
     pack_slot_starts, collect_emit_plan, stage_sampling_inputs,
 )
-from modeling.steer import (
+from inspectable_toolkit.steer import (
     SteerState, Steerable, InjectOp, dispatch_steer_point, dispatch_steer_add,
 )
+from inspectable_toolkit.measure import (
+    MeasureState, accumulate_residual_mean,
+    MEASURE_RESIDUAL, MEASURE_BASELINE, MEASURE_MODIFIED,
+)
+from inspectable_toolkit.flash_kl import dispatch_flash_kl
+from inspectable_toolkit.abliterate import AbliterableModel
+from kernels.copy_kernels import dispatch_copy
 from modeling.slot import (
     Slot, BindContext,
 )
@@ -116,12 +123,12 @@ comptime R = PassthroughRecipes
 comptime SH = Gemma4Shapes[R.FFN_BLOCK]
 comptime Layout[
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
-    steer_vectors: Int,
+    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool,
 ] = Gemma4Layout[
     PassthroughRecipes,
     SlidingKVSlots[max_resident_seqs],
     FullKVSlots[batching_seq_len],
-    max_seq_len, steer_vectors,
+    max_seq_len, steer_vectors, measure_rows, abliterate_training,
 ]
 
 
@@ -263,6 +270,18 @@ struct Gemma4HeadScratch(ScratchIsland, Copyable, ImplicitlyCopyable):
         SampleOutcome[MAXIMUM_SAMPLING_LOGITS],
         CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.FIXED,
     ]
+    var kl_accums: ScratchBuffer[
+        Float32,
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.PER_WORKER,
+    ]
+    var kl_partials: ScratchBuffer[
+        Float32,
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.FIXED,
+    ]
+    var mod_logz: ScratchBuffer[
+        Float32,
+        CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM, ScaleClass.FIXED,
+    ]
 
 
 @fieldwise_init
@@ -279,11 +298,14 @@ def calculate_peak_scratch(degree: Int, max_workers: Int) -> Int:
 
 def dispatch_sliding_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
-    steer_vectors: Int, //,
+    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
-    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors],
+    layout: Layout[
+        max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors,
+        measure_rows, abliterate_training,
+    ],
     ctx: BindContext[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     seq_len: Int,
@@ -374,11 +396,14 @@ def dispatch_sliding_attention_qkv[
 
 def dispatch_full_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
-    steer_vectors: Int, //,
+    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
-    layout: Layout[max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors],
+    layout: Layout[
+        max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors,
+        measure_rows, abliterate_training,
+    ],
     ctx: BindContext[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     seq_len: Int,
@@ -627,16 +652,19 @@ struct Gemma4[
     max_resident_seqs: Int = 4,
     Pool: BurstThreadPool = BurstPool[],
     steer_vectors: Int = 0,
+    measure_rows: Int = 0,
+    abliterate_training: Bool = False,
     profile: Bool = False, profile_slots: Int = 64,
-](Movable, ScheduledModel, Steerable):
+](Movable, ScheduledModel, Steerable, AbliterableModel):
     comptime POSITIONS_PER_PAGE = PAGE_LEN
     comptime STEER_VECTORS = Self.steer_vectors
+    comptime MEASURE_ROWS = Self.measure_rows
 
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
     var layout: Layout[
         Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-        Self.steer_vectors,
+        Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
     ]
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
@@ -650,6 +678,7 @@ struct Gemma4[
     var full_runs: KVRunTable
     var profiler: Profiler[Self.profile, Self.profile_slots]
     var steer: SteerState
+    var measure: MeasureState
     var tokens_processed: Int
 
     def __init__(out self,
@@ -657,7 +686,7 @@ struct Gemma4[
         var pools: List[Self.Pool],
         layout: Layout[
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-            Self.steer_vectors,
+            Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
         ],
         degree: Int,
         max_workers: Int,
@@ -682,6 +711,7 @@ struct Gemma4[
         self.full_runs = KVRunTable()
         self.profiler = Profiler[Self.profile, Self.profile_slots]()
         self.steer = SteerState(CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM)
+        self.measure = MeasureState()
         self.tokens_processed = 0
 
     def model_init(mut self):
@@ -702,6 +732,77 @@ struct Gemma4[
 
     def disarm_steer(mut self):
         self.steer.disarm()
+
+    def measure_residual(mut self, is_bad: Bool):
+        self.measure.arm_residual(is_bad)
+
+    def measure_baseline(mut self):
+        self.measure.arm_baseline()
+
+    def measure_modified(mut self):
+        self.measure.arm_modified()
+
+    def disarm_measure(mut self):
+        self.measure.disarm()
+
+    def reset_measure_directions(mut self):
+        self.measure.reset_directions()
+
+    def reset_measure_kl(mut self):
+        self.measure.reset_kl()
+
+    def refusal_directions(self) -> List[BFloat16]:
+        return self.measure.finalize_directions()
+
+    def measured_kl(self) -> Float64:
+        return self.measure.kl_value()
+
+    def restore_abliterated_layers(mut self):
+        comptime if Self.abliterate_training:
+            ref layout = self.layout
+            var degree = self.degree
+            var ctx = BindContext(RankView(Span(self.arena_bases)), 0)
+            var n_down = SH.Down.data_n(degree) * SH.Down.data_m(degree)
+            var n_exp = SH.ExpertsDown.data_n(degree) * SH.ExpertsDown.data_m(
+                degree)
+            var n_o_sliding = SH.SlidingO.data_n(degree) * SH.SlidingO.data_m(
+                degree)
+            var n_o_full = SH.FullO.data_n(degree) * SH.FullO.data_m(degree)
+            for i in range(C.NUM_LAYERS):
+                var entry = LAYER_SCHEDULE[i]
+                if entry.kind == LayerKind.FULL:
+                    var lctx = ctx.with_layer(layout.full.base(entry.local_idx))
+                    var pctx = ctx.with_layer(
+                        layout.pristine_full.base(entry.local_idx))
+                    var attn = layout.full.proto.attn
+                    var body = layout.full.proto.body
+                    var pr = layout.pristine_full.proto
+                    dispatch_copy(pr.o_proj.binding(pctx),
+                        attn.o_proj.binding(lctx), n_o_full,
+                        self.pools, self.profiler)
+                    dispatch_copy(pr.down_proj.binding(pctx),
+                        body.down_proj.binding(lctx), n_down,
+                        self.pools, self.profiler)
+                    dispatch_copy(pr.experts_down.binding(pctx),
+                        body.experts_down.binding(lctx), n_exp,
+                        self.pools, self.profiler)
+                else:
+                    var lctx = ctx.with_layer(
+                        layout.sliding.base(entry.local_idx))
+                    var pctx = ctx.with_layer(
+                        layout.pristine_sliding.base(entry.local_idx))
+                    var attn = layout.sliding.proto.attn
+                    var body = layout.sliding.proto.body
+                    var pr = layout.pristine_sliding.proto
+                    dispatch_copy(pr.o_proj.binding(pctx),
+                        attn.o_proj.binding(lctx), n_o_sliding,
+                        self.pools, self.profiler)
+                    dispatch_copy(pr.down_proj.binding(pctx),
+                        body.down_proj.binding(lctx), n_down,
+                        self.pools, self.profiler)
+                    dispatch_copy(pr.experts_down.binding(pctx),
+                        body.experts_down.binding(lctx), n_exp,
+                        self.pools, self.profiler)
 
     def batch_geometry(self) -> BatchGeometry:
         return BatchGeometry(
@@ -775,8 +876,10 @@ struct Gemma4[
         ](ctx, self.head_plan)
 
         var buf_starts = pack_slot_starts(schedule)
-        if self.steer.armed:
+        if self.steer.armed or self.measure.armed():
             self.steer.record_step(schedule, buf_starts, num_slots)
+        var emit_plan = collect_emit_plan(schedule, buf_starts)
+        var num_emit = emit_plan.count()
         self.run_prefix_copies(schedule)
         self.bind_step_runs(schedule, pages)
         var full_runs = UnsafePointer(to=self.full_runs).as_unsafe_any_origin()
@@ -789,6 +892,15 @@ struct Gemma4[
           x_main_ranks, shard_rows, total, self.pools, self.profiler)
         dispatch_allreduce_inplace[BF16](
             x_main_ranks, total * C.HIDDEN, self.pools, self.profiler)
+
+        if self.measure.mode == MEASURE_RESIDUAL:
+            accumulate_residual_mean[hidden=C.HIDDEN](
+                x_main_ranks, emit_plan.rows, num_emit,
+                0, self.measure.acc_ptr(), self.measure.scratch_ptr())
+            if self.measure.current_is_bad:
+                self.measure.bad_count += num_emit
+            else:
+                self.measure.good_count += num_emit
 
         for i in range(C.NUM_LAYERS):
             if schedule.fully_cancelled():
@@ -876,9 +988,13 @@ struct Gemma4[
                         self.steer.verify_rank)
                     self.steer.mismatch_count += mism
 
+            if self.measure.mode == MEASURE_RESIDUAL:
+                accumulate_residual_mean[hidden=C.HIDDEN](
+                    x_main_ranks, emit_plan.rows,
+                    num_emit, i + 1, self.measure.acc_ptr(),
+                    self.measure.scratch_ptr())
+
         var outcomes = List[SampleOutcome[MAXIMUM_SAMPLING_LOGITS]]()
-        var emit_plan = collect_emit_plan(schedule, buf_starts)
-        var num_emit = emit_plan.count()
 
         if num_emit > 0:
             debug_assert(
@@ -902,6 +1018,50 @@ struct Gemma4[
             ](x_head, layout.tail.proto.embed.binding(tail_ctx),
               accums, sample_params, out_ptr, num_emit, vocab_per_rank,
               self.pools, self.profiler)
+
+            if self.measure.mode == MEASURE_BASELINE:
+                var bh = layout.measure.base_head.state_binding(ctx)
+                var bl = layout.measure.base_logz.state_binding(ctx)
+                var ofs = self.measure.base_row_offset
+                for r in range(degree):
+                    for j in range(num_emit):
+                        copy_row[C.HIDDEN](
+                            x_head[r] + j * C.HIDDEN,
+                            bh[r] + (ofs + j) * C.HIDDEN)
+                    var dl = bl[r] + ofs
+                    for j in range(num_emit):
+                        (dl + j)[] = (out_ptr + j)[].logz
+                self.measure.base_row_offset += num_emit
+            elif self.measure.mode == MEASURE_MODIFIED:
+                var bh = layout.measure.base_head.state_binding(ctx)
+                var bl = layout.measure.base_logz.state_binding(ctx)
+                var ofs = self.measure.base_row_offset
+                var kl_accums = self.scratch.binding[
+                    Gemma4HeadScratch, "kl_accums",
+                ](ctx, self.head_plan)
+                var kl_partials = self.scratch.binding[
+                    Gemma4HeadScratch, "kl_partials",
+                ](ctx, self.head_plan)
+                var mod_logz = self.scratch.binding[
+                    Gemma4HeadScratch, "mod_logz",
+                ](ctx, self.head_plan)
+                for r in range(degree):
+                    var ml = mod_logz[r]
+                    for j in range(num_emit):
+                        (ml + j)[] = (out_ptr + j)[].logz
+                dispatch_flash_kl[
+                    cols=C.HIDDEN, cap=C.LOGIT_SOFTCAP,
+                ](x_head, bh.shifted(ofs * C.HIDDEN),
+                  layout.tail.proto.embed.binding(tail_ctx),
+                  bl.shifted(ofs), mod_logz, kl_accums, kl_partials,
+                  num_emit, vocab_per_rank, self.pools, self.profiler)
+                var p0 = kl_partials[0]
+                var ksum = Float64(0)
+                for j in range(num_emit):
+                    ksum += Float64((p0 + j)[])
+                self.measure.kl_sum += ksum
+                self.measure.kl_rows += num_emit
+                self.measure.base_row_offset += num_emit
 
             for j in range(num_emit):
                 outcomes.append((out_ptr + j)[])
@@ -928,7 +1088,7 @@ struct Gemma4[
             SlidingKVSlots[Self.max_resident_seqs],
             FullKVSlots[Self.batching_seq_len],
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-            Self.steer_vectors,
+            Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
         ](dir_path, topo, degree, max_workers,
           calculate_peak_scratch(degree, max_workers), arenas)
         if not layout_opt:

@@ -9,7 +9,7 @@ from modeling_config import (
     Model, TOKENIZER_PATH, MODEL_DIR, stop_tokens, format_prompt,
 )
 from modeling.gemma4_common import Gemma4BaseConfig
-from modeling.slider_pack import load_pack
+from inspectable_toolkit.slider_pack import load_pack
 from kernels.flash_sample import SamplingParams
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
 from continuous_batching.scheduler import ContinuousBatchScheduler

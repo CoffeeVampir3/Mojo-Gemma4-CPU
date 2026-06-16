@@ -11,7 +11,7 @@ from modeling_config import (
     BOS_TOKEN_ID, TURN_START_TOKEN_ID, TURN_END_TOKEN_ID,
 )
 from modeling.gemma4_common import Gemma4BaseConfig
-from modeling.probe import (
+from inspectable_toolkit.probe import (
     ContrastSet, ProbeResult, build_probe, mean_row_norm,
 )
 from kernels.helpers import BF16Ptr, F32Ptr, W
