@@ -6,13 +6,15 @@ from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
 
 from modeling.gemma_4_moe_bq import Gemma4
-
-
-comptime SOURCE = "checkpoints/gemma-4-26B-A4B"
-comptime OUTPUT = "checkpoints/gemma-4-26B-A4B-bq/model.safetensors"
+from modeling_config import MODEL_DIR
 
 
 def main():
+    var source = String(MODEL_DIR)
+    var output = source + "-bq/model.safetensors"
+    print(t"source: {source}")
+    print(t"output: {output}")
+
     var topo = NumaTopology()
     var nodes = topo.num_nodes()
     var iso = len(topo.isolated_cpus)
@@ -24,7 +26,7 @@ def main():
     ](var pools: List[P]):
         var t0 = perf_counter_ns()
         var ok = Gemma4[Pool=P].quantize(
-            Path(SOURCE), Path(OUTPUT), topo, pools^)
+            Path(source), Path(output), topo, pools^)
         var elapsed_s = (perf_counter_ns() - t0) / 1_000_000_000
         if ok:
             print(t"quantize ok in {elapsed_s} s")

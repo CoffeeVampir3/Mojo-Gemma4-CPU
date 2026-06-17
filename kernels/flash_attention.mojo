@@ -12,6 +12,7 @@ struct FlashAttentionKernel[
     KV: KVSlot,
     head_dim: Int, max_q: Int, gqa_ratio: Int,
 ](WorkerRangePartitionedKernel):
+    var kv: Self.KV
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
@@ -44,8 +45,8 @@ struct FlashAttentionKernel[
         while pos < self.end:
             var tile_len = min(TILE, self.end - pos)
             process_kv_tile[
-                Self.KV, Self.head_dim, Self.gqa_ratio,
-            ](q_ptrs, self.k_base, self.v_base,
+                Self.head_dim, Self.gqa_ratio,
+            ](self.kv, q_ptrs, self.k_base, self.v_base,
               self.start_pos, pos, tile_len, m, l, acc_ptrs,
               self.num_q, self.kv_stride)
             pos += TILE

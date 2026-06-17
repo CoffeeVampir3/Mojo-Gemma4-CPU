@@ -154,3 +154,14 @@ def gelu_tanh_f32[width: Int](
     var t = tanh_f32(inner)
     return SIMD[DType.float32, width](0.5) * x * (
         SIMD[DType.float32, width](1.0) + t)
+
+
+@always_inline
+def softcap_value[
+    cap: Float64,
+](
+    x: SIMD[DType.float32, 1],
+) -> SIMD[DType.float32, 1]:
+    comptime assert cap > 0.0, "softcap cap must be positive"
+    comptime c = SIMD[DType.float32, 1](cap)
+    return tanh_f32[1](x / c) * c

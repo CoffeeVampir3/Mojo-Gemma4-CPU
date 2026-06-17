@@ -32,6 +32,9 @@ trait SlotLike:
     @always_inline
     def set_offset(mut self, off: Int): ...
 
+    @always_inline
+    def get_offset(self) -> Int: ...
+
 
 trait SlotGroup(FieldwiseDefault):
     pass
@@ -39,22 +42,27 @@ trait SlotGroup(FieldwiseDefault):
 
 @fieldwise_init
 struct BindContext[o: ImmutOrigin](Copyable, ImplicitlyCopyable):
-    """Per-call binding context. `layer_base` is the current layer's absolute
-    arena offset for weight-slot resolution; state slots anchor at the rank-0
-    arena base via `state_binding`. The `RankView` carries the runtime
-    tensor-parallel degree (`len` of the borrowed bases)."""
+    """Per-call binding context. `layer_off` is the current layer's
+    arena-relative offset for weight-slot resolution; promotion to an
+    absolute address happens only here, anchored at the rank-0 arena base.
+    The `RankView` carries the runtime tensor-parallel degree (`len` of the
+    borrowed bases)."""
     var view: RankView[Self.o]
-    var layer_base: Int
+    var layer_off: Int
 
     @always_inline
     def degree(self) -> Int:
         return self.view.degree()
 
     @always_inline
-    def with_layer(self, lb: Int) -> Self:
+    def with_layer(self, layer_off: Int) -> Self:
         var c = self
-        c.layer_base = lb
+        c.layer_off = layer_off
         return c
+
+    @always_inline
+    def layer_address(self) -> Int:
+        return self.view.bases[0] + self.layer_off
 
     @always_inline
     def bind[T: AnyType](
@@ -88,6 +96,10 @@ struct Slot[
         self.offset = off
 
     @always_inline
+    def get_offset(self) -> Int:
+        return self.offset
+
+    @always_inline
     def at(self, base: Int) -> UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin]:
         return UnsafePointer[Scalar[Self.ENCODING.DTYPE], MutAnyOrigin](
             unsafe_from_address=base + self.offset)
@@ -102,7 +114,7 @@ struct Slot[
     def binding[o: ImmutOrigin](
         self, ctx: BindContext[o],
     ) -> Binding[Scalar[Self.ENCODING.DTYPE], o]:
-        return self.binding(ctx.layer_base, ctx.view)
+        return self.binding(ctx.layer_address(), ctx.view)
 
     @always_inline
     def state_binding[o: ImmutOrigin](
@@ -123,7 +135,7 @@ struct Slot[
             Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.SCALE](degree)
         var cs_off = member_rel_off[
             Self.ENCODING, Self.SHAPE, Self.QUANT, QuantRole.COLSUM](degree)
-        var base = ctx.layer_base + self.offset
+        var base = ctx.layer_address() + self.offset
         var data = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=base)
         var scale = UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=base + scale_off)
@@ -143,7 +155,7 @@ struct Slot[
             Self.QUANT.isa[RouterCenter]() or Self.QUANT.isa[SoftmaxRouterCenter]()
         ), "Slot.bq_router requires a router-centered slot."
         var degree = ctx.degree()
-        var base = ctx.layer_base + self.offset
+        var base = ctx.layer_address() + self.offset
         var centered = ctx.bind(UnsafePointer[BFloat16, MutAnyOrigin](
             unsafe_from_address=base))
         var gauge = Optional[Binding[BFloat16, o]](None)

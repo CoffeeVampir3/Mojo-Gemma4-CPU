@@ -104,10 +104,6 @@ rsync -av \
     --exclude='test_rings_bin' \
     --exclude='fence_experiment_bin' \
     --exclude='tp_param_bin' \
-    --include='checkpoints/SmolLM2/model.safetensors' \
-    --include='checkpoints/gemma-4-26B-A4B/*' \
-    --include='checkpoints/gemma-4-26B-A4B-bq/model.safetensors' \
-    --exclude='checkpoints/**/*.safetensors' \
     . \
     $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/
 
@@ -119,4 +115,4 @@ if test (count $argv) -gt 1
     set PERF_DELAY $argv[2]
 end
 
-ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && env MOJO_ENABLE_RUNTIME=0 pixi run mojo build -I . -D ASSERT=all $TARGET && echo '=== PERF STAT ===' && perf stat -D $PERF_DELAY -e $PERF_EVENTS_CSV ./$BINARY"
+ssh -t $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && env MOJO_ENABLE_RUNTIME=0 pixi run mojo build -I . -D ASSERT=all $TARGET && echo '=== PERF STAT ===' && perf stat -D $PERF_DELAY -e $PERF_EVENTS_CSV ./$BINARY"

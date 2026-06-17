@@ -5,6 +5,7 @@ comptime KernelFlags = UInt64
 comptime KernelFlags32 = UInt32
 
 comptime EINTR: Int = -4
+comptime EAGAIN: Int = -11
 
 struct CloneFlags(TrivialRegisterPassable):
     comptime VM = 0x00000100
@@ -370,8 +371,59 @@ struct IoUringFeat(TrivialRegisterPassable):
 
 comptime FUTEX_BITSET_MATCH_ANY: Int = 0xFFFFFFFF
 
+struct TermIoctl(TrivialRegisterPassable):
+    comptime TCGETS = 0x5401
+    comptime TCSETS = 0x5402
+    comptime TIOCGWINSZ = 0x5413
+
+struct TermInputFlag(TrivialRegisterPassable):
+    comptime ICRNL = 0o400
+    comptime IXON = 0o2000
+
+struct TermLocalFlag(TrivialRegisterPassable):
+    comptime ISIG = 0o1
+    comptime ICANON = 0o2
+    comptime ECHO = 0o10
+    comptime IEXTEN = 0o100000
+
+struct TermControlChar(TrivialRegisterPassable):
+    comptime VTIME = 5
+    comptime VMIN = 6
+
+comptime TERMIOS_NCCS = 19
+
+struct Termios(Copyable, Movable):
+    var c_iflag: UInt32
+    var c_oflag: UInt32
+    var c_cflag: UInt32
+    var c_lflag: UInt32
+    var c_line: UInt8
+    var c_cc: InlineArray[UInt8, TERMIOS_NCCS]
+
+    def __init__(out self):
+        self.c_iflag = 0
+        self.c_oflag = 0
+        self.c_cflag = 0
+        self.c_lflag = 0
+        self.c_line = 0
+        self.c_cc = InlineArray[UInt8, TERMIOS_NCCS](fill=UInt8(0))
+
+struct Winsize(Copyable, Movable):
+    var ws_row: UInt16
+    var ws_col: UInt16
+    var ws_xpixel: UInt16
+    var ws_ypixel: UInt16
+
+    def __init__(out self):
+        self.ws_row = 0
+        self.ws_col = 0
+        self.ws_xpixel = 0
+        self.ws_ypixel = 0
+
 trait ArchLinux:
+    comptime NR_read: Int
     comptime NR_write: Int
+    comptime NR_ioctl: Int
     comptime NR_mmap: Int
     comptime NR_mprotect: Int
     comptime NR_munmap: Int
@@ -405,16 +457,16 @@ trait ArchLinux:
     def arch_thread_pointer(self) -> Int: ...
     def arch_tls_load_i64[offset: Int](self) -> Int: ...
 
-    def sys_clone3_with_entry(
+    def sys_clone3_with_entry[origin: MutOrigin](
         self,
-        clone_args_ptr: UnsafePointer[Clone3Args, MutAnyOrigin],
+        clone_args_ptr: UnsafePointer[Clone3Args, origin],
         clone_args_size: Int,
     ) -> Int: ...
 
-    def sys_rt_sigaction(
+    def sys_rt_sigaction[act_origin: MutOrigin](
         self,
         signum: Int,
-        act: UnsafePointer[RtSigAction, MutAnyOrigin],
+        act: UnsafePointer[RtSigAction, act_origin],
         old: Optional[UnsafePointer[RtSigAction, MutAnyOrigin]] = None,
     ) -> Int: ...
 
@@ -467,9 +519,24 @@ trait LinuxSys(ArchLinux):
     def sys_close(self, fd: Int) -> Int:
         return self.syscall(Self.NR_close, fd)
 
-    def sys_sigaltstack(
+    def sys_read(self, fd: Int, buf: Int, count: Int) -> Int:
+        return self.syscall(Self.NR_read, fd, buf, count)
+
+    def sys_ioctl(self, fd: Int, request: Int, arg: Int) -> Int:
+        return self.syscall(Self.NR_ioctl, fd, request, arg)
+
+    def sys_tcgetattr[origin: MutOrigin](self, fd: Int, t: UnsafePointer[Termios, origin]) -> Int:
+        return self.sys_ioctl(fd, TermIoctl.TCGETS, Int(t))
+
+    def sys_tcsetattr[origin: MutOrigin](self, fd: Int, t: UnsafePointer[Termios, origin]) -> Int:
+        return self.sys_ioctl(fd, TermIoctl.TCSETS, Int(t))
+
+    def sys_get_winsize[origin: MutOrigin](self, fd: Int, w: UnsafePointer[Winsize, origin]) -> Int:
+        return self.sys_ioctl(fd, TermIoctl.TIOCGWINSZ, Int(w))
+
+    def sys_sigaltstack[ss_origin: MutOrigin](
         self,
-        ss: UnsafePointer[StackT, MutAnyOrigin],
+        ss: UnsafePointer[StackT, ss_origin],
         old: Optional[UnsafePointer[StackT, MutAnyOrigin]] = None,
     ) -> Int:
         return self.syscall(Self.NR_sigaltstack, Int(ss),

@@ -8,8 +8,8 @@ from .helpers import (
     fanout_dispatch, Binding,
 )
 from .attention_ops import (
-    LinearKV, RingKV, TILE, full_local_kv_count, process_kv_tile,
-    zero_accumulators,
+    KVRunTable, PagedKV, TILE, full_local_kv_count, pow2_shift,
+    process_kv_tile, zero_accumulators,
 )
 from .logsum_merge import MergeSegment, write_finalized_head
 from .profiling import Profiler
@@ -18,12 +18,14 @@ from .profiling import Profiler
 @fieldwise_init
 struct FlashPrefillSlidingKernel[
     head_dim: Int, max_q: Int, gqa_ratio: Int,
-    window: Int, cache_size: Int,
+    window: Int, cache_size: Int, page_len: Int,
 ](WorkerRangePartitionedKernel):
-    """`cache_size` must be a power of two (slot index uses `& (cache_size - 1)`).
-    The per-rank head count `num_q` and `kv_stride` are runtime; per-head storage
-    sizes to the comptime `max_q` cap (= model NUM_HEADS)."""
+    """`page_len` and `cache_size / page_len` must be powers of two (slot
+    resolution is shift/mask through the run's page ring). The per-rank head
+    count `num_q` and `kv_stride` are runtime; per-head storage sizes to the
+    comptime `max_q` cap (= model NUM_HEADS)."""
 
+    var runs: UnsafePointer[KVRunTable, MutAnyOrigin]
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
@@ -32,13 +34,15 @@ struct FlashPrefillSlidingKernel[
     var num_q: Int
     var partial_stride: Int
     var kv_stride: Int
-    var base_pos: Int
     var worker_id: Int
     var start: Int
     var end: Int
 
     def execute(mut self):
         var q_stride = self.num_q * Self.head_dim
+        comptime page_shift = pow2_shift(Self.page_len)
+        comptime row_mask = Self.page_len - 1
+        comptime page_mask = Self.cache_size // Self.page_len - 1
 
         var scratch = self.partials + self.worker_id * self.partial_stride
         var acc_ptrs = InlineArray[F32Ptr, Self.max_q](uninitialized=True)
@@ -46,8 +50,23 @@ struct FlashPrefillSlidingKernel[
         for h in range(self.num_q):
             acc_ptrs[h] = scratch + h * Self.head_dim
 
+        ref run_list = self.runs[].runs
+        var num_runs = len(run_list)
+        var r = 0
+        var kv = PagedKV(
+            self.runs[].row_ptr(0), page_shift, row_mask, page_mask)
+        var run_start = Int(run_list[0].buf_start)
+        var run_pos = Int(run_list[0].base_pos)
+
         for t in range(self.start, self.end):
-            var abs_pos = self.base_pos + t
+            while r + 1 < num_runs and t >= Int(run_list[r + 1].buf_start):
+                r += 1
+                kv = PagedKV(
+                    self.runs[].row_ptr(r),
+                    page_shift, row_mask, page_mask)
+                run_start = Int(run_list[r].buf_start)
+                run_pos = Int(run_list[r].base_pos)
+            var abs_pos = run_pos + (t - run_start)
             var lo = max(0, abs_pos - Self.window + 1)
             var hi = abs_pos + 1
 
@@ -65,9 +84,8 @@ struct FlashPrefillSlidingKernel[
             while pos < hi:
                 var tile_len = min(TILE, hi - pos)
                 process_kv_tile[
-                    RingKV[Self.cache_size],
                     Self.head_dim, Self.gqa_ratio,
-                ](q_ptrs, self.k_base, self.v_base,
+                ](kv, q_ptrs, self.k_base, self.v_base,
                   0, pos, tile_len, m, l, acc_ptrs,
                   self.num_q, self.kv_stride)
                 pos += TILE
@@ -99,18 +117,20 @@ struct FlashPrefillFullKernel[
     head_dim: Int, num_q: Int, gqa_ratio: Int,
     partial_stride: Int,
 ](RangePartitionedKernel):
-    """Full-attention prefill. Q heads are replicated (num_q comptime); only the
-    context-shard `degree` and `kv_stride` are runtime. Writes (acc, m, l)
-    partials for the cross-rank logsum merge."""
+    """Full-attention prefill. Q heads are replicated (num_q comptime); the
+    context-shard `degree`, `kv_stride`, and page geometry are runtime. Writes
+    (acc, m, l) partials for the cross-rank logsum merge."""
 
+    var runs: UnsafePointer[KVRunTable, MutAnyOrigin]
     var q: BF16Ptr
     var k_base: BF16Ptr
     var v_base: BF16Ptr
     var partials: F32Ptr
     var kv_stride: Int
     var degree: Int
-    var base_pos: Int
     var rank: Int
+    var page_shift: Int
+    var row_mask: Int
     var start: Int
     var end: Int
 
@@ -122,8 +142,24 @@ struct FlashPrefillFullKernel[
         var acc_ptrs = InlineArray[F32Ptr, Self.num_q](uninitialized=True)
         var q_ptrs = InlineArray[BF16Ptr, Self.num_q](uninitialized=True)
 
+        ref run_list = self.runs[].runs
+        var num_runs = len(run_list)
+        var r = 0
+        var kv = PagedKV(
+            self.runs[].row_ptr(0),
+            self.page_shift, self.row_mask, -1)
+        var run_start = Int(run_list[0].buf_start)
+        var run_pos = Int(run_list[0].base_pos)
+
         for t in range(self.start, self.end):
-            var abs_pos = self.base_pos + t
+            while r + 1 < num_runs and t >= Int(run_list[r + 1].buf_start):
+                r += 1
+                kv = PagedKV(
+                    self.runs[].row_ptr(r),
+                    self.page_shift, self.row_mask, -1)
+                run_start = Int(run_list[r].buf_start)
+                run_pos = Int(run_list[r].base_pos)
+            var abs_pos = run_pos + (t - run_start)
             var local_kv_count = full_local_kv_count(
                 self.rank, abs_pos, self.degree)
 
@@ -143,9 +179,8 @@ struct FlashPrefillFullKernel[
             while pos < local_kv_count:
                 var tile_len = min(TILE, local_kv_count - pos)
                 process_kv_tile[
-                    LinearKV,
                     Self.head_dim, Self.gqa_ratio,
-                ](q_ptrs, self.k_base, self.v_base,
+                ](kv, q_ptrs, self.k_base, self.v_base,
                   0, pos, tile_len, m, l, acc_ptrs, Self.num_q, self.kv_stride)
                 pos += TILE
 

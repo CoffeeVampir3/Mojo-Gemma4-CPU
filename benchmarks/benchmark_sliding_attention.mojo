@@ -5,7 +5,7 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from kernels.attention_ops import flash_partial_stride
+from kernels.attention_ops import KVRun, KVRunTable, flash_partial_stride
 from kernels.attention_dispatch_kernels import dispatch_sliding_attention
 from kernels.helpers import Binding, RankView
 from kernels.profiling import Profiler
@@ -78,6 +78,7 @@ def fill_pattern_all[o: ImmutOrigin](
 
 def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -98,14 +99,15 @@ def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
         if vl > WINDOW:
             continue
         var pos = vl - 1
+        runs[].runs[0].base_pos = Int32(pos)
 
         for _ in range(WARMUP):
             dispatch_sliding_attention[
                 head_dim=HEAD_DIM, max_q=NUM_Q,
                 gqa_ratio=GQA_RATIO,
-                window=WINDOW, cache_size=WINDOW,
-            ](q, k_cache, v_cache, output, partials,
-              NUM_Q, PSTRIDE, KV_STRIDE, pos, 1, pools, prof)
+                window=WINDOW, cache_size=WINDOW, page_len=WINDOW,
+            ](q, k_cache, v_cache, output, partials, runs,
+              NUM_Q, PSTRIDE, KV_STRIDE, 1, pools, prof)
             keep(output[0][0])
 
         samples.clear()
@@ -114,9 +116,9 @@ def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
             dispatch_sliding_attention[
                 head_dim=HEAD_DIM, max_q=NUM_Q,
                 gqa_ratio=GQA_RATIO,
-                window=WINDOW, cache_size=WINDOW,
-            ](q, k_cache, v_cache, output, partials,
-              NUM_Q, PSTRIDE, KV_STRIDE, pos, 1, pools, prof)
+                window=WINDOW, cache_size=WINDOW, page_len=WINDOW,
+            ](q, k_cache, v_cache, output, partials, runs,
+              NUM_Q, PSTRIDE, KV_STRIDE, 1, pools, prof)
             var t1 = now_ns()
             var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
@@ -130,6 +132,7 @@ def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
 
 def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -140,13 +143,14 @@ def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     comptime VL = 64
     var pos = VL - 1
     var prof = Profiler[False]()
+    runs[].runs[0].base_pos = Int32(pos)
 
     dispatch_sliding_attention[
         head_dim=HEAD_DIM, max_q=NUM_Q,
         gqa_ratio=GQA_RATIO,
-        window=WINDOW, cache_size=WINDOW,
-    ](q, k_cache, v_cache, output, partials,
-      NUM_Q, PSTRIDE, KV_STRIDE, pos, 1, pools, prof)
+        window=WINDOW, cache_size=WINDOW, page_len=WINDOW,
+    ](q, k_cache, v_cache, output, partials, runs,
+      NUM_Q, PSTRIDE, KV_STRIDE, 1, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()
@@ -198,8 +202,14 @@ def run_all[P: BurstThreadPool, //](
         t"gqa={GQA_RATIO} window={WINDOW}"
     )
 
-    section_validation(pools, q, k_cache, v_cache, output, partials)
-    section_context_sweep(pools, q, k_cache, v_cache, output, partials)
+    var runs_table = KVRunTable()
+    var run = KVRun(0, 0)
+    run.base_rows.append(Int32(0))
+    runs_table.runs.append(run^)
+    var runs = UnsafePointer(to=runs_table)
+
+    section_validation(pools, runs, q, k_cache, v_cache, output, partials)
+    section_context_sweep(pools, runs, q, k_cache, v_cache, output, partials)
 
 
 def main():

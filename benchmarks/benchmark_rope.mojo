@@ -5,6 +5,7 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
+from kernels.attention_ops import KVRun, KVRunTable, pow2_shift
 from kernels.helpers import Binding, RankView
 from kernels.rope import (
     rope_head, dispatch_rope_cache_write,
@@ -186,15 +187,22 @@ def section_sliding_cache_write[
     var num_q = q_rows // HEAD_DIM_SLIDING
     var num_kv = kv_rows // HEAD_DIM_SLIDING
     comptime POS = 513
+    comptime page_shift = pow2_shift(SLIDING_WINDOW)
+    comptime row_mask = SLIDING_WINDOW - 1
     var prof = Profiler[False]()
+
+    var runs_table = KVRunTable()
+    var run = KVRun(0, POS)
+    run.base_rows.append(Int32(0))
+    runs_table.runs.append(run^)
+    var runs = UnsafePointer(to=runs_table)
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
             half=HALF_SLIDING, pair_stride=HEAD_DIM_SLIDING // 2,
             head_dim=HEAD_DIM_SLIDING,
-            slot_mask=SLIDING_WINDOW - 1,
-        ](qs, ks, vs, kc, vc, cos, sin,
-          num_q, num_kv, 1, POS, 1, pools, prof)
+        ](qs, ks, vs, kc, vc, cos, sin, runs,
+          num_q, num_kv, 1, page_shift, row_mask, 0, 1, pools, prof)
 
     var samples = SampleBuffer(SAMPLES)
     samples.clear()
@@ -203,9 +211,8 @@ def section_sliding_cache_write[
         dispatch_rope_cache_write[
             half=HALF_SLIDING, pair_stride=HEAD_DIM_SLIDING // 2,
             head_dim=HEAD_DIM_SLIDING,
-            slot_mask=SLIDING_WINDOW - 1,
-        ](qs, ks, vs, kc, vc, cos, sin,
-          num_q, num_kv, 1, POS, 1, pools, prof)
+        ](qs, ks, vs, kc, vc, cos, sin, runs,
+          num_q, num_kv, 1, page_shift, row_mask, 0, 1, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts(pools)
         samples.push(t_done - t0, t1 - t0)
@@ -233,14 +240,22 @@ def section_full_cache_write[
     comptime NUM_Q = Q_DIM_FULL // HEAD_DIM_FULL
     comptime NUM_KV = KV_DIM_FULL // HEAD_DIM_FULL
     comptime POS = 513
+    comptime page_shift = pow2_shift(MAX_POS)
+    comptime row_mask = MAX_POS - 1
     var prof = Profiler[False]()
+
+    var runs_table = KVRunTable()
+    var run = KVRun(0, POS)
+    run.base_rows.append(Int32(0))
+    runs_table.runs.append(run^)
+    var runs = UnsafePointer(to=runs_table)
 
     for _ in range(WARMUP):
         dispatch_rope_cache_write[
             half=HALF_FULL, pair_stride=HEAD_DIM_FULL // 2,
-            head_dim=HEAD_DIM_FULL, slot_mask=-1,
-        ](qs, ks, vs, kc, vc, cos, sin,
-          NUM_Q, NUM_KV, tp, POS, 1, pools, prof)
+            head_dim=HEAD_DIM_FULL,
+        ](qs, ks, vs, kc, vc, cos, sin, runs,
+          NUM_Q, NUM_KV, tp, page_shift, row_mask, 0, 1, pools, prof)
 
     var samples = SampleBuffer(SAMPLES)
     samples.clear()
@@ -248,9 +263,9 @@ def section_full_cache_write[
         var t0 = now_ns()
         dispatch_rope_cache_write[
             half=HALF_FULL, pair_stride=HEAD_DIM_FULL // 2,
-            head_dim=HEAD_DIM_FULL, slot_mask=-1,
-        ](qs, ks, vs, kc, vc, cos, sin,
-          NUM_Q, NUM_KV, tp, POS, 1, pools, prof)
+            head_dim=HEAD_DIM_FULL,
+        ](qs, ks, vs, kc, vc, cos, sin, runs,
+          NUM_Q, NUM_KV, tp, page_shift, row_mask, 0, 1, pools, prof)
         var t1 = now_ns()
         var t_done = max_last_ts(pools)
         samples.push(t_done - t0, t1 - t0)

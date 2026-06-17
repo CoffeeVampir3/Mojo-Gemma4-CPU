@@ -5,7 +5,7 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from kernels.attention_ops import flash_partial_stride
+from kernels.attention_ops import KVRun, KVRunTable, flash_partial_stride
 from kernels.attention_dispatch_kernels import dispatch_full_attention
 from kernels.helpers import Binding, RankView
 from kernels.logsum_merge import MergeSegment
@@ -26,6 +26,7 @@ comptime NUM_KV = 2
 comptime GLOBAL_GQA = GLOBAL_NUM_Q // NUM_KV
 comptime KV_STRIDE = 1024
 comptime MAX_SEQ = 4096
+comptime PAGE_LEN = 1024
 comptime MAX_WORKERS = 128
 comptime PSTRIDE = flash_partial_stride(GLOBAL_NUM_Q, HEAD_DIM)
 
@@ -77,6 +78,7 @@ def fill_pattern_all[o: ImmutOrigin](
 
 def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -88,13 +90,14 @@ def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     comptime VL = 64
     var local_num_q = GLOBAL_NUM_Q // len(pools)
     var prof = Profiler[False]()
+    runs[].runs[0].base_pos = Int32(VL - 1)
 
     dispatch_full_attention[
         head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
         gqa_ratio=GLOBAL_GQA,
-        kv_stride=KV_STRIDE, partial_stride=PSTRIDE,
-    ](q, k_cache, v_cache, output, partials, merge_segments,
-      local_num_q, VL - 1, 1, pools, prof)
+        kv_stride=KV_STRIDE, partial_stride=PSTRIDE, page_len=PAGE_LEN,
+    ](q, k_cache, v_cache, output, partials, merge_segments, runs,
+      local_num_q, 1, pools, prof)
 
     var out0 = output[0]
     var o0 = out0[0].cast[DType.float32]()
@@ -113,6 +116,7 @@ def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
 
 def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[BFloat16, o],
     k_cache: Binding[BFloat16, o],
     v_cache: Binding[BFloat16, o],
@@ -134,14 +138,15 @@ def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
         var vl = sizes[s]
         if vl > MAX_SEQ:
             continue
+        runs[].runs[0].base_pos = Int32(vl - 1)
 
         for _ in range(WARMUP):
             dispatch_full_attention[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                 gqa_ratio=GLOBAL_GQA,
-                kv_stride=KV_STRIDE, partial_stride=PSTRIDE,
-            ](q, k_cache, v_cache, output, partials, merge_segments,
-              local_num_q, vl - 1, 1, pools, prof)
+                kv_stride=KV_STRIDE, partial_stride=PSTRIDE, page_len=PAGE_LEN,
+            ](q, k_cache, v_cache, output, partials, merge_segments, runs,
+              local_num_q, 1, pools, prof)
             keep(output[0][0])
 
         samples.clear()
@@ -150,9 +155,9 @@ def section_context_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
             dispatch_full_attention[
                 head_dim=HEAD_DIM, num_q=GLOBAL_NUM_Q,
                 gqa_ratio=GLOBAL_GQA,
-                kv_stride=KV_STRIDE, partial_stride=PSTRIDE,
-            ](q, k_cache, v_cache, output, partials, merge_segments,
-              local_num_q, vl - 1, 1, pools, prof)
+                kv_stride=KV_STRIDE, partial_stride=PSTRIDE, page_len=PAGE_LEN,
+            ](q, k_cache, v_cache, output, partials, merge_segments, runs,
+              local_num_q, 1, pools, prof)
             var t1 = now_ns()
             var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
@@ -199,10 +204,18 @@ def run_all[P: BurstThreadPool, //](
         t"gqa={GLOBAL_GQA} max_seq={MAX_SEQ}"
     )
 
+    var runs_table = KVRunTable()
+    var run = KVRun(0, 0)
+    var rows_per_page = PAGE_LEN // tp
+    for ordinal in range(MAX_SEQ // PAGE_LEN):
+        run.base_rows.append(Int32(ordinal * rows_per_page))
+    runs_table.runs.append(run^)
+    var runs = UnsafePointer(to=runs_table)
+
     section_validation(
-        pools, q, k_cache, v_cache, output, partials, merge_segments)
+        pools, runs, q, k_cache, v_cache, output, partials, merge_segments)
     section_context_sweep(
-        pools, q, k_cache, v_cache, output, partials, merge_segments)
+        pools, runs, q, k_cache, v_cache, output, partials, merge_segments)
 
 
 def main():

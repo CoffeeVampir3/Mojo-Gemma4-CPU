@@ -5,6 +5,7 @@ from std.reflection import reflect
 from std.sys.info import size_of
 
 from kernels.helpers import Binding
+from modeling.model_spec import ShapeLike
 from modeling.slot import BindContext
 
 
@@ -30,8 +31,8 @@ struct ScaleClass:
 
 
 @always_inline
-def resolve_scratch_bytes(
-    base_elems: Int, element_size: Int, scale: Int, degree: Int, workers: Int,
+def resolve_scratch_elems(
+    base_elems: Int, scale: Int, degree: Int, workers: Int,
 ) -> Int:
     var n = base_elems
     if scale == ScaleClass.PER_DEGREE:
@@ -40,14 +41,15 @@ def resolve_scratch_bytes(
         n = base_elems * workers
     elif scale == ScaleClass.PER_WORKER_PER_DEGREE:
         n = base_elems * workers * degree
-    return aligned_scratch_bytes(n * element_size)
+    return n
 
 
 trait ScratchBufferLike:
     comptime Element: AnyType
     comptime ELEMENT_SIZE: Int
-    comptime BASE_ELEMS: Int
-    comptime SCALE: Int
+
+    @staticmethod
+    def scratch_elems(degree: Int, workers: Int) -> Int: ...
 
 
 @fieldwise_init
@@ -56,8 +58,30 @@ struct ScratchBuffer[T: AnyType, base_elems: Int, scale: Int = ScaleClass.FIXED]
 ):
     comptime Element = Self.T
     comptime ELEMENT_SIZE = size_of[Self.T]()
-    comptime BASE_ELEMS = Self.base_elems
-    comptime SCALE = Self.scale
+
+    @staticmethod
+    @always_inline
+    def scratch_elems(degree: Int, workers: Int) -> Int:
+        return resolve_scratch_elems(
+            Self.base_elems, Self.scale, degree, workers)
+
+
+@fieldwise_init
+struct ShardedScratchBuffer[
+    T: AnyType, rows: Int, S: ShapeLike, col_block: Int = 1,
+](ScratchBufferLike, Copyable, ImplicitlyCopyable):
+    """Per-rank scratch for row-sharded tensor products: `rows` step rows by
+    the shape's per-rank extent. Sizing flows through `S.data_n(degree)` so the
+    shard padding has a single source of truth shared with the weight pack and
+    the dispatch row counts. `col_block` shrinks the per-rank extent for
+    sidecars that carry one element per quantization block."""
+    comptime Element = Self.T
+    comptime ELEMENT_SIZE = size_of[Self.T]()
+
+    @staticmethod
+    @always_inline
+    def scratch_elems(degree: Int, workers: Int) -> Int:
+        return Self.rows * (Self.S.data_n(degree) // Self.col_block)
 
 
 trait ScratchPhaseOrderLike:
@@ -137,8 +161,8 @@ def derive_scratch_plan[T: ScratchPhaseSchema](
                 cur_first >= 0 and cur_last >= cur_first,
                 "scratch buffer declared without a valid phase",
             )
-            sizes[n] = resolve_scratch_bytes(
-                FT.BASE_ELEMS, FT.ELEMENT_SIZE, FT.SCALE, degree, workers)
+            sizes[n] = aligned_scratch_bytes(
+                FT.scratch_elems(degree, workers) * FT.ELEMENT_SIZE)
             firsts[n] = cur_first
             lasts[n] = cur_last
             fields[n] = i
@@ -203,8 +227,8 @@ def co_live_buffers_overlap[T: ScratchPhaseSchema](
             cur_first = T.phase_index[FT.FIRST_NAME]()
             cur_last = T.phase_index[FT.LAST_NAME]()
         comptime if conforms_to(FT, ScratchBufferLike):
-            sizes[n] = resolve_scratch_bytes(
-                FT.BASE_ELEMS, FT.ELEMENT_SIZE, FT.SCALE, degree, workers)
+            sizes[n] = aligned_scratch_bytes(
+                FT.scratch_elems(degree, workers) * FT.ELEMENT_SIZE)
             firsts[n] = cur_first
             lasts[n] = cur_last
             offs[n] = plan.offsets[i]
@@ -222,6 +246,17 @@ def co_live_buffers_overlap[T: ScratchPhaseSchema](
     return False
 
 
+def derive_checked_plan[T: ScratchPhaseSchema](
+    degree: Int, workers: Int,
+) -> ScratchPlan:
+    var plan = derive_scratch_plan[T](degree, workers)
+    debug_assert(
+        not co_live_buffers_overlap[T](plan, degree, workers),
+        "scratch plan overlaps co-live buffers",
+    )
+    return plan
+
+
 def aggregate_scratch_peak[T: AnyType](degree: Int, workers: Int) -> Int:
     var m = 0
     comptime for i in range(reflect[T].field_count()):
@@ -234,16 +269,15 @@ def aggregate_scratch_peak[T: AnyType](degree: Int, workers: Int) -> Int:
 
 
 struct TemporalScratchPool(Movable, Copyable, ImplicitlyCopyable):
-    var base: UnsafePointer[UInt8, MutAnyOrigin]
+    var scratch_off: Int
 
-    def __init__(out self, base: Int):
-        self.base = UnsafePointer[UInt8, MutAnyOrigin](
-            unsafe_from_address=base)
+    def __init__(out self, scratch_off: Int):
+        self.scratch_off = scratch_off
 
     @always_inline
     def slot[
         I: ScratchIsland, name: StringLiteral,
-    ](self, plan: ScratchPlan) -> UnsafePointer[
+    ](self, arena_base: Int, plan: ScratchPlan) -> UnsafePointer[
         downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
         MutAnyOrigin,
     ]:
@@ -252,7 +286,7 @@ struct TemporalScratchPool(Movable, Copyable, ImplicitlyCopyable):
         return UnsafePointer[
             downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
             MutAnyOrigin,
-        ](unsafe_from_address=Int(self.base) + off)
+        ](unsafe_from_address=arena_base + self.scratch_off + off)
 
     @always_inline
     def binding[
@@ -261,49 +295,4 @@ struct TemporalScratchPool(Movable, Copyable, ImplicitlyCopyable):
         downcast[reflect[I].field_type[name].T, ScratchBufferLike].Element,
         o,
     ]:
-        return ctx.view.bind(self.slot[I, name](plan))
-
-
-struct TemporalLogitsView[
-    vocab: Int, dtype: DType = DType.bfloat16,
-](Movable):
-    """Per-rank-sharded logits view returned from forward. Owns a small copy of
-    the arena bases (one Int per rank) so it carries no borrowed origin across
-    the call boundary."""
-    comptime DTYPE = Self.dtype
-    comptime VOCAB = Self.vocab
-
-    var ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
-    var bases: List[Int]
-
-    def __init__(
-        out self,
-        ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin],
-        var bases: List[Int],
-    ):
-        self.ptr = ptr
-        self.bases = bases^
-
-    @always_inline
-    def vocab_per_rank(self) -> Int:
-        return Self.vocab // len(self.bases)
-
-    @always_inline
-    def local_ptr(self, offset: Int) -> UnsafePointer[
-        Scalar[Self.dtype], MutAnyOrigin,
-    ]:
-        var vpr = self.vocab_per_rank()
-        var rank = offset // vpr
-        var local = offset - rank * vpr
-        return UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=Int(self.ptr) + self.bases[rank]
-                - self.bases[0]) + local
-
-    @always_inline
-    def load_f32[width: Int](self, offset: Int) -> SIMD[DType.float32, width]:
-        var vpr = self.vocab_per_rank()
-        debug_assert(
-            offset % vpr + width <= vpr,
-            "TemporalLogitsView load crosses a rank shard",
-        )
-        return self.local_ptr(offset).load[width=width]().cast[DType.float32]()
+        return ctx.view.bind(self.slot[I, name](ctx.view.bases[0], plan))

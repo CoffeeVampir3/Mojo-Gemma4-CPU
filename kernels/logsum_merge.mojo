@@ -12,7 +12,10 @@ from .helpers import (
 from .dispatch_heuristics import (
     MERGE_INLINE_MAX_BYTES, MERGE_SATURATE_BYTES,
 )
+from .attention_ops import RunSplitBand
 from .profiling import Profiler, DispatchSpan
+
+comptime RunSplitBandPtr = UnsafePointer[RunSplitBand, MutAnyOrigin]
 
 
 @fieldwise_init
@@ -62,7 +65,8 @@ def merge_segments[
                 var sp = base + (batch_start + b) * stride
                 deltas[b] = (sp + m_off + h)[] - global_m
                 batch_ls[b] = (sp + l_off + h)[]
-            var corrs = fast_exp_softmax_biased[W](deltas)
+            var corrs = fast_exp_softmax_biased[W](
+                max(SIMD[DType.float32, W](-87.0), deltas))
             corrs = batch_ls.gt(SIMD[DType.float32, W](0)).select(
                 corrs, SIMD[DType.float32, W](0))
             global_l += (batch_ls * corrs).reduce_add()
@@ -286,3 +290,177 @@ def dispatch_merge_context_flash_partials[
         label="merge_context_flash_partials",
     ](pools, prof, local_num_q,
       total_sources * (head_dim + 2) * 4 * local_num_q)
+
+
+@fieldwise_init
+struct BatchedFinalizeKernel[head_dim: Int](RangePartitionedKernel):
+    """Rank-local batched merge (sliding decode). Work units are (run, head)
+    flattened as `run * num_q + head`; each run's flash partials occupy stripes
+    `[band.split_base, band.split_base + band.n_splits)` and finalize into
+    output token row `band.buf_start`. `bands` points at this rank's contiguous
+    slice of the flat rank-major band table."""
+    var output: BF16Ptr
+    var partials: F32Ptr
+    var bands: RunSplitBandPtr
+    var num_runs: Int
+    var num_q: Int
+    var partial_stride: Int
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        var q_stride = self.num_q * Self.head_dim
+        for flat in range(self.start, self.end):
+            var i = flat // self.num_q
+            var h = flat % self.num_q
+            var band = self.bands[i]
+            var segs = InlineArray[MergeSegment, 1](uninitialized=True)
+            segs[0] = MergeSegment(
+                self.partials + band.split_base * self.partial_stride,
+                self.partial_stride, band.n_splits)
+            var seg_span = Span(ptr=UnsafePointer(to=segs[0]), length=1)
+            var dst = self.output + band.buf_start * q_stride + h * Self.head_dim
+            write_finalized_head[Self.head_dim](dst, seg_span, self.num_q, h)
+
+    @always_inline
+    def install_range(mut self, start: Int, end: Int):
+        self.start = start
+        self.end = end
+
+
+def dispatch_merge_batched_flash_partials[
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    head_dim: Int,
+    max_worker_count: Int = 128,
+](
+    output: Binding[BFloat16, o],
+    partials_buf: Binding[Float32, o],
+    bands: RunSplitBandPtr,
+    num_runs: Int,
+    num_q: Int,
+    partial_stride: Int,
+    mut pools: List[P],
+    mut prof: Profiler[Profile, N],
+):
+    """Sliding batched merge. `bands` is the flat rank-major table; rank r reads
+    its slice `bands + r * num_runs`."""
+    if num_runs <= 0:
+        return
+    comptime K = BatchedFinalizeKernel[head_dim]
+    var bp = bands
+    var nr = num_runs
+    var nq = num_q
+    var ps = partial_stride
+
+    @parameter
+    def make(r: Int) -> K:
+        return K(output[r], partials_buf[r], bp + r * nr, nr, nq, ps, 0, 0)
+
+    var total_units = num_runs * num_q
+    fanout_dispatch[
+        make,
+        max_worker_count=max_worker_count,
+        worker_policy=merge_workers,
+        label="merge_batched_flash",
+    ](pools, prof, total_units, total_units * (head_dim + 2) * 4)
+
+
+@fieldwise_init
+struct BatchedContextMergeConfig[
+    head_dim: Int, o: ImmutOrigin,
+](TrivialRegisterPassable):
+    var output: Binding[BFloat16, Self.o]
+    var partials: Binding[Float32, Self.o]
+    var bands: RunSplitBandPtr
+    var num_runs: Int
+
+
+@fieldwise_init
+struct BatchedContextFinalizeKernel[
+    head_dim: Int, o: ImmutOrigin,
+](WorkerRangePartitionedKernel):
+    """Cross-rank batched merge (full decode). Work units are (run, local_head)
+    flattened as `run * local_num_q + local_head`. For each run, every rank's
+    partials are merged via the rank-major band table: rank r's stripes for run
+    i start at `bands[r * num_runs + i].split_base`. The destination token row is
+    `bands[q_rank * num_runs + i].buf_start` (rank-independent)."""
+    var config: BatchedContextMergeConfig[Self.head_dim, Self.o]
+    var q_rank: Int
+    var segment_scratch: UnsafePointer[MergeSegment, MutAnyOrigin]
+    var num_q: Int
+    var local_num_q: Int
+    var partial_stride: Int
+    var worker_id: Int
+    var start: Int
+    var end: Int
+
+    def execute(mut self):
+        var tp = self.config.partials.degree()
+        var out_stride = self.local_num_q * Self.head_dim
+        var nr = self.config.num_runs
+        var segs = self.segment_scratch + self.worker_id * tp
+        var seg_span = Span(ptr=segs, length=tp)
+
+        for flat in range(self.start, self.end):
+            var i = flat // self.local_num_q
+            var local_h = flat % self.local_num_q
+            var global_h = self.q_rank * self.local_num_q + local_h
+
+            for r in range(tp):
+                var band = self.config.bands[r * nr + i]
+                segs[r] = MergeSegment(
+                    self.config.partials[r] + band.split_base * self.partial_stride,
+                    self.partial_stride, band.n_splits)
+
+            var buf_start = self.config.bands[self.q_rank * nr + i].buf_start
+            var dst = self.config.output[self.q_rank] \
+                      + buf_start * out_stride + local_h * Self.head_dim
+            write_finalized_head[Self.head_dim](
+                dst, seg_span, self.num_q, global_h)
+
+    @always_inline
+    def install_worker_range(
+        mut self, worker_id: Int, start: Int, end: Int,
+    ):
+        self.worker_id = worker_id
+        self.start = start
+        self.end = end
+
+
+def dispatch_merge_batched_context_partials[
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    head_dim: Int,
+    max_worker_count: Int = 128,
+](
+    output: Binding[BFloat16, o],
+    partials_buf: Binding[Float32, o],
+    segment_scratch: Binding[MergeSegment, o],
+    bands: RunSplitBandPtr,
+    num_runs: Int,
+    num_q: Int, local_num_q: Int, partial_stride: Int,
+    mut pools: List[P],
+    mut prof: Profiler[Profile, N],
+):
+    """Full batched merge. `bands` is the flat rank-major table of length
+    `tp * num_runs`; every merge worker reads all ranks' bands for its run."""
+    if num_runs <= 0:
+        return
+    var cfg = BatchedContextMergeConfig[head_dim, o](
+        output, partials_buf, bands, num_runs)
+    comptime K = BatchedContextFinalizeKernel[head_dim, o]
+    var nq = num_q
+    var lnq = local_num_q
+    var ps = partial_stride
+
+    @parameter
+    def make(q_rank: Int) -> K:
+        return K(cfg, q_rank, segment_scratch[q_rank], nq, lnq, ps, 0, 0, 0)
+
+    var total_units = num_runs * local_num_q
+    fanout_dispatch[
+        make,
+        max_worker_count=max_worker_count,
+        worker_policy=merge_workers,
+        label="merge_batched_context",
+    ](pools, prof, total_units,
+      total_units * (head_dim + 2) * 4 * len(pools))

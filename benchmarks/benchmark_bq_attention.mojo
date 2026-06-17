@@ -5,7 +5,7 @@ from std.benchmark import keep
 from numa import NumaArena, NumaTopology
 from threading.threading_traits import BurstThreadPool
 from threading.topological_dispatch import with_topological_rank_dispatch
-from kernels.attention_ops import flash_partial_stride
+from kernels.attention_ops import KVRunTable, flash_partial_stride
 from kernels.helpers import Binding, RankView
 from kernels.logsum_merge import MergeSegment
 from kernels.profiling import Profiler
@@ -85,20 +85,23 @@ def run_bq_sliding_decode[P: BurstThreadPool, o: ImmutOrigin, //](
     v_scale: Binding[Float32, o],
     output: Binding[BFloat16, o],
     partials: Binding[Float32, o],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     base_pos: Int,
     mut pools: List[P],
 ):
     var prof = Profiler[False]()
+    runs[].runs[0].base_pos = Int32(base_pos)
     dispatch_bq_sliding_attention[
         head_dim=SLIDING_HEAD_DIM, max_q=SLIDING_NUM_Q,
         gqa_ratio=SLIDING_GQA_RATIO,
         window=SLIDING_WINDOW, cache_size=SLIDING_WINDOW,
+        page_len=SLIDING_WINDOW,
         max_worker_count=MAX_WORKERS,
     ](
         q, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
-        output, partials,
+        output, partials, runs,
         SLIDING_NUM_Q, SLIDING_NUM_KV, SLIDING_PSTRIDE, SLIDING_KV_STRIDE,
-        base_pos, 1, pools, prof)
+        1, pools, prof)
 
 
 def run_bq_full_decode[P: BurstThreadPool, o: ImmutOrigin, //](
@@ -112,20 +115,23 @@ def run_bq_full_decode[P: BurstThreadPool, o: ImmutOrigin, //](
     output: Binding[BFloat16, o],
     partials: Binding[Float32, o],
     segments: Binding[MergeSegment, o],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     base_pos: Int,
     mut pools: List[P],
 ):
     var prof = Profiler[False]()
     var local_num_q = FULL_GLOBAL_NUM_Q // len(pools)
+    runs[].runs[0].base_pos = Int32(base_pos)
     dispatch_bq_full_attention[
         head_dim=FULL_HEAD_DIM, num_q=FULL_GLOBAL_NUM_Q,
         num_kv=FULL_NUM_KV, gqa_ratio=FULL_GQA_RATIO,
         kv_stride=FULL_KV_STRIDE, partial_stride=FULL_PSTRIDE,
+        page_len=MAX_SEQ,
         max_worker_count=MAX_WORKERS,
     ](
         q, qi_bias, f_q, k_cache, k_scale, v_cache, v_scale,
-        output, partials, segments,
-        local_num_q, base_pos, 1, pools, prof)
+        output, partials, segments, runs,
+        local_num_q, 1, pools, prof)
 
 
 def fill_i8(ptr: I8Ptr, count: Int, phase: Int):
@@ -199,6 +205,8 @@ def has_nan(ptr: BF16Ptr, count: Int) -> Bool:
 
 def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    sliding_runs: UnsafePointer[KVRunTable, MutAnyOrigin],
+    full_runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     sliding_q: Binding[Int8, o],
     sliding_qi_bias: Binding[Float32, o],
     sliding_f_q: Binding[Float32, o],
@@ -225,26 +233,26 @@ def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
     run_bq_sliding_decode(
         sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
-        sliding_output, sliding_partials, 0, pools)
+        sliding_output, sliding_partials, sliding_runs, 0, pools)
     check_single_token("sliding seq=1", sliding_output[0], sliding_v[0], sliding_vs[0])
 
     run_bq_full_decode(
         full_q, full_qi_bias, full_f_q,
         full_k, full_ks, full_v, full_vs,
-        full_output, full_partials, full_segments, 0, pools)
+        full_output, full_partials, full_segments, full_runs, 0, pools)
     check_single_token("full seq=1", full_output[0], full_v[0], full_vs[0])
 
     run_bq_sliding_decode(
         sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
-        sliding_output, sliding_partials, 63, pools)
+        sliding_output, sliding_partials, sliding_runs, 63, pools)
     var sliding_bad = has_nan(
         sliding_output[0], SLIDING_NUM_Q * SLIDING_HEAD_DIM)
 
     run_bq_full_decode(
         full_q, full_qi_bias, full_f_q,
         full_k, full_ks, full_v, full_vs,
-        full_output, full_partials, full_segments, 63, pools)
+        full_output, full_partials, full_segments, full_runs, 63, pools)
     var full_bad = has_nan(
         full_output[0], full_local_num_q * FULL_HEAD_DIM)
 
@@ -254,6 +262,7 @@ def section_validation[P: BurstThreadPool, o: ImmutOrigin, //](
 
 def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[Int8, o],
     qi_bias: Binding[Float32, o],
     f_q: Binding[Float32, o],
@@ -277,14 +286,14 @@ def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
         var pos = vl - 1
         for _ in range(WARMUP):
             run_bq_sliding_decode(
-                q, qi_bias, f_q, k, ks, v, vs, output, partials, pos, pools)
+                q, qi_bias, f_q, k, ks, v, vs, output, partials, runs, pos, pools)
             keep(output[0][0])
 
         samples.clear()
         for _ in range(SAMPLES):
             var t0 = now_ns()
             run_bq_sliding_decode(
-                q, qi_bias, f_q, k, ks, v, vs, output, partials, pos, pools)
+                q, qi_bias, f_q, k, ks, v, vs, output, partials, runs, pos, pools)
             var t1 = now_ns()
             var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
@@ -298,6 +307,7 @@ def section_sliding_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
 
 def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
     mut pools: List[P],
+    runs: UnsafePointer[KVRunTable, MutAnyOrigin],
     q: Binding[Int8, o],
     qi_bias: Binding[Float32, o],
     f_q: Binding[Float32, o],
@@ -323,7 +333,7 @@ def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
         for _ in range(WARMUP):
             run_bq_full_decode(
                 q, qi_bias, f_q, k, ks, v, vs,
-                output, partials, segments, pos, pools)
+                output, partials, segments, runs, pos, pools)
             keep(output[0][0])
 
         samples.clear()
@@ -331,7 +341,7 @@ def section_full_sweep[P: BurstThreadPool, o: ImmutOrigin, //](
             var t0 = now_ns()
             run_bq_full_decode(
                 q, qi_bias, f_q, k, ks, v, vs,
-                output, partials, segments, pos, pools)
+                output, partials, segments, runs, pos, pools)
             var t1 = now_ns()
             var t_done = max_last_ts(pools)
             samples.push(t_done - t0, t1 - t0)
@@ -454,8 +464,18 @@ def run_all[P: BurstThreadPool, //](
         t"num_kv={FULL_NUM_KV} gqa={FULL_GQA_RATIO} max_seq={MAX_SEQ}"
     )
 
+    var sliding_runs_table = KVRunTable()
+    sliding_runs_table.begin_run(0, 0)
+    sliding_runs_table.add_base_row(Int32(0))
+    var sliding_runs = UnsafePointer(to=sliding_runs_table)
+
+    var full_runs_table = KVRunTable()
+    full_runs_table.begin_run(0, 0)
+    full_runs_table.add_base_row(Int32(0))
+    var full_runs = UnsafePointer(to=full_runs_table)
+
     section_validation(
-        pools,
+        pools, sliding_runs, full_runs,
         sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
         sliding_output, sliding_partials,
@@ -464,12 +484,12 @@ def run_all[P: BurstThreadPool, //](
         full_output, full_partials, full_segments,
     )
     section_sliding_sweep(
-        pools, sliding_q, sliding_qi_bias, sliding_f_q,
+        pools, sliding_runs, sliding_q, sliding_qi_bias, sliding_f_q,
         sliding_k, sliding_ks, sliding_v, sliding_vs,
         sliding_output, sliding_partials,
     )
     section_full_sweep(
-        pools, full_q, full_qi_bias, full_f_q,
+        pools, full_runs, full_q, full_qi_bias, full_f_q,
         full_k, full_ks, full_v, full_vs,
         full_output, full_partials, full_segments,
     )

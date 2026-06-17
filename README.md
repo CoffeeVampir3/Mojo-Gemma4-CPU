@@ -18,7 +18,7 @@ pixi run mojo run test_gemma4.mojo
 
 Quantize bf16 model -> butterquant:
 ```
-pixi run mojo run quantize_gemma_bq.mojo
+pixi run mojo run quantize_gemma.mojo
 ```
 
 Run butterquant model:

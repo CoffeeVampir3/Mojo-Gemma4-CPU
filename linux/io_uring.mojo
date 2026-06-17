@@ -658,7 +658,7 @@ def dispatch_reads[queue_depth: Int, mask_size: Int](
     """Dispatch one worker on `pool` with the prepared kernel. The kernel's
     backing storage must live until the caller joins `pool`."""
     var span = Span[LoadShardKernel[queue_depth], MutAnyOrigin](
-        ptr=UnsafePointer(to=kernel), length=1)
+        ptr=UnsafePointer(to=kernel).as_unsafe_any_origin(), length=1)
     pool.dispatch(span, 1)
 
 

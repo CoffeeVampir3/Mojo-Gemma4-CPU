@@ -1,3 +1,4 @@
+from std.algorithm import vectorize
 from std.collections import InlineArray
 from std.memory import Span, UnsafePointer
 from std.sys.info import simd_width_of
@@ -81,6 +82,14 @@ def scale_unrolled[
         comptime for p in range(PU):
             var off = i * STRIDE + p * width
             (acc + off).store((acc + off).load[width=width]() * f)
+
+
+@always_inline
+def copy_row[hidden: Int](src: BF16Ptr, dst: BF16Ptr):
+    def step[width: Int](idx: Int) {read}:
+        (dst + idx).store((src + idx).load[width=width]())
+
+    vectorize[BW](hidden, step)
 
 
 @fieldwise_init
@@ -179,6 +188,18 @@ def worker_range(
     if start >= base + total:
         return (base + total, base + total)
     return (start, end)
+
+
+@always_inline
+def min_pool_capacity[P: BurstThreadPool, //](
+    read pools: List[P], max_worker_count: Int,
+) -> Int:
+    var cap = max_worker_count
+    for r in range(len(pools)):
+        var c = pools[r].get_capacity()
+        if c < cap:
+            cap = c
+    return cap
 
 
 @always_inline

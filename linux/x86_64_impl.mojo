@@ -28,7 +28,9 @@ struct KernelSigInfoX86_64(TrivialRegisterPassable):
     var si_addr: Int
 
 struct X86_64LinuxSys(LinuxSys):
+    comptime NR_read = 0
     comptime NR_write = 1
+    comptime NR_ioctl = 16
     comptime NR_mmap = 9
     comptime NR_mprotect = 10
     comptime NR_munmap = 11
@@ -92,10 +94,10 @@ struct X86_64LinuxSys(LinuxSys):
         comptime asm = "mov %fs:" + String(offset) + ", $0"
         return Int(inlined_assembly[asm, Int, constraints="=r"]())
 
-    def sys_rt_sigaction(
+    def sys_rt_sigaction[act_origin: MutOrigin](
         self,
         signum: Int,
-        act: UnsafePointer[RtSigAction, MutAnyOrigin],
+        act: UnsafePointer[RtSigAction, act_origin],
         old: Optional[UnsafePointer[RtSigAction, MutAnyOrigin]] = None,
     ) -> Int:
         var restorer_copy = rt_sigreturn_restorer
@@ -138,9 +140,9 @@ struct X86_64LinuxSys(LinuxSys):
             _ = kact_ptr[]
             return result
 
-    def sys_clone3_with_entry(
+    def sys_clone3_with_entry[origin: MutOrigin](
         self,
-        clone_args_ptr: UnsafePointer[Clone3Args, MutAnyOrigin],
+        clone_args_ptr: UnsafePointer[Clone3Args, origin],
         clone_args_size: Int,
     ) -> Int:
         comptime asm = (
