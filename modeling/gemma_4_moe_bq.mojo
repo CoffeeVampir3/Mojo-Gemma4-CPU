@@ -53,7 +53,7 @@ from modeling.modeling_common import (
     pack_slot_starts, collect_emit_plan, stage_sampling_inputs,
 )
 from inspectable_toolkit.steer import (
-    SteerState, Steerable, InjectOp, dispatch_steer_point, dispatch_steer_add,
+    SteerState, Steerable, InjectOp, apply_steer_ops,
 )
 from modeling.slot import (
     Slot, BindContext, emit_pack_tasks,
@@ -1106,40 +1106,11 @@ struct Gemma4[
                 self.scratch, self.ffn_plan, self.pools, self.profiler)
 
             if self.steer.armed:
-                if self.steer.per_request:
-                    for s in range(num_slots):
-                        var rid = schedule.slots[s].request_id
-                        if rid >= len(self.steer.req_ops):
-                            continue
-                        var sstart = buf_starts[s]
-                        var sn = schedule.slots[s].n_tokens
-                        for k in range(len(self.steer.req_ops[rid])):
-                            var op = self.steer.req_ops[rid][k]
-                            if op.layer == i:
-                                var vec = layout.steer.vectors.state_binding(
-                                    ctx).shifted(op.vec_idx * C.HIDDEN)
-                                dispatch_steer_add[hidden=C.HIDDEN](
-                                    x_main_ranks.shifted(sstart * C.HIDDEN),
-                                    vec, op.alpha, sn,
-                                    self.pools, self.profiler)
-                else:
-                    for k in range(len(self.steer.inject_ops)):
-                        var op = self.steer.inject_ops[k]
-                        if op.layer == i:
-                            var vec = layout.steer.vectors.state_binding(ctx).shifted(
-                                op.vec_idx * C.HIDDEN)
-                            dispatch_steer_add[hidden=C.HIDDEN](
-                                x_main_ranks, vec, op.alpha, total,
-                                self.pools, self.profiler)
-                var tp = self.steer.tap_index(i)
-                if tp >= 0:
-                    var sink = self.steer.sink_ptr()
-                    var mism = dispatch_steer_point[hidden=C.HIDDEN](
-                        x_main_ranks, self.steer.last_rows,
-                        self.steer.last_num_slots, tp,
-                        sink, self.steer.max_slots,
-                        self.steer.verify_rank)
-                    self.steer.mismatch_count += mism
+                apply_steer_ops[hidden=C.HIDDEN](
+                    self.steer,
+                    layout.steer.vectors.state_binding(ctx),
+                    schedule, buf_starts, x_main_ranks,
+                    num_slots, total, i, self.pools, self.profiler)
 
         var outcomes = List[SampleOutcome[MAXIMUM_SAMPLING_LOGITS]]()
         var emit_plan = collect_emit_plan(schedule, buf_starts)

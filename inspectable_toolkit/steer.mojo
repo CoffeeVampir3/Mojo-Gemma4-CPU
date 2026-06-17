@@ -200,3 +200,48 @@ def dispatch_steer_add[
     fanout_dispatch[make, max_worker_count=max_worker_count, label="steer_add"](
         pools, prof, seq_len, seq_len * hidden * 4,
         inline_threshold_bytes=SCALAR_MUL_INLINE_TOKENS * hidden * 4)
+
+
+def apply_steer_ops[
+    P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin, //,
+    hidden: Int,
+](
+    mut steer: SteerState,
+    steer_vectors: Binding[BFloat16, o],
+    read schedule: Schedule,
+    read buf_starts: List[Int],
+    x_main: Binding[BFloat16, o],
+    num_slots: Int,
+    total: Int,
+    layer: Int,
+    mut pools: List[P],
+    mut prof: Profiler[Profile, N],
+):
+    if steer.per_request:
+        for s in range(num_slots):
+            var rid = schedule.slots[s].request_id
+            if rid >= len(steer.req_ops):
+                continue
+            var sstart = buf_starts[s]
+            var sn = schedule.slots[s].n_tokens
+            for k in range(len(steer.req_ops[rid])):
+                var op = steer.req_ops[rid][k]
+                if op.layer == layer:
+                    var vec = steer_vectors.shifted(op.vec_idx * hidden)
+                    dispatch_steer_add[hidden=hidden](
+                        x_main.shifted(sstart * hidden),
+                        vec, op.alpha, sn, pools, prof)
+    else:
+        for k in range(len(steer.inject_ops)):
+            var op = steer.inject_ops[k]
+            if op.layer == layer:
+                var vec = steer_vectors.shifted(op.vec_idx * hidden)
+                dispatch_steer_add[hidden=hidden](
+                    x_main, vec, op.alpha, total, pools, prof)
+    var tp = steer.tap_index(layer)
+    if tp >= 0:
+        var sink = steer.sink_ptr()
+        var mism = dispatch_steer_point[hidden=hidden](
+            x_main, steer.last_rows, steer.last_num_slots, tp,
+            sink, steer.max_slots, steer.verify_rank)
+        steer.mismatch_count += mism
