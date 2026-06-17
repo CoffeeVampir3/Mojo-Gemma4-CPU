@@ -57,22 +57,12 @@ from inspectable_toolkit.measure import (
     MEASURE_RESIDUAL, MEASURE_BASELINE, MEASURE_MODIFIED,
 )
 from inspectable_toolkit.flash_kl import dispatch_flash_kl
-from inspectable_toolkit.abliterate import (
-    AbliterableModel, AbliterationParameters, AbliterateWorkspace,
-)
-from inspectable_toolkit.checkpoint_writer import copy_checkpoint, patch_slot
-from safetensors.parser import SafetensorsHeader, parse_safetensors_header
-from kernels.copy_kernels import dispatch_copy_slot
-from kernels.abliterate_kernels import (
-    dispatch_abliterate_dense, dispatch_abliterate_experts,
-)
 from modeling.slot import (
     Slot, BindContext,
 )
 from modeling.kv_policy import (
     KVPoolMirror, pool_specs, dispatch_prefix_copies, bind_pool_run_table,
 )
-from modeling.loader import discover_shards
 from modeling.gemma4_topology import (
     MAX_WORKERS, PAGE_LEN, CONTINUOUS_BATCHING_MAX_SEQ_PARALLELISM,
     SLIDING_POOL, FULL_POOL, SLIDING_RING_PAGES,
@@ -131,12 +121,12 @@ comptime R = PassthroughRecipes
 comptime SH = Gemma4Shapes[R.FFN_BLOCK]
 comptime Layout[
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
-    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool,
+    steer_vectors: Int, measure_rows: Int,
 ] = Gemma4Layout[
     PassthroughRecipes,
     SlidingKVSlots[max_resident_seqs],
     FullKVSlots[batching_seq_len],
-    max_seq_len, steer_vectors, measure_rows, abliterate_training,
+    max_seq_len, steer_vectors, measure_rows,
 ]
 
 
@@ -306,13 +296,13 @@ def calculate_peak_scratch(degree: Int, max_workers: Int) -> Int:
 
 def dispatch_sliding_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
-    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool, //,
+    steer_vectors: Int, measure_rows: Int, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
     layout: Layout[
         max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors,
-        measure_rows, abliterate_training,
+        measure_rows,
     ],
     ctx: BindContext[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
@@ -404,13 +394,13 @@ def dispatch_sliding_attention_qkv[
 
 def dispatch_full_attention_qkv[
     P: BurstThreadPool, Profile: Bool, N: Int, o: ImmutOrigin,
-    steer_vectors: Int, measure_rows: Int, abliterate_training: Bool, //,
+    steer_vectors: Int, measure_rows: Int, //,
     max_seq_len: Int, batching_seq_len: Int, max_resident_seqs: Int,
     max_worker_count: Int = 128,
 ](
     layout: Layout[
         max_seq_len, batching_seq_len, max_resident_seqs, steer_vectors,
-        measure_rows, abliterate_training,
+        measure_rows,
     ],
     ctx: BindContext[o],
     runs: UnsafePointer[KVRunTable, MutAnyOrigin],
@@ -661,18 +651,18 @@ struct Gemma4[
     Pool: BurstThreadPool = BurstPool[],
     steer_vectors: Int = 0,
     measure_rows: Int = 0,
-    abliterate_training: Bool = False,
     profile: Bool = False, profile_slots: Int = 64,
-](Movable, ScheduledModel, Steerable, AbliterableModel):
+](Movable, ScheduledModel, Steerable):
     comptime POSITIONS_PER_PAGE = PAGE_LEN
     comptime STEER_VECTORS = Self.steer_vectors
     comptime MEASURE_ROWS = Self.measure_rows
+    comptime Recipes = R
 
     var arenas: List[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: List[Self.Pool]
     var layout: Layout[
         Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-        Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
+        Self.steer_vectors, Self.measure_rows,
     ]
     var scratch: TemporalScratchPool
     var arena_bases: List[Int]
@@ -694,7 +684,7 @@ struct Gemma4[
         var pools: List[Self.Pool],
         layout: Layout[
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-            Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
+            Self.steer_vectors, Self.measure_rows,
         ],
         degree: Int,
         max_workers: Int,
@@ -764,179 +754,6 @@ struct Gemma4[
 
     def measured_kl(self) -> Float64:
         return self.measure.kl_value()
-
-    def restore_abliterated_layers(mut self):
-        comptime if Self.abliterate_training:
-            ref layout = self.layout
-            var ctx = BindContext(RankView(Span(self.arena_bases)), 0)
-            for i in range(C.NUM_LAYERS):
-                var entry = LAYER_SCHEDULE[i]
-                if entry.kind == LayerKind.FULL:
-                    var lctx = ctx.with_layer(layout.full.base(entry.local_idx))
-                    var pctx = ctx.with_layer(
-                        layout.pristine_full.base(entry.local_idx))
-                    var attn = layout.full.proto.attn
-                    var body = layout.full.proto.body
-                    var pr = layout.pristine_full.proto
-                    dispatch_copy_slot(pr.o_proj, attn.o_proj, pctx, lctx,
-                        self.pools, self.profiler)
-                    dispatch_copy_slot(pr.down_proj, body.down_proj, pctx,
-                        lctx, self.pools, self.profiler)
-                    dispatch_copy_slot(pr.experts_down, body.experts_down,
-                        pctx, lctx, self.pools, self.profiler)
-                else:
-                    var lctx = ctx.with_layer(
-                        layout.sliding.base(entry.local_idx))
-                    var pctx = ctx.with_layer(
-                        layout.pristine_sliding.base(entry.local_idx))
-                    var attn = layout.sliding.proto.attn
-                    var body = layout.sliding.proto.body
-                    var pr = layout.pristine_sliding.proto
-                    dispatch_copy_slot(pr.o_proj, attn.o_proj, pctx, lctx,
-                        self.pools, self.profiler)
-                    dispatch_copy_slot(pr.down_proj, body.down_proj, pctx,
-                        lctx, self.pools, self.profiler)
-                    dispatch_copy_slot(pr.experts_down, body.experts_down,
-                        pctx, lctx, self.pools, self.profiler)
-
-    def abliterate_layers(
-        mut self,
-        read directions: List[BFloat16],
-        read attn: AbliterationParameters,
-        read down: AbliterationParameters,
-        mut ws: AbliterateWorkspace,
-    ):
-        var attn_alpha = List[Float32](length=C.NUM_LAYERS, fill=Float32(0))
-        var down_alpha = List[Float32](length=C.NUM_LAYERS, fill=Float32(0))
-        for i in range(C.NUM_LAYERS):
-            attn_alpha[i] = attn.strength(i)
-            down_alpha[i] = down.strength(i)
-        self.abliterate_schedule(directions, attn_alpha, down_alpha, ws)
-
-    def abliterate_schedule(
-        mut self,
-        read directions: List[BFloat16],
-        read attn_alpha: List[Float32],
-        read down_alpha: List[Float32],
-        mut ws: AbliterateWorkspace,
-    ):
-        comptime if Self.abliterate_training:
-            ref layout = self.layout
-            var actx = BindContext(RankView(Span(self.arena_bases)), 0)
-            var ws_view = RankView(Span(ws.bases))
-            var v = ws_view.bind(ws.v_ptr())
-            var m = ws_view.bind(ws.m_ptr())
-            var a = ws_view.bind(ws.a_ptr())
-            var p = ws_view.bind(ws.p_ptr())
-            for i in range(C.NUM_LAYERS):
-                var a_alpha = attn_alpha[i]
-                var d_alpha = down_alpha[i]
-                if a_alpha == Float32(0) and d_alpha == Float32(0):
-                    continue
-                var db = (i + 1) * C.HIDDEN
-                for r in range(self.degree):
-                    var vp = v[r]
-                    for j in range(C.HIDDEN):
-                        vp[j] = directions[db + j].cast[DType.float32]()
-                var entry = LAYER_SCHEDULE[i]
-                if entry.kind == LayerKind.FULL:
-                    var lctx = actx.with_layer(layout.full.base(entry.local_idx))
-                    var pctx = actx.with_layer(
-                        layout.pristine_full.base(entry.local_idx))
-                    var attn_r = layout.full.proto.attn
-                    var body = layout.full.proto.body
-                    var pr = layout.pristine_full.proto
-                    if a_alpha != Float32(0):
-                        dispatch_abliterate_dense[reduce=True](
-                            pr.o_proj, attn_r.o_proj, pctx, lctx, v, m, a, p,
-                            a_alpha, self.pools, self.profiler)
-                    if d_alpha != Float32(0):
-                        dispatch_abliterate_dense[reduce=True](
-                            pr.down_proj, body.down_proj, pctx, lctx, v, m, a, p,
-                            d_alpha, self.pools, self.profiler)
-                        dispatch_abliterate_experts(
-                            pr.experts_down, body.experts_down, pctx, lctx,
-                            v, m, a, p, C.HIDDEN, d_alpha,
-                            self.pools, self.profiler)
-                else:
-                    var lctx = actx.with_layer(
-                        layout.sliding.base(entry.local_idx))
-                    var pctx = actx.with_layer(
-                        layout.pristine_sliding.base(entry.local_idx))
-                    var attn_r = layout.sliding.proto.attn
-                    var body = layout.sliding.proto.body
-                    var pr = layout.pristine_sliding.proto
-                    if a_alpha != Float32(0):
-                        dispatch_abliterate_dense[reduce=True](
-                            pr.o_proj, attn_r.o_proj, pctx, lctx, v, m, a, p,
-                            a_alpha, self.pools, self.profiler)
-                    if d_alpha != Float32(0):
-                        dispatch_abliterate_dense[reduce=True](
-                            pr.down_proj, body.down_proj, pctx, lctx, v, m, a, p,
-                            d_alpha, self.pools, self.profiler)
-                        dispatch_abliterate_experts(
-                            pr.experts_down, body.experts_down, pctx, lctx,
-                            v, m, a, p, C.HIDDEN, d_alpha,
-                            self.pools, self.profiler)
-
-    def save_abliterated(
-        self, source_dir: Path, dest_dir: Path,
-    ) -> Bool:
-        """Write the current (edited) weights to a new checkpoint: copy the
-        source checkpoint verbatim, then overwrite only the abliteration-
-        touched tensors (o_proj, down_proj, experts_down per layer) in place
-        with their global tensors gathered from the live arenas. Shapes and
-        dtypes are preserved, so the source header stays valid."""
-        if String(source_dir) == String(dest_dir):
-            print("save_abliterated: dest_dir must differ from source_dir")
-            return False
-        if not copy_checkpoint(source_dir, dest_dir):
-            return False
-        var shard_paths = discover_shards(dest_dir)
-        if len(shard_paths) == 0:
-            print(t"save_abliterated: no shards in {dest_dir}")
-            return False
-        var headers = List[SafetensorsHeader]()
-        for i in range(len(shard_paths)):
-            var h = parse_safetensors_header(shard_paths[i])
-            if not h:
-                var p = shard_paths[i]
-                print(t"save_abliterated: failed to parse {p}")
-                return False
-            headers.append(h.take())
-
-        ref layout = self.layout
-        for i in range(C.NUM_LAYERS):
-            var entry = LAYER_SCHEDULE[i]
-            var prefix = String(t"model.language_model.layers.{entry.idx}.")
-            if entry.kind == LayerKind.FULL:
-                var lb = layout.full.base(entry.local_idx)
-                var attn = layout.full.proto.attn
-                var body = layout.full.proto.body
-                if not patch_slot(attn.o_proj, lb, prefix, self.degree,
-                    self.arena_bases, headers, shard_paths):
-                    return False
-                if not patch_slot(body.down_proj, lb, prefix, self.degree,
-                    self.arena_bases, headers, shard_paths):
-                    return False
-                if not patch_slot(body.experts_down, lb, prefix, self.degree,
-                    self.arena_bases, headers, shard_paths):
-                    return False
-            else:
-                var lb = layout.sliding.base(entry.local_idx)
-                var attn = layout.sliding.proto.attn
-                var body = layout.sliding.proto.body
-                if not patch_slot(attn.o_proj, lb, prefix, self.degree,
-                    self.arena_bases, headers, shard_paths):
-                    return False
-                if not patch_slot(body.down_proj, lb, prefix, self.degree,
-                    self.arena_bases, headers, shard_paths):
-                    return False
-                if not patch_slot(body.experts_down, lb, prefix, self.degree,
-                    self.arena_bases, headers, shard_paths):
-                    return False
-        print(t"save_abliterated: wrote {dest_dir}")
-        return True
 
     def batch_geometry(self) -> BatchGeometry:
         return BatchGeometry(
@@ -1222,7 +1039,7 @@ struct Gemma4[
             SlidingKVSlots[Self.max_resident_seqs],
             FullKVSlots[Self.batching_seq_len],
             Self.max_seq_len, Self.batching_seq_len, Self.max_resident_seqs,
-            Self.steer_vectors, Self.measure_rows, Self.abliterate_training,
+            Self.steer_vectors, Self.measure_rows,
         ](dir_path, topo, degree, max_workers,
           calculate_peak_scratch(degree, max_workers), arenas)
         if not layout_opt:

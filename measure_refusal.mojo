@@ -16,7 +16,10 @@ from kernels.flash_sample import SamplingParams
 from continuous_batching.schedule import MAXIMUM_SAMPLING_LOGITS
 from continuous_batching.scheduler import ContinuousBatchScheduler
 from simd_math.ops import sqrt
-from inspectable_toolkit.abliterate import AbliterateWorkspace
+from inspectable_toolkit.abliterate import (
+    AbliterateWorkspace, ShadowWeights, build_shadow, populate_shadow,
+    restore_from_shadow, abliterate_schedule, save_abliterated,
+)
 
 
 comptime C = Gemma4BaseConfig
@@ -62,6 +65,15 @@ def read_lines(path: Path) -> List[String]:
     return lines^
 
 
+def write_text_file(path: String, content: String) -> Bool:
+    try:
+        with open(path, "w") as f:
+            f.write_bytes(content.as_bytes())
+        return True
+    except:
+        return False
+
+
 def append_enc(
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     mut ids: List[Int32],
@@ -94,10 +106,10 @@ def wave_run[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
+        measure_rows=EVAL_CAP, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     sampling: SamplingParams,
@@ -139,10 +151,10 @@ def residual_pass[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
+        measure_rows=EVAL_CAP, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     is_bad: Bool,
@@ -159,10 +171,10 @@ def baseline_pass[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
+        measure_rows=EVAL_CAP, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     greedy: SamplingParams,
@@ -181,10 +193,10 @@ def kl_zero_pass[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
+        measure_rows=EVAL_CAP, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     greedy: SamplingParams,
@@ -298,10 +310,10 @@ def count_refusals[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
+        measure_rows=EVAL_CAP, Pool=P],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read prompts: List[String],
     read markers: List[List[Byte]],
@@ -410,7 +422,8 @@ def apply_lambda[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
+        measure_rows=EVAL_CAP, Pool=P],
+    read shadow: ShadowWeights[Model.Recipes],
     read directions: List[BFloat16],
     read w: List[Float32],
     mut ws: AbliterateWorkspace,
@@ -422,7 +435,10 @@ def apply_lambda[
         var al = clampf(lam * w[i], 0, ALPHA_CAP)
         attn_alpha[i] = al
         down_alpha[i] = al
-    model.abliterate_schedule(directions, attn_alpha, down_alpha, ws)
+    abliterate_schedule(
+        shadow, model.layout, model.arena_bases, model.degree,
+        model.pools, model.profiler,
+        directions, attn_alpha, down_alpha, ws)
 
 
 def probe_kl[
@@ -430,10 +446,11 @@ def probe_kl[
 ](
     mut model: Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P],
+        measure_rows=EVAL_CAP, Pool=P],
+    read shadow: ShadowWeights[Model.Recipes],
     mut sched: ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE],
+              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE],
     mut tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read directions: List[BFloat16],
     read w: List[Float32],
@@ -442,9 +459,11 @@ def probe_kl[
     greedy: SamplingParams,
     lam: Float32,
 ) -> Float64:
-    apply_lambda(model, directions, w, ws, lam)
+    apply_lambda(model, shadow, directions, w, ws, lam)
     var kl = kl_zero_pass(model, sched, tok, harmless, greedy)
-    model.restore_abliterated_layers()
+    restore_from_shadow(
+        shadow, model.layout, model.arena_bases,
+        model.pools, model.profiler)
     return kl
 
 
@@ -457,7 +476,7 @@ def run[
 ):
     var model_opt = Model[
         batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-        measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].load(Path(MODEL_DIR), topo, pools^)
+        measure_rows=EVAL_CAP, Pool=P].load(Path(MODEL_DIR), topo, pools^)
     if not model_opt:
         print("model load failed")
         return
@@ -468,7 +487,7 @@ def run[
         1.0, 0.0, 0, 0, MAXIMUM_SAMPLING_LOGITS, True)
     var sched = ContinuousBatchScheduler[
         Model[batching_seq_len=CB_BATCH_LEN, max_resident_seqs=CB_RESIDENT,
-              measure_rows=EVAL_CAP, abliterate_training=True, Pool=P].POSITIONS_PER_PAGE,
+              measure_rows=EVAL_CAP, Pool=P].POSITIONS_PER_PAGE,
     ](model.batch_geometry(), STEP_BUDGET, stop_tokens())
 
     var harmless = read_lines(Path(DATA_DIR + "/harmless_train.txt"))
@@ -547,9 +566,15 @@ def run[
         print("--- B: efficient search (KL root-find + targeted count) ---")
         var ws = AbliterateWorkspace(
             topo, model.degree, C.HIDDEN, C.Q_DIM_FULL)
+        var shadow = build_shadow(model.layout, topo, model.degree)
         if not ws.ok():
             print("  workspace allocation failed")
+        elif not shadow.ok():
+            print("  shadow allocation failed")
         else:
+            populate_shadow(
+                shadow, model.layout, model.arena_bases,
+                model.pools, model.profiler)
             var w = layer_weights(
                 model.measure.good_acc, model.measure.good_count,
                 model.measure.bad_acc, model.measure.bad_count)
@@ -570,8 +595,8 @@ def run[
             for li in range(len(scan)):
                 var lam = scan[li]
                 var kl = probe_kl(
-                    model, sched, tok, directions, w, ws, harmless_eval,
-                    greedy, lam)
+                    model, shadow, sched, tok, directions, w, ws,
+                    harmless_eval, greedy, lam)
                 print(t"  {lam} | {kl}")
                 if kl <= KL_TARGET:
                     if lam > lo:
@@ -588,8 +613,8 @@ def run[
                     iters += 1
                     var mid = 0.5 * (lo + hi)
                     var kl = probe_kl(
-                        model, sched, tok, directions, w, ws, harmless_eval,
-                        greedy, mid)
+                        model, shadow, sched, tok, directions, w, ws,
+                        harmless_eval, greedy, mid)
                     print(t"  {mid} | {kl}")
                     if kl <= KL_TARGET:
                         lo = mid
@@ -604,21 +629,55 @@ def run[
                 print(t"  located lambda* = {lam_star} "
                       t"(max lambda with KL <= {KL_TARGET}), KL {lo_kl}")
                 print("  --- finalize at lambda* (full sets) ---")
-                apply_lambda(model, directions, w, ws, lam_star)
+                apply_lambda(model, shadow, directions, w, ws, lam_star)
                 var kl_full = kl_zero_pass(
                     model, sched, tok, harmless_eval, greedy)
                 var ref_full = count_refusals(
                     model, sched, tok, harmful_eval, markers, greedy, 8,
                     GEN_TOKENS)
                 print("  --- writing abliterated checkpoint ---")
-                if not model.save_abliterated(
-                    Path(MODEL_DIR), Path(ABLITERATED_DIR)):
+                var saved = save_abliterated(
+                    model.layout, model.degree, model.arena_bases,
+                    Path(MODEL_DIR), Path(ABLITERATED_DIR))
+                if not saved:
                     print("  save_abliterated failed")
-                model.restore_abliterated_layers()
+                restore_from_shadow(
+                    shadow, model.layout, model.arena_bases,
+                    model.pools, model.profiler)
                 print(t"  lambda* {lam_star}: KL(full) {kl_full}")
                 print(t"  refusals@{GEN_TOKENS} "
                       t"{ref_full}/{len(harmful_eval)} "
                       t"(baseline {base_refusals})")
+
+                if saved:
+                    var summary = String("abliteration results\n")
+                    summary += String(t"source model: {MODEL_DIR}\n")
+                    summary += String(t"abliterated model: {ABLITERATED_DIR}\n")
+                    summary += String(
+                        t"good prompts: {model.measure.good_count} | ")
+                    summary += String(
+                        t"bad prompts: {model.measure.bad_count}\n")
+                    summary += String(
+                        t"baseline refusals: {base_refusals}"
+                        t"/{len(harmful_eval)}\n")
+                    summary += "per-layer SNR weight (%, peak=100):"
+                    for i in range(C.NUM_LAYERS):
+                        summary += String(t" {Int(w[i] * 100)}")
+                    summary += "\n"
+                    summary += String(
+                        t"lambda*: {lam_star} "
+                        t"(max lambda with KL <= {KL_TARGET}), "
+                        t"scan KL {lo_kl}\n")
+                    summary += String(t"KL(full): {kl_full}\n")
+                    summary += String(
+                        t"refusals@{GEN_TOKENS}: {ref_full}"
+                        t"/{len(harmful_eval)} (baseline {base_refusals})\n")
+                    var results_path = String(
+                        ABLITERATED_DIR) + "/abliteration_results.txt"
+                    if write_text_file(results_path, summary):
+                        print(t"  wrote {results_path}")
+                    else:
+                        print(t"  failed to write {results_path}")
 
     var grand_ns = Int(perf_counter_ns() - grand_t0)
     var ns_per_s: Float64 = 1_000_000_000
